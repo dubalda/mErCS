@@ -236,7 +236,7 @@ itself never requires):
    jabby.register({ applet = jabby.applets.world, name = "World", configuration = { world = world } })
    ```
 
-With Wally, `Packages.mErCS` is only a link module without children: take the ModuleScript
+With Wally, `Packages.mercs` is only a link module without children: take the ModuleScript
 of the library (the one with the `jabby` child) from the package folder in `Packages._Index`.
 
 ## Types

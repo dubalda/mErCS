@@ -1,5 +1,15 @@
 # Changelog
 
+## v0.1.1 — 2026-09-26
+
+The Wally package gets a description, a homepage and a repository link; the code is the same as
+in v0.1.0.
+
+### Installation
+
+- Wally: `mercs = "dubalda/mercs@0.1.1"`.
+- Roblox model: `mercs.rbxm`, attached to this release.
+
 ## v0.1.0 — 2026-09-26
 
 The first release of mErCS, an entity component system for Luau and Roblox built on inverted
