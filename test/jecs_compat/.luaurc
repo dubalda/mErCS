@@ -1,0 +1,7 @@
+{
+    "languageMode": "nonstrict",
+    "aliases": {
+        "jecs": "./shim",
+        "modules": "./modules"
+    }
+}

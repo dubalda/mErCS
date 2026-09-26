@@ -1,0 +1,58 @@
+{
+  "name": "mErCSCheck",
+  "emitLegacyScripts": false,
+  "tree": {
+    "$className": "Folder",
+    "src": {
+      "$path": "../src"
+    },
+    "DevPackages": {
+      "$path": "../DevPackages"
+    },
+    "bench": {
+      "$className": "Folder",
+      "gc": {
+        "$path": "../bench/gc.luau"
+      },
+      "harness": {
+        "$path": "../bench/harness.luau"
+      },
+      "impl_defs": {
+        "$path": "../bench/impl_defs.luau"
+      },
+      "scenarios": {
+        "$path": "../bench/scenarios.luau"
+      },
+      "frame_scene": {
+        "$path": "../bench/frame_scene.luau"
+      },
+      "visual": {
+        "$path": "../bench/visual"
+      }
+    },
+    "test": {
+      "$className": "Folder",
+      "fuzz": {
+        "$path": "../test/fuzz.luau"
+      }
+    },
+    "studio": {
+      "$className": "Folder",
+      "runner": {
+        "$path": "runner.luau"
+      },
+      "server": {
+        "$path": "server.server.luau"
+      },
+      "client": {
+        "$path": "client.client.luau"
+      },
+      "ServerDone": {
+        "$className": "BoolValue",
+        "$properties": {
+          "Value": false
+        }
+      }
+    }
+  }
+}

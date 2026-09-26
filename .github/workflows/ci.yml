@@ -1,0 +1,80 @@
+# Checks every pull request and every push to main: formatting, lints and types, the tests in
+# the interpreter and with native code, the builds of the model and the Wally package, and the
+# documentation site (built, not published). See docs/development.md.
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    name: Format, lints and types
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: CompeyDev/setup-rokit@v0.2.1
+        with:
+          cache: true
+      - run: wally install
+      - run: bash tools/check.sh
+
+  test:
+    name: Tests (${{ matrix.mode }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        mode: [interpreter, native]
+    env:
+      FLAGS: ${{ matrix.mode == 'native' && '--codegen' || '' }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: CompeyDev/setup-rokit@v0.2.1
+        with:
+          cache: true
+      - run: wally install
+      - run: bash tools/test.sh $FLAGS
+      - name: Longer fuzz runs
+        run: |
+          for seed in 1 2 3; do
+            luau $FLAGS test/fuzz.luau -a "$seed" 400 wide hooks
+          done
+
+  build:
+    name: Model and Wally package
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: CompeyDev/setup-rokit@v0.2.1
+        with:
+          cache: true
+      - run: rojo build default.project.json --output mercs.rbxm
+      - name: Wally package (the library only)
+        run: |
+          wally package --list
+          wally package --output mercs.zip
+      - uses: actions/upload-artifact@v7
+        with:
+          name: mercs
+          path: |
+            mercs.rbxm
+            mercs.zip
+
+  docs:
+    name: Documentation site
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+      - name: README links for the site
+        # docs/x.md on GitHub is docs/x on the site (README.md becomes the home page)
+        run: |
+          sed -i -E 's#\]\(docs/([a-z-]+)\.md(\#[a-z0-9-]+)?\)#](docs/\1\2)#g' README.md
+      - run: npx --yes moonwave@1.4.2 build

@@ -1,0 +1,46 @@
+# Releases a version when a tag vX.Y.Z is pushed: checks that the tag matches wally.toml, runs
+# the checks and the tests, publishes the package to Wally and creates the GitHub release with
+# the model (mercs.rbxm). Needs the WALLY_AUTH_TOKEN secret: the token of `wally login` (the
+# registry rejects the automatic GITHUB_TOKEN). See docs/development.md.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Test, publish and release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: CompeyDev/setup-rokit@v0.2.1
+      - name: The tag matches the version in wally.toml
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"$/\1/p' wally.toml)
+          if [ "v$version" != "$GITHUB_REF_NAME" ]; then
+            echo "::error::the tag $GITHUB_REF_NAME does not match version $version of wally.toml"
+            exit 1
+          fi
+      - run: wally install
+      - run: bash tools/check.sh
+      - run: bash tools/test.sh
+      - run: bash tools/test.sh --codegen
+      - run: rojo build default.project.json --output mercs.rbxm
+      - name: Publish to Wally
+        env:
+          WALLY_AUTH_TOKEN: ${{ secrets.WALLY_AUTH_TOKEN }}
+        run: |
+          if [ -z "$WALLY_AUTH_TOKEN" ]; then
+            echo "::error::the WALLY_AUTH_TOKEN secret is not set: add the token of 'wally login' (docs/development.md)"
+            exit 1
+          fi
+          wally login --token "$WALLY_AUTH_TOKEN"
+          wally publish
+      - name: GitHub release with the model
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" mercs.rbxm --title "mErCS $GITHUB_REF_NAME" --generate-notes

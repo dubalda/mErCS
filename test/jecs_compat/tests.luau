@@ -1,0 +1,3860 @@
+--[[
+    jecs test suite (the fork dubalda/jecs, commit 082ec88) run against mErCS through the
+    "@jecs" alias (see .luaurc and shim.luau). Tests and cases that inspect jecs internals
+    (archetypes, entity_index, component records, the entity visualiser) are disabled:
+    TEST -> SKIP_TEST, "do CASE" -> "if NOT_APPLICABLE then CASE". See README.md.
+]]
+local NOT_APPLICABLE = false
+local skipped_tests: { string } = {}
+local function SKIP_TEST(name: string, _fn: () -> ())
+    table.insert(skipped_tests, name)
+end
+local jecs = require("@jecs")
+
+local testkit = require("@modules/testkit")
+local BENCH, START = testkit.benchmark()
+local __ = jecs.Wildcard
+local ECS_ID, ECS_GENERATION = jecs.ECS_ID, jecs.ECS_GENERATION
+local ECS_GENERATION_INC = jecs.ECS_GENERATION_INC
+local IS_PAIR = jecs.IS_PAIR
+local pair = jecs.pair
+local ecs_pair_first = jecs.pair_first
+local ecs_pair_second = jecs.pair_second
+local ChildOf = jecs.ChildOf
+
+local it = testkit.test()
+local TEST, CASE = it.TEST, it.CASE
+local CHECK, FINISH = it.CHECK, it.FINISH
+local _SKIP, _FOCUS = it.SKIP, it.FOCUS
+local CHECK_EXPECT_ERR = it.CHECK_EXPECT_ERR
+
+type World = jecs.World
+type Entity<T = nil> = jecs.Entity<T>
+type Id<T = unknown> = jecs.Id<T>
+
+local entity_visualiser = require("@modules/entity_visualiser")
+local dwi = entity_visualiser.stringify
+
+-- FOCUS()
+TEST("Stale to_remove", function()
+    local world = jecs.world()
+
+    local a = world:component()
+    local b = world:component()
+    local c = world:component()
+    local d = world:component()
+    local marker = world:component()
+
+    local target = world:entity()
+
+    local first = world:entity()
+    world:add(first, jecs.pair(a, target))
+    world:add(first, jecs.pair(b, target))
+    world:add(first, jecs.pair(jecs.ChildOf, target))
+
+    local second = world:entity()
+    world:add(second, jecs.pair(c, target))
+    world:add(second, jecs.pair(d, target))
+    world:add(second, marker)
+
+    print("-------")
+    world:delete(target)
+    print("-------")
+
+    CHECK(world:contains(second))
+    CHECK(world:has(second, marker))
+end)
+
+-- FOCUS()
+-- Exercises idr_t multi-remove path: entity has multiple pairs with same target (no cascade); delete target → both pairs removed, on_remove each called.
+TEST("Target delete: multi-remove path (removing_count > 1)", function()
+    local world = jecs.world()
+    local rel1 = world:entity()
+    local rel2 = world:entity()
+    local tag = world:component()
+    local target = world:entity()
+    local e = world:entity()
+    world:add(e, jecs.pair(rel1, target))
+    world:add(e, jecs.pair(rel2, target))
+    world:add(e, tag)
+    local removed_ids = {}
+    world:removed(rel1, function(_e, id)
+        table.insert(removed_ids, id)
+    end)
+    world:removed(rel2, function(_e, id)
+        table.insert(removed_ids, id)
+    end)
+    world:delete(target)
+    CHECK(world:contains(e))
+    CHECK(world:has(e, tag))
+    CHECK(not world:has(e, jecs.pair(rel1, target)))
+    CHECK(not world:has(e, jecs.pair(rel2, target)))
+    CHECK(#removed_ids == 2)
+end)
+
+-- FOCUS()
+TEST("repro 2", function()
+    local sessionDeletedCount = 0
+    local slotDeletedCount = 0
+
+    for i = 1, 100 do
+        local world = jecs.world(true)
+
+        -- randomness
+        for _ = 1, i % 40 do
+            world:entity()
+        end
+
+        local ofMatch = world:component()
+        local ofTeam = world:component()
+        local ofRound = world:component()
+        local ownedBy = world:component()
+        local nextTeam = world:component()
+        local activeRound = world:component()
+        local team = world:component()
+        local session = world:component()
+        local round = world:component()
+
+        world:add(ofTeam, jecs.Exclusive)
+        world:add(ownedBy, jecs.Exclusive)
+        world:add(nextTeam, jecs.Exclusive)
+
+        world:add(activeRound, jecs.Exclusive)
+
+        local slotEntity = world:entity()
+        local matchEntity = world:entity()
+        world:add(matchEntity, jecs.pair(jecs.ChildOf, slotEntity))
+
+        local teams = {}
+        for t = 1, 2 do
+            local teamEntity = world:entity()
+            world:add(teamEntity, team)
+            world:add(teamEntity, jecs.pair(jecs.ChildOf, matchEntity))
+            world:add(teamEntity, jecs.pair(ofMatch, matchEntity))
+            table.insert(teams, teamEntity)
+        end
+        world:add(matchEntity, jecs.pair(nextTeam, teams[1]))
+
+        local roundEntity = world:entity()
+        world:add(roundEntity, round)
+        world:add(roundEntity, jecs.pair(jecs.ChildOf, matchEntity))
+
+        -- doing something as simple as adding this pair causes error rate to change. When this isn't here, sessionDeletedCount drops from 100% to 80%.
+        world:add(matchEntity, jecs.pair(activeRound, roundEntity))
+
+        local sessions = {}
+        for j = 1, #teams do
+            -- random number of players on team
+            for _ = 1, 1 + (i % 5) do
+                local player = world:entity()
+
+                local sessionEntity = world:entity()
+                world:add(sessionEntity, session)
+                world:add(sessionEntity, jecs.pair(ofMatch, matchEntity))
+                world:add(sessionEntity, jecs.pair(ofTeam, teams[j]))
+
+                -- not adding this next pair makes sessionDeletedCount to drop to 0%??
+                world:add(sessionEntity, jecs.pair(ownedBy, player))
+                world:add(sessionEntity, jecs.pair(ofRound, roundEntity))
+                table.insert(sessions, sessionEntity)
+            end
+        end
+
+        world:delete(matchEntity)
+
+        -- session should stay alive after match deletion
+        for _, entity in sessions do
+            if not world:contains(entity) then
+                sessionDeletedCount += 1
+                break
+            end
+        end
+
+        if not world:contains(slotEntity) then
+            slotDeletedCount += 1
+            break
+        end
+    end
+
+    CHECK(sessionDeletedCount == 0)
+    CHECK(slotDeletedCount == 0)
+
+    if sessionDeletedCount + slotDeletedCount > 0 then
+        print(`repro 2 incorrect session deletion count: {sessionDeletedCount}`)
+
+        -- this has never been above 0, but it's the issue i'm having
+        print(`repro 2 incorrect slot deletion count: {slotDeletedCount}`)
+    end
+end)
+SKIP_TEST("migrating to real records", function()
+    local world = jecs.world(true)
+    local e1 = world:entity()
+    local e2 = world:entity()
+    print(jecs.record(world, e1).row)
+    world:add(e1, jecs.pair(jecs.ChildOf, e2))
+    world:set(e1, jecs.Name, "hello")
+    CHECK(jecs.record(world, e1).row ~= 0)
+    CHECK(world:get(e1, jecs.Name) == "hello")
+    CHECK(world:has(e1, jecs.pair(jecs.ChildOf, jecs.Wildcard)))
+end)
+
+TEST("e2 is nil", function()
+    local world = jecs.world(true)
+    local e1 = world:entity(1000)
+    local e2 = world:entity()
+
+    CHECK(e1 and world:contains(e1))
+    CHECK(e2 and world:contains(e2))
+end)
+-- FOCUS()
+SKIP_TEST("reproduce idr_t nil archetype bug", function()
+    local world = jecs.world(true)
+
+    local cts = {
+        Humanoid = world:component(),
+        Animator = world:component(),
+        VelocitizeAnimationWeight = world:component(),
+    }
+
+    local char = world:entity()
+
+    -- REMOVING ONE OF THESE THESE OFFSETS i BY +1
+    world:set(char, cts.Humanoid, 0)
+    world:set(char, cts.Animator, 0)
+    --
+
+    world:added(cts.Humanoid, function() end) -- REMOVING THIS OFFSETS i BY +1 TOO
+    world:removed(cts.Animator, function(entity, id)
+        local r = jecs.record(world, entity)
+        local _src = r.archetype
+
+        --REMOVING THIS jecs.archetype_traverse_remove CALL STOPS IT FROM HAPPENING
+        CHECK_EXPECT_ERR(function()
+            world:remove(entity, cts.Humanoid)
+        end)
+    end)
+
+    local batchSize = 200
+
+    local trackedEntities: { [number]: { parentId: number? } } = {}
+
+    for i = 1, batchSize do
+        local root = world:entity()
+        -- world:add(root, jecs.pair(jecs.ChildOf, char))
+
+        -- Removing animator from trackEntity1 causes it to stop happening
+        local trackEntity1 = world:entity()
+        world:set(trackEntity1, cts.Animator, 0)
+        world:add(trackEntity1, jecs.pair(jecs.ChildOf, root))
+        world:set(trackEntity1, jecs.Name, "trackEntity1v" .. i)
+        trackedEntities[trackEntity1] = { parentId = root }
+
+        -- Removing animator from trackEntity2 causes it to happen less frequently
+        local trackEntity2 = world:entity()
+        world:set(trackEntity2, cts.Animator, 0)
+        world:add(trackEntity2, jecs.pair(jecs.ChildOf, root))
+        world:set(trackEntity2, jecs.Name, "trackEntity2v" .. i)
+        trackedEntities[trackEntity2] = { parentId = root }
+
+        -- Removing this, but keeping Animator on the other 2 causes it to stop happening
+        world:set(trackEntity1, cts.VelocitizeAnimationWeight, 0)
+
+        local q = world:query(jecs.pair(jecs.ChildOf, __)):cached()
+
+        world:delete(root)
+
+        for entityId, info in trackedEntities do
+            if world:contains(entityId) and not world:parent(entityId :: any) then
+                print(`bugged entity found: {entityId}`)
+                print(`original parent: {info.parentId}`)
+                print(`current parent: {i}`)
+                print(`batch = {batchSize}, i = {i}`)
+                print("==========================================")
+                trackedEntities[entityId] = nil
+            end
+        end
+        for entity in q do
+            local _parent = world:parent(entity) :: jecs.Entity
+            CHECK(world:parent(entity) == nil)
+        end
+    end
+end)
+
+SKIP_TEST("Ensure archetype edges get cleaned", function()
+    local A = jecs.component()
+    local B = jecs.component()
+    local world = jecs.world()
+    local edges = world.archetype_edges
+
+    local e = world:entity()
+    local r = jecs.record(world, e)
+
+    world:set(e, A, true)
+    world:add(e, A)
+    local arch_a = r.archetype
+    world:set(e, B, true)
+    world:add(e, B)
+    local arch_ab = r.archetype
+    CHECK(edges[arch_a.id][B] == arch_ab)
+    CHECK(edges[arch_ab.id][B] == arch_a)
+
+    world:delete(B)
+
+    CHECK(edges[arch_a.id][B] == nil)
+    CHECK(edges[arch_ab.id][A] == nil)
+    for _ in edges[arch_ab.id] do
+        CHECK(false)
+    end
+
+    world:delete(A)
+
+    CHECK(edges[arch_a.id][B] == nil)
+    CHECK(edges[arch_a.id][A] == nil)
+    for _ in edges[arch_a.id] do
+        CHECK(false)
+    end
+end)
+
+TEST("repeated entity cached query", function()
+    local pair = jecs.pair
+    local world = jecs.world()
+    local rel = world:entity()
+    local cmp = world:component()
+
+    local query = world:query(cmp):cached()
+
+    local t1 = world:entity()
+    local p1 = pair(rel, t1)
+
+    local e1 = world:entity()
+
+    world:add(e1, p1)
+    world:set(e1, cmp, true)
+
+    CHECK(query:iter()() == e1)
+
+    world:delete(e1)
+    world:delete(t1)
+
+    local t2 = world:entity()
+    local p2 = pair(rel, t2)
+
+    local e2 = world:entity()
+
+    world:add(e2, p2)
+    world:set(e2, cmp, true)
+
+    CHECK(query:iter()() == e2) -- Fails
+end)
+
+TEST("repeated pairs", function()
+    local pair = jecs.pair
+    local world = jecs.world()
+    local rel = world:component() -- Does not error if this is just a tag
+
+    -- Does not happen if we delete manually instead of using this
+    world:add(rel, pair(jecs.OnDeleteTarget, jecs.Delete))
+
+    local t1 = world:entity()
+
+    local p1 = pair(rel, t1)
+
+    local e1 = world:entity()
+
+    world:set(e1, p1, true)
+
+    CHECK(world:get(e1, p1))
+    CHECK(world:each(p1)() == e1)
+
+    world:delete(t1)
+
+    local t2 = world:entity()
+    local p2 = pair(rel, t2)
+
+    local e2 = world:entity()
+
+    world:set(e2, p2, true)
+
+    CHECK(world:get(e2, p2))
+    CHECK(p1 == p2)
+    local count = 0
+    CHECK(world:has(e2, p2))
+    for _ in world:query(p2) do
+        count += 1
+    end
+    CHECK(count == 1)
+    CHECK(world:each(p2)() == e2) -- Fails
+end)
+
+TEST("repro", function()
+    local world = jecs.world()
+    local data = world:component()
+    local relation = world:component()
+    world:add(relation, jecs.pair(jecs.OnDeleteTarget, jecs.Delete))
+
+    local e1 = world:entity()
+    local e2 = world:entity()
+    world:set(e2, data, 456)
+    world:add(e2, jecs.pair(relation, e1))
+    world:delete(e1)
+
+    local e1v1 = world:entity()
+    CHECK(ECS_ID(e1v1) == e1 :: any)
+    local e2v1 = world:entity()
+    CHECK(ECS_ID(e2v1) == e2 :: any)
+    world:set(e2v1, data, 456)
+
+    CHECK(world:contains(e1v1))
+    CHECK(not world:contains(e2))
+    CHECK(world:contains(e2v1))
+
+    local count = 0
+    for i, val in world:query(data):iter() do
+        count += 1
+    end
+    CHECK(count == 1)
+    count = 0
+    world:add(e2v1, jecs.pair(relation, e1v1))
+    CHECK(world:has(e2v1, jecs.pair(relation, e1v1)))
+
+    for i, val in world:query(data):iter() do
+        count += 1
+    end
+
+    CHECK(count == 1)
+end)
+
+TEST("bulk", function()
+    do
+        CASE("Should allow components and tags to be in disorder")
+        local world = jecs.world()
+        local A = world:component()
+        local B = world:component()
+        local C = world:component()
+
+        local D = world:component()
+        local E = world:entity()
+        local F = world:component()
+
+        local e = world:entity()
+        local _r = jecs.entity_index_try_get(world.entity_index, e)
+        jecs.bulk_insert(world, e, { A, B, C }, { 1, 2, 3 })
+        CHECK(world:get(e, A) == 1)
+        CHECK(world:get(e, B) == 2)
+        CHECK(world:get(e, C) == 3)
+
+        jecs.bulk_insert(world, e, { D, E, F }, { 4, nil, 5 })
+        CHECK(world:get(e, A) == 1)
+        CHECK(world:get(e, B) == 2)
+        CHECK(world:get(e, C) == 3)
+
+        CHECK(world:get(e, D) == 4)
+        CHECK(world:get(e, E) == nil and world:has(e, E))
+        CHECK(world:get(e, F) == 5)
+
+        jecs.bulk_insert(world, e, { A, D, E, F, C }, { 10, 40, nil, 50, 30 })
+
+        CHECK(world:get(e, A) == 10)
+        CHECK(world:get(e, B) == 2)
+        CHECK(world:get(e, C) == 30)
+        CHECK(world:get(e, D) == 40)
+        CHECK(world:get(e, E) == nil and world:has(e, E))
+        CHECK(world:get(e, F) == 50)
+
+        local G = world:component()
+        world:set(e, G, 100)
+
+        CHECK(world:get(e, A) == 10)
+        CHECK(world:get(e, B) == 2)
+        CHECK(world:get(e, C) == 30)
+        CHECK(world:get(e, D) == 40)
+        CHECK(world:get(e, E) == nil and world:has(e, E))
+        CHECK(world:get(e, F) == 50)
+        CHECK(world:get(e, G) == 100)
+
+        world:remove(e, B)
+
+        CHECK(world:get(e, A) == 10)
+        CHECK(world:has(e, B) == false)
+        CHECK(world:get(e, C) == 30)
+        CHECK(world:get(e, D) == 40)
+        CHECK(world:get(e, E) == nil and world:has(e, E))
+        CHECK(world:get(e, F) == 50)
+        CHECK(world:get(e, G) == 100)
+
+        jecs.bulk_remove(world, e, { A, B, C, D })
+
+        CHECK(world:has(e, A) == false)
+        CHECK(world:has(e, B) == false)
+        CHECK(world:has(e, C) == false)
+        CHECK(world:has(e, D) == false)
+        CHECK(world:get(e, E) == nil and world:has(e, E))
+        CHECK(world:get(e, F) == 50)
+        CHECK(world:get(e, G) == 100)
+
+        jecs.bulk_insert(world, e, { D, G }, { 999, 1 })
+
+        CHECK(world:has(e, A) == false)
+        CHECK(world:has(e, B) == false)
+        CHECK(world:has(e, C) == false)
+        CHECK(world:get(e, D) == 999)
+        CHECK(world:get(e, E) == nil and world:has(e, E))
+        CHECK(world:get(e, F) == 50)
+        CHECK(world:get(e, G) == 1)
+
+        jecs.bulk_remove(world, e, { A, B, C, D, E, F, G })
+
+        CHECK(world:has(e, A) == false)
+        CHECK(world:has(e, B) == false)
+        CHECK(world:has(e, C) == false)
+        CHECK(world:has(e, D) == false)
+        CHECK(world:has(e, E) == false)
+        CHECK(world:has(e, F) == false)
+        CHECK(world:has(e, G) == false)
+    end
+    do
+        CASE("Should bulk add by default when there is no values")
+        local world = jecs.world()
+        local t1, t2, t3 = world:entity(), world:entity(), world:entity()
+        local count = 0
+        local function counter()
+            count += 1
+        end
+        world:added(t1, counter)
+        world:added(t2, counter)
+        world:added(t3, counter)
+
+        local e = world:entity()
+        jecs.bulk_insert(world, e, { t1, t2, t3 }, {})
+
+        CHECK(world:has(e, t1, t2, t3))
+        CHECK(count == 3)
+    end
+
+    do
+        CASE("Should bulk add by default when there is no values")
+        local world = jecs.world()
+        local c1, c2, c3 = world:component(), world:component(), world:component()
+        local count = 0
+        local function counter()
+            count += 1
+        end
+
+        world:changed(c1, counter)
+        world:changed(c2, counter)
+        world:changed(c3, counter)
+
+        local e = world:entity()
+        jecs.bulk_insert(world, e, { c1, c2 }, { 1, 2, 3 })
+
+        jecs.bulk_insert(world, e, { c1, c2, c3 }, { 4, 5, 6 })
+
+        CHECK(world:has(e, c1, c2, c3))
+        CHECK(count == 2)
+
+        jecs.bulk_insert(world, e, { c1, c2, c3 }, { 7, 8, 9 })
+        CHECK(count == 2 + 3)
+    end
+
+    do
+        CASE("Should bulk add with hooks moving archetypes without previous")
+        local world = jecs.world()
+        local c1, c2, c3 = world:component(), world:component(), world:component()
+
+        world:added(c1, function(e)
+            world:set(e, c3, "hello")
+        end)
+
+        local e = world:entity()
+        jecs.bulk_insert(world, e, { c1, c2 }, { true, 123 })
+        CHECK(world:get(e, c1) == true)
+        CHECK(world:get(e, c2) == 123)
+        CHECK(world:get(e, c3) == "hello")
+    end
+
+    do
+        CASE("Should bulk add with hooks moving archetypes with previous")
+        local world = jecs.world()
+        local c1, c2, c3 = world:component(), world:component(), world:component()
+
+        world:added(c1, function(e)
+            world:set(e, c3, "hello")
+        end)
+
+        local e = world:entity()
+        world:add(e, world:entity())
+        jecs.bulk_insert(world, e, { c1, c2 }, { true, 123 })
+        CHECK(world:get(e, c1) == true)
+        CHECK(world:get(e, c2) == 123)
+        CHECK(world:get(e, c3) == "hello")
+    end
+
+    do
+        CASE("Should ensure archetype ids are sorted")
+        local world = jecs.world()
+        local c1, c2, c3 = world:component(), world:component(), world:component()
+
+        local e = world:entity()
+        jecs.bulk_insert(world, e, { c2, c1 }, { 2, 1 })
+        jecs.bulk_insert(world, e, { c1 }, { 1 })
+        world:set(e, c3, 3)
+
+        CHECK(world:get(e, c1) == 1)
+        CHECK(world:get(e, c2) == 2)
+        CHECK(world:get(e, c3) == 3)
+    end
+end)
+
+TEST("repro", function()
+    local Model = jecs.component()
+    local Relation = jecs.component()
+    local _Relation2 = jecs.component()
+
+    local world = jecs.world()
+
+    local e1 = world:entity()
+    world:set(e1, Model, 2)
+
+    local e2 = world:entity()
+    world:set(e2, Model, 2)
+    world:set(e2, jecs.pair(Relation, e1), 5)
+
+    local e3 = world:entity()
+    world:set(e3, Model, 2)
+    world:set(e3, jecs.pair(Relation, e1), 5)
+
+    world:delete(e1)
+
+    for _ in world:query(Model) do
+    end
+    jecs.ECS_META_RESET()
+end)
+
+TEST("world:add()", function()
+    do
+        CASE("Removing exclusive pair should traverse backwards on edge")
+        local world = jecs.world()
+        local a = world:entity()
+        local b = world:entity()
+        local c = world:entity()
+
+        world:add(a, pair(ChildOf, b))
+        world:add(a, pair(ChildOf, c))
+
+        CHECK(not world:has(a, pair(ChildOf, b)))
+        CHECK(world:has(a, pair(ChildOf, c)))
+
+        world:remove(a, pair(ChildOf, c))
+
+        CHECK(not world:has(a, pair(ChildOf, b)))
+        CHECK(not world:has(a, pair(ChildOf, c)))
+        CHECK(not world:target(a, ChildOf))
+    end
+    do
+        CASE("Exclusive relations")
+        local world = jecs.world()
+        local A = world:component()
+        world:add(A, jecs.Exclusive)
+
+        local B = world:component()
+        local C = world:component()
+
+        local e = world:entity()
+        world:add(e, pair(A, B))
+        world:add(e, pair(A, C))
+
+        CHECK(world:has(e, pair(A, B)) == false)
+        CHECK(world:has(e, pair(A, C)) == true)
+
+        -- We have to test the path that checks the uncached method
+        local e1 = world:entity()
+
+        world:add(e1, pair(A, B))
+        world:add(e1, pair(A, C))
+
+        CHECK(world:has(e1, pair(A, B)) == false)
+        CHECK(world:has(e1, pair(A, C)) == true)
+    end
+
+    do
+        CASE("exclusive relations invoke hooks")
+        local world = jecs.world()
+        local A = world:component()
+        local B = world:component()
+        local C = world:component()
+
+        local e_ptr: jecs.Entity = (jecs.Rest :: any) + 1
+
+        world:add(A, jecs.Exclusive)
+        local on_remove_call = false
+        world:set(A, jecs.OnRemove, function(e, id)
+            on_remove_call = true
+        end)
+
+        local on_add_call_count = 0
+        world:set(A, jecs.OnAdd, function(e, id)
+            on_add_call_count += 1
+        end)
+
+        local e = world:entity()
+        CHECK(e == e_ptr)
+        world:add(e, pair(A, B))
+        CHECK(on_add_call_count == 1)
+        world:add(e, pair(A, C))
+        CHECK(on_add_call_count == 2)
+        CHECK(on_remove_call)
+
+        CHECK(world:has(e, pair(A, B)) == false)
+        CHECK(world:has(e, pair(A, C)) == true)
+
+        -- We have to ensure that it actually invokes hooks everytime it
+        -- traverses the archetype
+        e = world:entity()
+        world:add(e, pair(A, B))
+        CHECK(on_add_call_count == 3)
+        world:add(e, pair(A, C))
+        CHECK(on_add_call_count == 4)
+        CHECK(on_remove_call)
+
+        CHECK(world:has(e, pair(A, B)) == false)
+        CHECK(world:has(e, pair(A, C)) == true)
+    end
+
+    if NOT_APPLICABLE then
+        CASE("idempotent")
+        local world = jecs.world()
+        local d = dwi(world)
+        local _1, _2 = world:component(), world:component()
+
+        local e = world:entity()
+        world:add(e, _1)
+        world:add(e, _2)
+
+        world:add(e, _2) -- should have 0 effects
+        CHECK(d.archetype(e) == "1_2")
+    end
+
+    if NOT_APPLICABLE then
+        CASE("archetype move")
+        local world = jecs.world()
+
+        local d = dwi(world)
+
+        local _1 = world:component()
+        local e = world:entity()
+        -- An entity starts without an archetype or row
+        -- should therefore not need to copy over data
+        CHECK(d.tbl(e) == world.ROOT_ARCHETYPE)
+        CHECK(d.row(e) == 0)
+
+        local archetypes = #world.archetypes
+        -- This should create a new archetype
+        world:add(e, _1)
+        CHECK(#world.archetypes == archetypes + 1)
+
+        CHECK(d.archetype(e) == "1")
+        CHECK(d.tbl(e))
+    end
+end)
+
+TEST("world:children()", function()
+    local C = jecs.component()
+    local T = jecs.tag()
+    local world = jecs.world()
+
+    local e1 = world:entity()
+    world:set(e1, C, true)
+
+    local e2 = world:entity()
+
+    world:add(e2, T)
+    world:add(e2, pair(ChildOf, e1))
+
+    local e3 = world:entity()
+    world:add(e3, pair(ChildOf, e1))
+
+    CHECK(world:has(e2, pair(ChildOf, e1)))
+    CHECK(world:has(e3, pair(ChildOf, e1)))
+
+    local count = 0
+    for entity in world:children(e1) do
+        count += 1
+        if entity == e2 or entity == e3 then
+            CHECK(true)
+            continue
+        end
+        CHECK(false)
+    end
+    CHECK(count == 2)
+
+    world:remove(e2, pair(ChildOf, e1))
+
+    count = 0
+    for entity in world:children(e1) do
+        count += 1
+    end
+
+    CHECK(count == 1)
+
+    jecs.ECS_META_RESET()
+end)
+
+-- Arauser repro: many parents, only some have routes+checkpoints; delete all parents.
+-- With the bug: 1 checkpoint can remain and/or world:target returns non-alive parent.
+-- Scale and structure match arauser so the test FAILS when the bug is present.
+TEST("ChildOf cascade: world_target must not return non-alive parent", function()
+    local w = jecs.world(true)
+    local ParentTag = w:component()
+    local Anything = w:component()
+    local RouteTag = w:entity()
+    local CheckpointTag = w:entity()
+    local RouteOf = w:entity()
+
+    -- Like arauser: many parents (tiles) with two components, only a subset get routes + checkpoints
+    local nParents = 2000
+    local nWithChildren = 10
+    local parents = {}
+    for i = 1, nParents do
+        local p = w:entity()
+        w:set(p, ParentTag, {
+            row = math.floor((i - 1) / 50) + 1,
+            col = ((i - 1) % 50) + 1,
+        })
+        w:add(p, Anything)
+        parents[i] = p
+    end
+    local used = {}
+    local picked = 0
+    while picked < nWithChildren do
+        local idx = math.random(1, nParents)
+        if not used[idx] then
+            used[idx] = true
+            picked += 1
+            local p = parents[idx]
+            local route = w:entity()
+            w:add(route, RouteTag)
+            w:add(route, pair(ChildOf, p))
+            local checkpoint = w:entity()
+            w:add(checkpoint, CheckpointTag)
+            w:add(checkpoint, pair(ChildOf, p))
+            w:add(checkpoint, pair(RouteOf, route))
+        end
+    end
+
+    -- Delete all parents (collect first to avoid iterator invalidation)
+    local toDelete = {}
+    for e in w:query(ParentTag):iter() do
+        toDelete[#toDelete + 1] = e
+    end
+    for _, e in ipairs(toDelete) do
+        w:delete(e)
+    end
+
+    -- These must hold; with the bug one of them fails (checkpoint remains or parent not alive)
+    local count = 0
+    for checkpoint in w:query(CheckpointTag):iter() do
+        count += 1
+        CHECK(w:contains(checkpoint))
+        local parent = w:target(checkpoint, ChildOf)
+        if parent ~= nil then
+            CHECK(w:contains(parent))
+        end
+    end
+    CHECK(count == 0)
+    jecs.ECS_META_RESET()
+end)
+
+-- TEST("world:purge()", function()
+-- 	do CASE "should remove all instances of specified component"
+-- 		local world = jecs.world()
+-- 		local A = world:component()
+-- 		local B = world:component()
+
+-- 		local e = world:entity()
+-- 		local e1 = world:entity()
+-- 		local _e2 = world:entity()
+
+-- 		world:set(e, A, true)
+-- 		world:set(e, B, true)
+
+-- 		world:set(e1, A, true)
+-- 		world:set(e1, B, true)
+
+-- 		CHECK(world:get(e, A))
+-- 		CHECK(world:get(e, B))
+
+-- 		world:purge(A)
+-- 		CHECK(world:get(e, A) == nil)
+-- 		CHECK(world:get(e, B))
+-- 		CHECK(world:get(e1, A) == nil)
+-- 		CHECK(world:get(e1, B))
+-- 	end
+
+-- 	do CASE "remove purged component from entities"
+-- 		local world = jecs.world()
+-- 		local A = world:component()
+-- 		local B = world:component()
+-- 		local C = world:component()
+
+-- 		do
+-- 			local id1 = world:entity()
+-- 			local id2 = world:entity()
+-- 			local id3 = world:entity()
+
+-- 			world:set(id1, A, true)
+
+-- 			world:set(id2, A, true)
+-- 			world:set(id2, B, true)
+
+-- 			world:set(id3, A, true)
+-- 			world:set(id3, B, true)
+-- 			world:set(id3, C, true)
+
+-- 			world:purge(A)
+
+-- 			CHECK(not world:has(id1, A))
+-- 			CHECK(not world:has(id2, A))
+-- 			CHECK(not world:has(id3, A))
+
+-- 			CHECK(world:has(id2, B))
+-- 			CHECK(world:has(id3, B, C))
+
+-- 			world:purge(C)
+
+-- 			CHECK(world:has(id2, B))
+-- 			CHECK(world:has(id3, B))
+
+-- 			CHECK(world:contains(A))
+-- 			CHECK(world:contains(C))
+-- 			CHECK(world:has(A, jecs.Component))
+-- 			CHECK(world:has(B, jecs.Component))
+-- 		end
+
+-- 		do
+-- 			local id1 = world:entity()
+-- 			local id2 = world:entity()
+-- 			local id3 = world:entity()
+
+-- 			local tgt = world:entity()
+
+-- 			world:add(id1, pair(A, tgt))
+-- 			world:add(id1, pair(B, tgt))
+-- 			world:add(id1, pair(C, tgt))
+
+-- 			world:add(id2, pair(A, tgt))
+-- 			world:add(id2, pair(B, tgt))
+-- 			world:add(id2, pair(C, tgt))
+
+-- 			world:add(id3, pair(A, tgt))
+-- 			world:add(id3, pair(B, tgt))
+-- 			world:add(id3, pair(C, tgt))
+
+-- 			world:purge(B)
+-- 			CHECK(world:has(id1, pair(A, tgt), pair(C, tgt)))
+-- 			CHECK(not world:has(id1, pair(B, tgt)))
+-- 			CHECK(world:has(id2, pair(A, tgt), pair(C, tgt)))
+-- 			CHECK(not world:has(id1, pair(B, tgt)))
+-- 			CHECK(world:has(id3, pair(A, tgt), pair(C, tgt)))
+
+-- 		end
+
+-- 	end
+-- end)
+
+TEST("world:clear", function()
+    if NOT_APPLICABLE then
+        CASE("remove all components on entity")
+        local world = jecs.world()
+        local A = world:component()
+        local B = world:component()
+
+        local e = world:entity()
+
+        world:set(e, A, true)
+        world:set(e, B, true)
+
+        world:clear(e)
+
+        CHECK(world:contains(e))
+        CHECK(not world:has(e, A))
+        CHECK(not world:has(e, B))
+        print(jecs.record(world, e).archetype == nil :: any)
+    end
+
+    do
+        CASE("should invoke hooks")
+        local world = jecs.world()
+        local A = world:component()
+        local called = 0
+        world:set(A, jecs.OnRemove, function()
+            called += 1
+        end)
+
+        local B = world:component()
+        world:set(B, jecs.OnRemove, function()
+            called += 1
+        end)
+
+        local e = world:entity()
+
+        world:set(e, A, true)
+        world:set(e, B, true)
+
+        world:clear(e)
+
+        CHECK(world:contains(e))
+        CHECK(not world:has(e, A))
+        CHECK(not world:has(e, B))
+        CHECK(called == 2)
+    end
+end)
+
+TEST("world:component()", function()
+    do
+        CASE("allow IDs to be registered")
+        local A = jecs.component()
+        local B = jecs.component()
+
+        local world = jecs.world()
+        local C = world:component()
+        CHECK((A :: any) == 1)
+        CHECK((B :: any) == 2)
+        CHECK((C :: any) == 3)
+
+        local e = world:entity()
+
+        world:set(e, A, "foo")
+        world:set(e, B, "foo")
+        world:set(e, C, "foo")
+
+        CHECK(world:has(e, A, B, C))
+
+        jecs.ECS_META_RESET() -- Reset the ECS metadata because they may have side effects
+    end
+    do
+        CASE("only components should have EcsComponent trait")
+        local world = jecs.world()
+        local A = world:component()
+        local e = world:entity()
+
+        CHECK(world:has(A, jecs.Component))
+        CHECK(not world:has(e, jecs.Component))
+    end
+
+    do
+        CASE("tag")
+        local world = jecs.world()
+        local A = world:component()
+        local B = world:entity()
+        local C = world:entity()
+        local e = world:entity()
+        world:set(e, A, "test")
+        world:add(e, B)
+        CHECK_EXPECT_ERR(function()
+            world:set(e, C, 11 :: any)
+        end)
+
+        CHECK(world:has(e, A))
+        CHECK(world:get(e, A) == "test")
+        CHECK(world:get(e, B) == nil)
+        CHECK(world:get(e, C) == nil)
+    end
+end)
+
+TEST("world:contains()", function()
+    local tag = jecs.tag()
+    local world = jecs.world()
+    local id = world:entity()
+    CHECK(world:contains(id))
+
+    do
+        CASE("should not exist after delete")
+        world:delete(id)
+        CHECK(not world:contains(id))
+    end
+
+    CHECK(world:contains(tag))
+    jecs.ECS_META_RESET()
+end)
+
+TEST("world:delete()", function()
+    do
+        CASE("OnDelete cleanup policy cascades deletion to entites with idr_r pairs")
+        local world = jecs.world()
+        local r = world:entity()
+        world:add(r, jecs.pair(jecs.OnDelete, jecs.Delete))
+
+        local e = world:entity()
+        local e1 = world:entity()
+        world:add(e, jecs.pair(r, e1))
+
+        world:delete(r)
+        CHECK(not world:contains(e))
+    end
+
+    do
+        CASE("OnDeleteTarget works correctly regardless of adjacent archetype iteration order")
+        local world = jecs.world()
+        local t = world:entity()
+        local c = world:component()
+        world:add(c, t)
+
+        local component = world:component()
+        local lifetime = world:component()
+
+        local tag = world:entity()
+        local rel1 = world:entity()
+        local rel2 = world:entity()
+        local rel3 = world:entity()
+
+        local destroyed = false
+
+        world:removed(lifetime, function(e)
+            destroyed = true
+        end)
+
+        local parent = world:entity()
+        world:set(parent, component, "foo")
+        world:add(parent, jecs.pair(rel1, component))
+
+        local other1 = world:entity()
+        world:add(other1, tag)
+        world:add(other1, jecs.pair(jecs.ChildOf, parent))
+        world:add(other1, jecs.pair(rel1, component))
+
+        local child = world:entity()
+        world:set(child, lifetime, "")
+        world:add(child, jecs.pair(jecs.ChildOf, parent))
+        world:add(child, jecs.pair(rel3, parent))
+        world:add(child, jecs.pair(rel2, other1))
+
+        world:delete(parent)
+
+        CHECK(destroyed)
+        CHECK(not world:contains(child))
+    end
+
+    do
+        CASE("Should delete children in different archetypes if they have the same parent")
+        local world = jecs.world()
+
+        local component = world:entity()
+
+        local parent = world:entity()
+
+        local child = world:entity()
+        world:add(child, jecs.pair(jecs.ChildOf, parent))
+
+        local child2 = world:entity()
+        world:add(child2, component) -- important, they need to be in different archetypes
+        world:add(child2, jecs.pair(jecs.ChildOf, parent))
+
+        world:delete(parent)
+        CHECK(not world:contains(child))
+        CHECK(not world:contains(child2)) -- fails
+    end
+    do
+        CASE("idr_t//delete_mask@3102..3108")
+        local world = jecs.world()
+        local A = world:component()
+        world:add(A, pair(jecs.OnDeleteTarget, jecs.Delete))
+        local B = world:component()
+        local B_OnAdd_called = false
+        local _B_OnRemove_called = false
+        world:set(B, jecs.OnAdd, function()
+            B_OnAdd_called = true
+        end)
+        world:set(B, jecs.OnRemove, function()
+            _B_OnRemove_called = true
+        end)
+
+        world:set(A, jecs.OnRemove, function(entity, id)
+            world:set(entity, B, true)
+        end)
+
+        local e1 = world:entity()
+        local e2 = world:entity()
+        world:set(e2, pair(A, e1), true)
+
+        world:delete(e1)
+
+        CHECK(not world:has(e2, pair(A, e1)))
+        CHECK(not world:has(e2, B))
+        CHECK(not world:contains(e1))
+        CHECK(not world:contains(e2))
+        CHECK(B_OnAdd_called)
+        -- CHECK(B_OnRemove_called)
+    end
+
+    do
+        CASE("pair(OnDelete, Delete)")
+        local world = jecs.world()
+        local ct = world:component()
+        world:add(ct, jecs.pair(jecs.OnDelete, jecs.Delete))
+
+        local e1 = world:entity()
+        local e2 = world:entity()
+
+        local dummy = world:entity()
+
+        world:add(e1, ct)
+        world:add(e2, jecs.pair(ct, dummy))
+
+        -- world:delete(dummy)
+
+        -- CHECK(world:contains(e2))
+
+        world:delete(ct)
+
+        CHECK(not world:contains(e1))
+    end
+
+    do
+        CASE("pair(OnDeleteTarget, Delete)")
+        local world = jecs.world()
+        local ct = world:component()
+        world:add(ct, jecs.pair(jecs.OnDeleteTarget, jecs.Delete))
+
+        local e1 = world:entity()
+        local e2 = world:entity()
+
+        local dummy = world:entity()
+
+        world:add(e1, ct)
+
+        world:add(e2, jecs.pair(ct, dummy))
+
+        world:delete(dummy)
+
+        CHECK(not world:contains(e2))
+
+        world:delete(ct)
+
+        CHECK(world:contains(e1))
+    end
+    do
+        CASE("remove (*, R) pairs when relationship is invalidated")
+        local world = jecs.world()
+        local e1 = world:entity()
+        local e2 = world:entity()
+
+        local A = world:component()
+        local B = world:component()
+        local C = world:component()
+
+        world:add(e1, pair(e2, A))
+        world:add(e1, B) -- Some stable component that should not be removed in the process
+        world:add(e1, pair(e2, C))
+        world:delete(e2)
+
+        CHECK(not world:contains(e2))
+        CHECK(not world:has(e1, pair(e2, A)))
+        CHECK(world:has(e1, B))
+        CHECK(not world:has(e1, pair(e2, C)))
+        CHECK(world:contains(e1))
+    end
+    do
+        CASE("remove pair when relationship is deleted")
+        local world = jecs.world()
+        local e1 = world:entity()
+        local e2 = world:entity()
+
+        local A = world:component()
+        local B = world:component()
+        local C = world:component()
+
+        world:add(e1, pair(A, e2))
+        world:add(e1, pair(B, e2))
+        world:add(e1, pair(C, e2))
+        world:delete(A)
+
+        CHECK(not world:has(e1, pair(A, e2)))
+        CHECK(world:has(e1, pair(B, e2)))
+        CHECK(world:has(e1, pair(C, e2)))
+    end
+
+    do
+        CASE("invoke OnRemove hook on all components of deleted entity")
+        local world = jecs.world()
+
+        local e1 = world:entity()
+        local e2 = world:entity()
+
+        local Stable = world:component()
+        world:set(Stable, jecs.OnRemove, function(e)
+            CHECK(e == e1)
+        end)
+
+        world:set(e1, Stable, true)
+        world:set(e2, Stable, true)
+
+        world:delete(e1)
+    end
+
+    do
+        CASE("invoke OnRemove hook on relationship if target was deleted")
+        local world = jecs.world()
+        local pair = jecs.pair
+
+        local Relation = world:entity()
+        local A = world:entity()
+        local B = world:entity()
+
+        world:add(Relation, pair(jecs.OnDeleteTarget, jecs.Delete))
+
+        local entity = world:entity()
+
+        local called = false
+        world:set(A, jecs.OnRemove, function(e)
+            called = true
+        end)
+
+        world:add(entity, A)
+        world:add(entity, pair(Relation, B))
+
+        world:delete(B)
+
+        CHECK(called)
+    end
+
+    do
+        CASE("delete recycled entity id used as component")
+        local world = jecs.world()
+        local id = world:entity()
+        world:add(id, jecs.Component)
+
+        local e = world:entity()
+        world:set(e, id, 1)
+        CHECK(world:get(e, id) == 1)
+        world:delete(id)
+        local recycled = world:entity()
+        world:add(recycled, jecs.Component)
+        world:set(e, recycled, 1)
+        CHECK(world:has(recycled, jecs.Component))
+        CHECK(world:get(e, recycled) == 1)
+    end
+    do
+        CASE("bug: Empty entity does not respect cleanup policy")
+        local world = jecs.world()
+        local parent = world:entity()
+        local tag = world:entity()
+
+        local child = world:entity()
+        world:add(child, jecs.pair(jecs.ChildOf, parent))
+        world:delete(parent)
+
+        CHECK(not world:contains(parent))
+        CHECK(not world:contains(child))
+
+        local entity = world:entity()
+        world:add(entity, tag)
+        world:delete(tag)
+        CHECK(world:contains(entity))
+        CHECK(not world:contains(tag))
+        CHECK(not world:has(entity, tag)) -- => true
+    end
+
+    do
+        CASE("should allow deleting components")
+        local world = jecs.world()
+
+        local Health = world:component()
+        local Poison = world:component()
+
+        local id = world:entity()
+        world:set(id, Poison, 5)
+        world:set(id, Health, 50)
+        local id1 = world:entity()
+        world:set(id1, Poison, 500)
+        world:set(id1, Health, 50)
+
+        world:delete(id)
+        CHECK(not world:contains(id))
+        CHECK(world:get(id, Poison) == nil)
+        CHECK(world:get(id, Health) == nil)
+
+        CHECK(world:get(id1, Poison) == 500)
+        CHECK(world:get(id1, Health) == 50)
+    end
+
+    do
+        CASE("delete entities using another Entity as component with Delete cleanup action")
+        local world = jecs.world()
+
+        local Health = world:entity()
+        world:add(Health, pair(jecs.OnDelete, jecs.Delete))
+        local Poison = world:component()
+
+        local id = world:entity()
+        world:set(id, Poison, 5)
+        CHECK_EXPECT_ERR(function()
+            world:set(id, Health, 50 :: any)
+        end)
+        local id1 = world:entity()
+        world:set(id1, Poison, 500)
+        CHECK_EXPECT_ERR(function()
+            world:set(id1, Health, 50 :: any)
+        end)
+
+        CHECK(world:has(id, Poison, Health))
+        CHECK(world:has(id1, Poison, Health))
+        world:delete(Poison)
+
+        CHECK(world:contains(id))
+        CHECK(not world:has(id, Poison))
+        CHECK(not world:has(id1, Poison))
+
+        world:delete(Health)
+        CHECK(not world:contains(id))
+        CHECK(not world:contains(id1))
+        CHECK(not world:has(id, Health))
+        CHECK(not world:has(id1, Health))
+    end
+
+    do
+        CASE("delete children")
+        local world = jecs.world()
+
+        local Health = world:component()
+        local Poison = world:component()
+        local FriendsWith = world:component()
+
+        local e = world:entity()
+        world:set(e, Poison, 5)
+        world:set(e, Health, 50)
+
+        local children = {}
+        for i = 1, 10 do
+            local child = world:entity()
+            world:set(child, Poison, 9999)
+            world:set(child, Health, 100)
+            world:add(child, pair(jecs.ChildOf, e))
+            table.insert(children, child)
+        end
+
+        BENCH("delete children of entity", function()
+            world:delete(e)
+        end)
+
+        for i, child in children do
+            CHECK(not world:contains(child))
+            CHECK(not world:has(child, pair(jecs.ChildOf, e)))
+            CHECK(not world:has(child, Health))
+        end
+
+        e = world:entity()
+
+        local friends = {}
+        for i = 1, 10 do
+            local friend = world:entity()
+            world:set(friend, Poison, 9999)
+            world:set(friend, Health, 100)
+            world:add(friend, pair(FriendsWith, e))
+            table.insert(friends, friend)
+        end
+
+        BENCH("remove friends of entity", function()
+            world:delete(e)
+        end)
+
+        for i, friend in friends do
+            CHECK(not world:has(friend, pair(FriendsWith, e)))
+            CHECK(world:has(friend, Health))
+            CHECK(world:contains(friend))
+        end
+    end
+
+    do
+        CASE("remove deleted ID from entities")
+        local world = jecs.world()
+        do
+            local A = world:component()
+            local B = world:component()
+            local C = world:component()
+            local id1 = world:entity()
+            local id2 = world:entity()
+            local id3 = world:entity()
+
+            world:set(id1, A, true)
+
+            world:set(id2, A, true)
+            world:set(id2, B, true)
+
+            world:set(id3, A, true)
+            world:set(id3, B, true)
+            world:set(id3, C, true)
+
+            world:delete(A)
+
+            CHECK(not world:has(id1, A))
+            CHECK(not world:has(id2, A))
+            CHECK(not world:has(id3, A))
+
+            CHECK(world:has(id2, B))
+            CHECK(world:has(id3, B, C))
+
+            world:delete(C)
+
+            CHECK(world:has(id2, B))
+            CHECK(world:has(id3, B))
+
+            CHECK(not world:contains(A))
+            CHECK(not world:contains(C))
+        end
+
+        do
+            local A = world:component()
+            world:add(A, pair(jecs.OnDeleteTarget, jecs.Delete))
+            local B = world:component()
+            local C = world:component()
+            world:add(C, pair(jecs.OnDeleteTarget, jecs.Delete))
+
+            local id1 = world:entity()
+            local id2 = world:entity()
+            local id3 = world:entity()
+
+            world:set(id1, C, true)
+
+            world:set(id2, pair(A, id1), true)
+            world:set(id2, B, true)
+
+            world:set(id3, B, true)
+            world:set(id3, pair(C, id2), true)
+
+            world:delete(id1)
+
+            CHECK(not world:contains(id1))
+            CHECK(not world:contains(id2))
+            CHECK(not world:contains(id3))
+        end
+
+        do
+            local A = world:component()
+            local B = world:component()
+            local C = world:component()
+            local id1 = world:entity()
+            local id2 = world:entity()
+            local id3 = world:entity()
+
+            world:set(id2, A, true)
+            world:set(id2, pair(B, id1), true)
+
+            world:set(id3, A, true)
+            world:set(id3, pair(B, id1), true)
+            world:set(id3, C, true)
+
+            world:delete(id1)
+
+            CHECK(not world:contains(id1))
+            CHECK(world:contains(id2))
+            CHECK(world:contains(id3))
+
+            CHECK(world:has(id2, A))
+            CHECK(world:has(id3, A, C))
+
+            CHECK(not world:target(id2, B))
+            CHECK(not world:target(id3, B))
+        end
+    end
+
+    do
+        CASE("fast delete")
+        local world = jecs.world()
+
+        local entities = {}
+        local Health = world:component()
+        local Poison = world:component()
+
+        for i = 1, 100 do
+            local child = world:entity()
+            world:set(child, Poison, 9999)
+            world:set(child, Health, 100)
+            table.insert(entities, child)
+        end
+
+        BENCH("simple deletion of entity", function()
+            for i = 1, START(100) do
+                local e = entities[i]
+                world:delete(e)
+            end
+        end)
+
+        for _, entity in entities do
+            CHECK(not world:contains(entity))
+        end
+    end
+
+    do
+        CASE("cycle")
+        local world = jecs.world()
+        local Likes = world:component()
+        world:add(Likes, pair(jecs.OnDeleteTarget, jecs.Delete))
+        local bob = world:entity()
+        local alice = world:entity()
+
+        world:add(bob, pair(Likes, alice))
+        world:add(alice, pair(Likes, bob))
+
+        world:delete(bob)
+        CHECK(not world:contains(bob))
+        CHECK(not world:contains(alice))
+    end
+
+    do
+        CASE("deleted entity should not be able to be operated on")
+        local world = jecs.world()
+        local e = world:entity()
+        local A = world:component()
+        world:set(e, A, true)
+        world:delete(e)
+        world:set(e, A, true)
+        CHECK(world:has(e, A) == false)
+    end
+end)
+
+TEST("world:each()", function()
+    local world = jecs.world()
+    local A = world:component()
+    local B = world:component()
+    local C = world:component()
+
+    local e3 = world:entity()
+    local e1 = world:entity()
+    local e2 = world:entity()
+
+    world:set(e1, A, true)
+
+    world:set(e2, A, true)
+    world:set(e2, B, true)
+
+    world:set(e3, A, true)
+    world:set(e3, B, true)
+    world:set(e3, C, true)
+
+    for entity in world:each(A) do
+        if entity == e1 or entity == e2 or entity == e3 then
+            CHECK(true)
+            continue
+        end
+        CHECK(false)
+    end
+end)
+
+TEST("world:added", function()
+    local world = jecs.world()
+    do
+        CASE("Should work even if set after the component has been used")
+        local A = world:component()
+        world:set(world:entity(), A, 2)
+        local ran = false
+        world:added(A, function()
+            ran = true
+        end)
+        local entity = world:entity()
+        world:set(entity, A, 3)
+        CHECK(ran)
+    end
+
+    do
+        CASE("")
+        local IsNearby = world:component()
+        world:set(IsNearby, jecs.Name, "IsNearby")
+        local person1, person2 = world:entity(), world:entity()
+
+        world:add(person2, jecs.pair(IsNearby, person1))
+        local IsNearby_added_called = false
+        world:added(IsNearby, function(...) -- This prints fine
+            IsNearby_added_called = true
+        end)
+        local IsNearby_removed_called = false
+        world:removed(IsNearby, function(...)
+            IsNearby_removed_called = true
+        end)
+
+        world:remove(person2, pair(IsNearby, person1))
+        world:add(person2, pair(IsNearby, person1))
+        world:remove(person2, pair(IsNearby, person1))
+
+        CHECK(IsNearby_added_called)
+        CHECK(IsNearby_removed_called)
+    end
+
+    do
+        CASE("Should work even if set after the pair has been used")
+        local A = world:component()
+        local B = world:component()
+
+        world:set(world:entity(), pair(A, B), 2)
+
+        local ran = false
+        world:added(A, function()
+            ran = true
+        end)
+
+        local entity = world:entity()
+        world:set(entity, pair(A, B), 3)
+        CHECK(ran)
+    end
+
+    do
+        CASE("Should allow setting signal after Relation has been used as a component")
+        local A = world:component()
+        local B = world:component()
+
+        world:add(world:entity(), A)
+
+        local ran = false
+        world:added(A, function()
+            ran = true
+        end)
+
+        world:add(world:entity(), pair(A, B))
+        CHECK(ran)
+    end
+
+    do
+        CASE("Should invoke signal for the Relation being set as a key despite a pair with Relation having been cached")
+        local A = world:component()
+        local B = world:component()
+
+        world:add(world:entity(), pair(A, B))
+
+        local ran = false
+        world:added(A, function()
+            ran = true
+        end)
+
+        world:add(world:entity(), A)
+
+        CHECK(ran)
+    end
+
+    do
+        CASE("Should not override hook")
+        local A = world:component()
+        local count = 1
+        local function counter()
+            count += 1
+        end
+        world:set(A, jecs.OnAdd, counter)
+        world:added(A, counter)
+        world:set(world:entity(), A, false)
+        CHECK(count == (1 + 2))
+        world:set(world:entity(), A, false)
+        CHECK(count == (1 + (2 * 2)))
+    end
+end)
+
+-- FOCUS()
+TEST("world:range()", function()
+    do
+        CASE("spawn entity under min range")
+        local world = jecs.world()
+        world:range(400, 1000)
+        local e = world:entity(300)
+        local e1 = world:entity(300)
+        CHECK(world:contains(e))
+        CHECK(world:contains(e1))
+    end
+    do
+        CASE("entity ID reuse works correctly across different world ranges")
+        local base = jecs.world()
+        base:range(1_000, 2_000)
+
+        local mirror = jecs.world()
+        mirror:range(3_000, 4_000)
+
+        mirror:entity() -- NOTE: this fixes the "attempt to index nil with 'dense'" error
+
+        local foo = base:entity()
+        local bar = mirror:entity(foo)
+
+        base:delete(base:entity()) -- Removing this line stops the error below from happening
+
+        local meow = base:entity()
+        mirror:delete(bar)
+
+        CHECK(jecs.ECS_ID(foo))
+        CHECK(jecs.ECS_ID(meow))
+        local mrrp = mirror:entity(meow) -- jecs, Line 785 - Entity ID is already in use with a different generation
+        CHECK(mrrp == meow)
+    end
+    do
+        CASE("axen2")
+        local world = jecs.world()
+        local mirror = jecs.world()
+
+        world:range(1000, 2000)
+        mirror:range(3000, 4000)
+
+        local foo = world:entity() -- 1000
+        local foo_mirror = mirror:entity(foo) -- 1000
+        CHECK(foo == foo_mirror)
+
+        for index = 1, 5 do
+            world:entity()
+        end
+
+        world:delete(foo)
+        mirror:delete(foo_mirror)
+
+        local bar = world:entity()
+        local bar_mirror = mirror:entity(bar)
+        CHECK(bar == bar_mirror)
+    end
+
+    print('<do CASE "delete outside partitioned range">')
+    if NOT_APPLICABLE then
+        CASE("delete outside partitioned range")
+        local server = jecs.world()
+        local client = jecs.world()
+
+        server:range(0, 1000)
+        client:range(1000, 5000)
+
+        local e1 = server:entity()
+        CHECK((e1 :: any) < 1000)
+        server:delete(e1)
+        local e2 = client:entity(e1)
+        CHECK(e2 == e1)
+        local A = client:component()
+        client:set(e2, A, true)
+        CHECK(client:get(e2, A))
+
+        client:delete(e2)
+
+        print("<client.entity_index.max_id>")
+        print(client.entity_index.max_id)
+        print("</client.entity_index.max_id>")
+
+        print("<client.entity_index.alive_count>")
+        print(client.entity_index.alive_count)
+        print("</client.entity_index.alive_count>")
+
+        print("</client.entity_index.dense_array[client.entity_index.alive_count]>")
+        print(client.entity_index.dense_array[client.entity_index.alive_count])
+        print("</client.entity_index.dense_array[client.entity_index.alive_count]>")
+        print("<client:entity()>")
+        local e3 = client:entity()
+        print("</client:entity()>")
+        print("<ECS_ID(e3) == 1001>")
+        CHECK(ECS_ID(e3) == 1001)
+        print("</ECS_ID(e3) == 1001>")
+
+        local e1v1 = server:entity()
+        local e4 = client:entity(e1v1)
+        CHECK(ECS_ID(e4) == e1 :: any)
+        CHECK(ECS_GENERATION(e4) == 1)
+        CHECK(not client:contains(e2))
+        CHECK(client:contains(e4))
+    end
+
+    print('</do CASE "delete outside partitioned range">')
+
+    do
+        CASE("desired id within range does not overwrite existing entities")
+        local world = jecs.world()
+        world:range(1000, 2000)
+
+        local ctype = world:component()
+
+        local e1 = world:entity(1000)
+        local e2 = world:entity(1001)
+        local e3 = world:entity(1002)
+
+        world:set(e1, ctype, "entity1")
+        world:set(e2, ctype, "entity2")
+        world:set(e3, ctype, "entity3")
+
+        local e4 = world:entity(1500)
+        world:set(e4, ctype, "entity4")
+
+        CHECK(world:contains(e1))
+        CHECK(world:contains(e2))
+        CHECK(world:contains(e3))
+        CHECK(world:contains(e4))
+        CHECK(world:get(e1, ctype) == "entity1")
+        CHECK(world:get(e2, ctype) == "entity2")
+        CHECK(world:get(e3, ctype) == "entity3")
+        CHECK(world:get(e4, ctype) == "entity4")
+    end
+
+    do
+        CASE("creating entity with range+offset does not conflict with existing")
+        local world = jecs.world()
+        world:range(500, 1000)
+
+        local ctype = world:component()
+
+        local base = world:entity(500)
+        world:set(base, ctype, "base")
+
+        local offset1 = world:entity(501)
+        world:set(offset1, ctype, "offset1")
+
+        local offset2 = world:entity(750)
+        world:set(offset2, ctype, "offset2")
+
+        CHECK(world:contains(base))
+        CHECK(world:contains(offset1))
+        CHECK(world:contains(offset2))
+        CHECK(world:get(base, ctype) == "base")
+        CHECK(world:get(offset1, ctype) == "offset1")
+        CHECK(world:get(offset2, ctype) == "offset2")
+    end
+
+    do
+        CASE("creating entities in reverse order within range")
+        local world = jecs.world()
+        world:range(100, 200)
+
+        local ctype = world:component()
+
+        local e3 = world:entity(150)
+        local e2 = world:entity(120)
+        local e1 = world:entity(110)
+
+        world:set(e1, ctype, 1)
+        world:set(e2, ctype, 2)
+        world:set(e3, ctype, 3)
+
+        -- All should exist independently
+        CHECK(world:contains(e1))
+        CHECK(world:contains(e2))
+        CHECK(world:contains(e3))
+        CHECK(world:get(e1, ctype) == 1)
+        CHECK(world:get(e2, ctype) == 2)
+        CHECK(world:get(e3, ctype) == 3)
+    end
+
+    do
+        CASE("creating entity with desired ID after range pre-population")
+        local world = jecs.world()
+        world:range(400, 1000)
+
+        local ctype = world:component()
+
+        -- Range pre-populates 1-399 with dense=0
+        -- Create an entity at a pre-populated position
+        local e1 = world:entity(300)
+        world:set(e1, ctype, "prepop")
+
+        -- Create another entity at a different pre-populated position
+        local e2 = world:entity(250)
+        world:set(e2, ctype, "prepop2")
+
+        -- Create entity within the range
+        local e3 = world:entity(500)
+        world:set(e3, ctype, "inrange")
+
+        -- All should work correctly
+        CHECK(world:contains(e1))
+        CHECK(world:contains(e2))
+        CHECK(world:contains(e3))
+        CHECK(world:get(e1, ctype) == "prepop")
+        CHECK(world:get(e2, ctype) == "prepop2")
+        CHECK(world:get(e3, ctype) == "inrange")
+    end
+
+    do
+        CASE("creating same entity twice returns existing entity")
+        local world = jecs.world()
+        world:range(1000, 2000)
+
+        local ctype = world:component()
+
+        -- Create entity
+        local e1 = world:entity(1500)
+        world:set(e1, ctype, "original")
+
+        -- Try to create it again
+        local e2 = world:entity(1500)
+
+        -- Should return the same entity
+        CHECK(e1 == e2)
+        CHECK(world:get(e1, ctype) == "original")
+        CHECK(world:get(e2, ctype) == "original")
+
+        -- Should only be one entity
+        local count = 0
+        for _ in world:query(ctype) do
+            count += 1
+        end
+        CHECK(count == 1)
+    end
+
+    do
+        CASE("creating entities with gaps in range does not affect existing")
+        local world = jecs.world()
+        world:range(200, 300)
+
+        local ctype = world:component()
+
+        -- Create entities with gaps
+        local e1 = world:entity(200)
+        local e2 = world:entity(250)
+        local e3 = world:entity(299)
+
+        world:set(e1, ctype, 1)
+        world:set(e2, ctype, 2)
+        world:set(e3, ctype, 3)
+
+        -- Create entity in the gap
+        local e4 = world:entity(225)
+        world:set(e4, ctype, 4)
+
+        -- All should still exist
+        CHECK(world:contains(e1))
+        CHECK(world:contains(e2))
+        CHECK(world:contains(e3))
+        CHECK(world:contains(e4))
+        CHECK(world:get(e1, ctype) == 1)
+        CHECK(world:get(e2, ctype) == 2)
+        CHECK(world:get(e3, ctype) == 3)
+        CHECK(world:get(e4, ctype) == 4)
+    end
+
+    do
+        CASE("creating many entities with desired IDs in range")
+        local world = jecs.world()
+        world:range(1000, 2000)
+
+        local ctype = world:component()
+        local entities = {}
+
+        -- Create 50 entities with specific IDs
+        for i = 1, 50 do
+            local id = 1000 + (i * 10)
+            local e = world:entity(id)
+            world:set(e, ctype, i)
+            entities[i] = e
+        end
+
+        -- Verify all exist and have correct values
+        for i = 1, 50 do
+            CHECK(world:contains(entities[i]))
+            CHECK(world:get(entities[i], ctype) == i)
+        end
+
+        -- Create more entities in between
+        for i = 1, 49 do
+            local id = 1000 + (i * 10) + 5
+            local e = world:entity(id)
+            world:set(e, ctype, i + 100)
+        end
+
+        -- Original entities should still be intact
+        for i = 1, 50 do
+            CHECK(world:contains(entities[i]))
+            CHECK(world:get(entities[i], ctype) == i)
+        end
+    end
+
+    if NOT_APPLICABLE then
+        CASE("sparse_array remains optimized with non-contiguous entity IDs")
+        local world = jecs.world()
+        local ctype = world:component()
+
+        -- Create entities with large gaps to test sparse_array optimization
+        -- Start with entity 100, then jump to 1000 (gap: 101-999)
+        local e1 = world:entity(100)
+        local e2 = world:entity(1000)
+        -- Then jump to 5000 (gap: 1001-4999)
+        local e3 = world:entity(5000)
+        -- Then jump to 10000 (gap: 5001-9999)
+        local e4 = world:entity(10000)
+
+        world:set(e1, ctype, 1)
+        world:set(e2, ctype, 2)
+        world:set(e3, ctype, 3)
+        world:set(e4, ctype, 4)
+
+        -- Verify all entities exist and have correct values
+        CHECK(world:contains(e1))
+        CHECK(world:contains(e2))
+        CHECK(world:contains(e3))
+        CHECK(world:contains(e4))
+        CHECK(world:get(e1, ctype) == 1)
+        CHECK(world:get(e2, ctype) == 2)
+        CHECK(world:get(e3, ctype) == 3)
+        CHECK(world:get(e4, ctype) == 4)
+
+        -- Verify intermediate IDs are pre-populated (they should exist but not be alive)
+        -- These are in the gaps between created entities
+        local sparse_array = world.entity_index.sparse_array
+        CHECK(sparse_array[500] ~= nil) -- Between 100 and 1000, should be pre-populated
+        CHECK(sparse_array[500].dense == 0) -- But not alive (dense=0)
+        CHECK(sparse_array[2500] ~= nil) -- Between 1000 and 5000, should be pre-populated
+        CHECK(sparse_array[2500].dense == 0)
+        CHECK(sparse_array[7500] ~= nil) -- Between 5000 and 10000, should be pre-populated
+        CHECK(sparse_array[7500].dense == 0)
+
+        -- Verify max_id was updated correctly
+        CHECK(world.entity_index.max_id == 10000)
+    end
+    do
+        CASE("desired id does not overwrite old entity id")
+        local world = jecs.world()
+        local ctype = world:component()
+        local id = world:entity()
+
+        print("<local e = world:entity(id + 1)>")
+        local e = world:entity((id :: any) + 1)
+        print("</local e = world:entity(id + 1)>")
+
+        CHECK(world:contains(id))
+        CHECK(world:contains(e))
+
+        -- also make sure that they don't share the same record
+
+        world:set(id, ctype, 1)
+        world:set(e, ctype, 2)
+
+        CHECK(world:get(id, ctype) == 1)
+        CHECK(world:get(e, ctype) == 2)
+    end
+
+    do
+        CASE("creating ids with a higher key first")
+        local world = jecs.world()
+        local ctype = world:component()
+
+        local e = world:entity(1000)
+        local id = world:entity(999)
+
+        CHECK(world:contains(id))
+        CHECK(world:contains(e))
+
+        -- also make sure that they don't share the same record
+
+        world:set(id, ctype, 1)
+        world:set(e, ctype, 2)
+
+        CHECK(world:get(id, ctype) == 1)
+        CHECK(world:get(e, ctype) == 2)
+    end
+
+    do
+        CASE("under range start")
+
+        local world = jecs.world()
+        world:range(400, 1000)
+        local id = world:entity()
+        local e = world:entity(id :: any + 5)
+        CHECK(e :: any == (id :: any) + 5)
+
+        CHECK(world:contains(e))
+        local e2 = world:entity(399)
+        CHECK(world:contains(e2))
+        world:delete(e2)
+        CHECK(not world:contains(e2))
+        local e2v1 = world:entity(399)
+        CHECK(world:contains(e2v1))
+        CHECK(ECS_ID(e2v1) == 399)
+        CHECK(ECS_GENERATION(e2v1) == 0)
+    end
+
+    do
+        CASE("over range start")
+        local world = jecs.world()
+        world:range(400, 1000)
+        local e2 = world:entity(405)
+        CHECK(world:contains(e2))
+        world:delete(e2)
+        CHECK(not world:contains(e2))
+        local e2v1 = world:entity(405)
+        CHECK(world:contains(e2v1))
+        CHECK(ECS_ID(e2v1) == 405)
+        CHECK(ECS_GENERATION(e2v1) == 0)
+
+        world:delete(e2v1)
+        local e2v2 = world:entity(e2v1)
+        CHECK(ECS_ID(e2v2) == 405)
+        CHECK(ECS_GENERATION(e2v2) == 0)
+    end
+end)
+
+TEST("world:entity()", function()
+    do
+        CASE("entity mirroring preserves IDs across world ranges")
+        local world = jecs.world()
+        world:range(2000, 3000)
+
+        local e0v1_id = jecs.ECS_COMBINE(1000, 1) -- id can be both within or outside the world's range
+        local e0v1 = world:entity(e0v1_id)
+        CHECK(world:contains(e0v1)) -- fails
+    end
+
+    do
+        CASE("component names persist after entity creation")
+        local world = jecs.world()
+        local C = world:component()
+
+        world:set(C, jecs.Name, "C")
+        CHECK(world:get(C, jecs.Name) == "C")
+        world:entity(2000)
+        CHECK(world:get(C, jecs.Name) == "C")
+    end
+    do
+        CASE("desired id")
+        local world = jecs.world()
+        local id = world:entity()
+        local offset: jecs.Entity = (id :: any) + 5
+        local e = world:entity(offset)
+        CHECK(e == offset)
+        CHECK(world:contains(e))
+        local e2 = world:entity(399)
+        CHECK(world:contains(e2))
+    end
+
+    do
+        CASE("desired id does not overwrite old entity id")
+        local world = jecs.world()
+        local ctype = world:component()
+        local id = world:entity()
+
+        local e = world:entity((id :: any) + 1)
+
+        CHECK(world:contains(id))
+        CHECK(world:contains(e))
+
+        -- also make sure that they don't share the same record
+
+        world:set(id, ctype, 1)
+        world:set(e, ctype, 2)
+
+        CHECK(world:get(id, ctype) == 1)
+        CHECK(world:get(e, ctype) == 2)
+    end
+
+    do
+        CASE("creating ids with a higher key first")
+        local world = jecs.world()
+        local ctype = world:component()
+
+        local e = world:entity(1000)
+        local id = world:entity(999)
+
+        CHECK(world:contains(id))
+        CHECK(world:contains(e))
+
+        -- also make sure that they don't share the same record
+
+        world:set(id, ctype, 1)
+        world:set(e, ctype, 2)
+
+        CHECK(world:get(id, ctype) == 1)
+        CHECK(world:get(e, ctype) == 2)
+    end
+
+    local N = 2 ^ 8
+
+    do
+        CASE("unique IDs")
+        local world = jecs.world()
+        local set = {}
+        for i = 1, N do
+            local e = world:entity()
+            CHECK(not set[e])
+            set[e] = true
+        end
+    end
+    do
+        CASE("generations")
+        local world = jecs.world()
+        local e = world:entity()
+        CHECK(ECS_ID(e) == 1 + jecs.Rest :: any)
+        CHECK(ECS_GENERATION(e) == 0) -- 0
+        e = ECS_GENERATION_INC(e)
+        CHECK(ECS_GENERATION(e) == 1) -- 1
+    end
+
+    do
+        CASE("pairs")
+        local world = jecs.world()
+        local _e = world:entity()
+        local e2 = world:entity()
+        local e3 = world:entity()
+
+        -- Incomplete pair, must have a bit flag that notes it is a pair
+        CHECK(IS_PAIR(world:entity()) == false)
+
+        local p = pair(e2, e3)
+        CHECK(IS_PAIR(p) == true)
+
+        CHECK(ecs_pair_first(world, p) == e2)
+        CHECK(ecs_pair_second(world, p) == e3)
+
+        world:delete(e2)
+        local e2v2 = world:entity() :: any
+        CHECK(IS_PAIR(e2v2) == false)
+
+        CHECK(IS_PAIR(pair(e2v2, e3) :: any) == true)
+    end
+
+    do
+        CASE("Recycling")
+        local world = jecs.world()
+        local e = world:entity()
+        world:delete(e)
+        local e1 = world:entity()
+        world:delete(e1)
+        local e2 = world:entity()
+        CHECK(ECS_ID(e2 :: any) :: any == e)
+        CHECK(ECS_GENERATION(e2 :: any) == 2)
+        CHECK(world:contains(e2))
+        CHECK(not world:contains(e1))
+        CHECK(not world:contains(e))
+    end
+
+    do
+        CASE("Recycling max generation")
+        local world = jecs.world()
+        local pin = (jecs.Rest :: any) :: number + 1
+        for i = 1, 2 ^ 16 - 1 do
+            local e = world:entity()
+            world:delete(e)
+        end
+        local e = world:entity()
+        CHECK(ECS_ID(e) == pin)
+        CHECK(ECS_GENERATION(e) == 2 ^ 16 - 1)
+        world:delete(e)
+        e = world:entity()
+        CHECK(ECS_ID(e) == pin)
+        CHECK(ECS_GENERATION(e) == 0)
+    end
+end)
+
+TEST("world:has()", function()
+    do
+        CASE("should find Tag on entity")
+        local world = jecs.world()
+
+        local Tag = world:entity()
+
+        local e = world:entity()
+        world:add(e, Tag)
+
+        CHECK(world:has(e, Tag))
+    end
+
+    do
+        CASE("should return false when missing one tag")
+        local world = jecs.world()
+
+        local A = world:entity()
+        local B = world:entity()
+        local C = world:entity()
+        local D = world:entity()
+
+        local e = world:entity()
+        world:add(e, A)
+        world:add(e, C)
+        world:add(e, D)
+
+        CHECK(world:has(e, A, B, C, D) == false)
+    end
+end)
+
+TEST("world:query()", function()
+    local N = 2 ^ 8
+
+    do
+        CASE("queries should accept zero-ids provided they use :with for the leading component")
+        local world = jecs.world()
+        local A = world:component()
+        local B = world:component()
+
+        local e1 = world:entity()
+        world:set(e1, A, "A")
+
+        local e2 = world:entity()
+        world:set(e2, A, "A")
+        world:set(e2, B, "B")
+
+        for e, a in world:query():with(A) do
+            CHECK(e == e1 or e == e2)
+            CHECK(a == nil)
+            if e == e1 then
+                CHECK(world:has(e1, A))
+                CHECK(not world:has(e1, B))
+            elseif e == e2 then
+                CHECK(world:has(e2, A, B))
+            end
+        end
+        for e, a in world:query():with(A):without(B) do
+            CHECK(e == e1)
+            CHECK(a == nil)
+            CHECK(world:has(e1, A))
+            CHECK(not world:has(e1, B))
+        end
+    end
+
+    if NOT_APPLICABLE then
+        CASE("query:archetypes(override) should create new archetypes list")
+        local world = jecs.world()
+        local A = world:component()
+        local B = world:component()
+
+        local q = world:query(A, B)
+        local e = world:entity()
+        world:set(e, A, false)
+        world:set(e, B, true)
+
+        CHECK(q:archetypes() == q:archetypes())
+        CHECK(q:archetypes() ~= q:archetypes(true))
+    end
+
+    if NOT_APPLICABLE then
+        CASE("cached")
+        local world = jecs.world()
+        local Foo = world:component()
+        local Bar = world:component()
+        local Baz = world:component()
+        local e = world:entity()
+        local q = world:query(Foo, Bar):without(Baz):cached()
+        world:set(e, Foo, true)
+        world:set(e, Bar, false)
+        local i = 0
+
+        local iter = 0
+        for _ in q:iter() do
+            iter += 1
+            i = 1
+        end
+        CHECK(iter == 1)
+        CHECK(i == 1)
+        for _ in q:iter() do
+            i = 2
+        end
+        CHECK(i == 2)
+        for _ in q do
+            i = 3
+        end
+        CHECK(i == 3)
+        for _ in q do
+            i = 4
+        end
+        CHECK(i == 4)
+
+        CHECK(#q:archetypes() == 1)
+        CHECK(not table.find(q:archetypes(), world.archetype_index[table.concat({ Foo, Bar, Baz }, "_")]))
+        world:delete(Foo)
+        CHECK(#q:archetypes() == 0)
+    end
+
+    do
+        CASE("3 components")
+        local world = jecs.world()
+        local A = world:component() :: jecs.Entity<boolean>
+        local B = world:component() :: jecs.Entity<boolean>
+        local C = world:component() :: jecs.Entity<boolean>
+        local e = world:entity()
+        world:set(e, A, true)
+        world:set(e, B, true)
+        world:set(e, C, true)
+        local q = world:query(A, B, C):cached()
+        local counter = 0
+        for x, a, b, c in q:iter() do
+            counter += 1
+            CHECK(a)
+            CHECK(b)
+            CHECK(c)
+        end
+        CHECK(counter == 1)
+    end
+    do
+        CASE("multiple iter")
+        local world = jecs.world()
+        local A = world:component() :: jecs.Entity<string>
+        local B = world:component() :: jecs.Entity<string>
+        local e = world:entity()
+        world:add(e, A)
+        world:add(e, B)
+        local q = world:query(A, B)
+        local counter = 0
+        for x in q:iter() do
+            counter += 1
+        end
+        for x in q:iter() do
+            counter += 1
+        end
+        CHECK(counter == 2)
+    end
+    do
+        CASE("tag")
+        local world = jecs.world()
+        local A = world:entity()
+        local e = world:entity()
+        CHECK_EXPECT_ERR(function()
+            world:set(e, A, "test" :: any)
+        end)
+        local count = 0
+        for id, a in world:query(A) :: any do
+            count += 1
+            CHECK(a == nil)
+        end
+        CHECK(count == 1)
+    end
+    do
+        CASE("pairs")
+        local world = jecs.world()
+
+        local C1 = world:component() :: jecs.Id<boolean>
+        local C2 = world:component() :: jecs.Id<boolean>
+        local T1 = world:entity()
+        local T2 = world:entity()
+
+        local e = world:entity()
+
+        local C1_C2 = pair(C1, C2)
+        world:set(e, C1_C2, true)
+        world:set(e, pair(C1, T1), true)
+        world:set(e, pair(T1, C1), true)
+        CHECK_EXPECT_ERR(function()
+            world:set(e, pair(T1, T2), true :: any)
+        end)
+
+        for id, a, b, c, d in world:query(pair(C1, C2), pair(C1, T1), pair(T1, C1), pair(T1, T2)):iter() do
+            CHECK(a == true)
+            CHECK(b == true)
+            CHECK(c == true)
+            CHECK(d == nil)
+        end
+    end
+    do
+        CASE("iterate wildcard pairs in cached query")
+        local world = jecs.world()
+        local pair = jecs.pair
+
+        local Relation = world:entity()
+        local Wildcard = jecs.Wildcard
+        local A = world:entity()
+
+        local relationship = pair(Relation, Wildcard)
+        local query = world:query(relationship):cached()
+
+        local entity = world:entity()
+
+        local p = pair(Relation, A)
+        CHECK(jecs.pair_first(world, p) == Relation)
+        CHECK(jecs.pair_second(world, p) == A)
+        world:add(entity, pair(Relation, A))
+
+        local counter = 0
+        for e in query:iter() do
+            counter += 1
+        end
+        CHECK(counter == 1)
+    end
+
+    do
+        CASE("iterate wildcard pairs in uncached query")
+        local world = jecs.world()
+        local pair = jecs.pair
+
+        local Relation = world:entity()
+        local Wildcard = jecs.Wildcard
+        local A = world:entity()
+
+        local relationship = pair(Relation, Wildcard)
+
+        local entity = world:entity()
+
+        world:add(entity, pair(Relation, A))
+
+        local counter = 0
+        for e in world:query(relationship):iter() do
+            counter += 1
+        end
+        CHECK(counter == 1)
+    end
+
+    do
+        CASE("query single component")
+        do
+            local world = jecs.world()
+            local A = world:component()
+            local B = world:component()
+
+            local entities = {}
+            for i = 1, N do
+                local id = world:entity()
+
+                world:set(id, A, true)
+                if i > 5 then
+                    world:set(id, B, true)
+                end
+                entities[i] = id
+            end
+
+            for id in world:query(A) :: any do
+                table.remove(entities, CHECK(table.find(entities, id)))
+            end
+
+            CHECK(#entities == 0)
+        end
+
+        do
+            local world = jecs.world()
+            local A = world:component()
+            local B = world:component()
+            local eA = world:entity()
+            world:set(eA, A, true)
+            local eB = world:entity()
+            world:set(eB, B, true)
+            local eAB = world:entity()
+            world:set(eAB, A, true)
+            world:set(eAB, B, true)
+
+            -- Should drain the iterator
+            local q = world:query(A)
+
+            local i = 0
+            local j = 0
+            for _ in q :: any do
+                i += 1
+            end
+            for _ in q :: any do
+                j += 1
+            end
+            CHECK(i == 2)
+            -- mErCS: an uncached query can be iterated again (jecs drains it)
+            CHECK(j == 2)
+        end
+    end
+
+    do
+        CASE("query missing component")
+        local world = jecs.world()
+        local A = world:component()
+        local B = world:component()
+        local C = world:component()
+
+        local e1 = world:entity()
+        local e2 = world:entity()
+
+        world:set(e1, A, "abc")
+        world:set(e2, A, "def")
+        world:set(e1, B, 123)
+        world:set(e2, B, 457)
+
+        local counter = 0
+        for _ in world:query(B, C) :: any do
+            counter += 1
+        end
+        CHECK(counter == 0)
+    end
+
+    do
+        CASE("query more than 8 components")
+        local world = jecs.world()
+        local components = {}
+
+        for i = 1, 9 do
+            local id = world:component()
+            world:component() -- make the components sparsely interleaved
+            components[i] = id
+        end
+        local e1 = world:entity()
+        for i, id in components do
+            world:set(e1, id, 13 ^ i)
+        end
+
+        for entity, a, b, c, d, e, f, g, h, i in world:query(unpack(components)) :: any do
+            CHECK(a == 13 ^ 1)
+            CHECK(b == 13 ^ 2)
+            CHECK(c == 13 ^ 3)
+            CHECK(d == 13 ^ 4)
+            CHECK(e == 13 ^ 5)
+            CHECK(f == 13 ^ 6)
+            CHECK(g == 13 ^ 7)
+            CHECK(h == 13 ^ 8)
+            CHECK(i == 13 ^ 9)
+        end
+    end
+
+    do
+        CASE("query more than 8 components")
+        local world = jecs.world()
+        local components = {}
+
+        for i = 1, 15 do
+            local id = world:component()
+            world:component() -- make the components sparsely interleaved
+            components[i] = id
+        end
+        local e1 = world:entity()
+        for i, id in components do
+            world:set(e1, id, 13 ^ i)
+        end
+
+        local q = world:query(unpack(components))
+
+        for entity, a, b, c, d, e, f, g, h, i, j, k, l, m, n, o in q do
+            CHECK(a == 13 ^ 1)
+            CHECK(b == 13 ^ 2)
+            CHECK(c == 13 ^ 3)
+            CHECK(d == 13 ^ 4)
+            CHECK(e == 13 ^ 5)
+            CHECK(f == 13 ^ 6)
+            CHECK(g == 13 ^ 7)
+            CHECK(h == 13 ^ 8)
+            CHECK(i == 13 ^ 9)
+            CHECK(j == 13 ^ 10)
+            CHECK(k == 13 ^ 11)
+            CHECK(l == 13 ^ 12)
+            CHECK(m == 13 ^ 13)
+            CHECK(n == 13 ^ 14)
+            CHECK(o == 13 ^ 15)
+        end
+    end
+
+    do
+        CASE("should be able to get next results")
+        local world = jecs.world()
+        world:component()
+        local A = world:component()
+        local B = world:component()
+        local eA = world:entity()
+        world:set(eA, A, true)
+        local eB = world:entity()
+        world:set(eB, B, true)
+        local eAB = world:entity()
+        world:set(eAB, A, true)
+        world:set(eAB, B, true)
+
+        local it = world:query(A):iter()
+
+        local e, data = it()
+        while e do
+            if e == eA then
+                CHECK(data)
+            elseif e == eAB then
+                CHECK(data)
+            else
+                CHECK(false)
+            end
+
+            e, data = it()
+        end
+        CHECK(true)
+    end
+
+    do
+        CASE("should query all matching entities when irrelevant component is removed")
+        local world = jecs.world()
+        local A = world:component()
+        local B = world:component()
+
+        local entities = {}
+        for i = 1, N do
+            local id = world:entity()
+
+            -- specifically put them in disorder to track regression
+            -- https://github.com/Ukendio/jecs/pull/15
+            world:set(id, B, true)
+            world:set(id, A, true)
+            if i > 5 then
+                world:remove(id, B)
+            end
+            entities[i] = id
+        end
+
+        local added = 0
+        for id in world:query(A) :: any do
+            added += 1
+            table.remove(entities, CHECK(table.find(entities, id)))
+        end
+
+        CHECK(added == N)
+    end
+
+    do
+        CASE("should query all entities without B")
+        local world = jecs.world()
+        local A = world:component()
+        local B = world:component()
+
+        local entities = {}
+        for i = 1, N do
+            local id = world:entity()
+
+            world:set(id, A, true)
+            if i < 5 then
+                entities[i] = id
+            else
+                world:set(id, B, true)
+            end
+        end
+
+        for id in world:query(A):without(B) :: any do
+            table.remove(entities, CHECK(table.find(entities, id)))
+        end
+
+        CHECK(#entities == 0)
+    end
+
+    do
+        CASE("should allow querying for relations")
+        local world = jecs.world()
+        local Eats = world:component()
+        local Apples = world:component()
+        local bob = world:entity()
+
+        world:set(bob, pair(Eats, Apples), true)
+        for e, bool in world:query(pair(Eats, Apples)) :: any do
+            CHECK(e == bob)
+            CHECK(bool)
+        end
+    end
+
+    do
+        CASE("should allow wildcards in queries")
+        local world = jecs.world()
+        local Eats = world:component()
+        local Apples = world:entity()
+        local bob = world:entity()
+
+        world:set(bob, pair(Eats, Apples), "bob eats apples")
+
+        local w = jecs.Wildcard
+        for e, data in world:query(pair(Eats, w)) :: any do
+            CHECK(e == bob)
+            CHECK(data == "bob eats apples")
+        end
+        for e, data in world:query(pair(w, Apples)) :: any do
+            CHECK(e == bob)
+            CHECK(data == "bob eats apples")
+        end
+    end
+
+    do
+        CASE("should match against multiple pairs")
+        local world = jecs.world()
+        local Eats = world:component()
+        local Apples = world:entity()
+        local Oranges = world:entity()
+        local bob = world:entity()
+        local alice = world:entity()
+
+        world:set(bob, pair(Eats, Apples), "bob eats apples")
+        world:set(alice, pair(Eats, Oranges), "alice eats oranges")
+
+        local w = jecs.Wildcard
+        local count = 0
+        for e, data in world:query(pair(Eats, w)) :: any do
+            count += 1
+            if e == bob then
+                CHECK(data == "bob eats apples")
+            else
+                CHECK(data == "alice eats oranges")
+            end
+        end
+
+        CHECK(count == 2)
+        count = 0
+
+        for e, data in world:query(pair(w, Apples)) :: any do
+            count += 1
+            CHECK(data == "bob eats apples")
+        end
+        CHECK(count == 1)
+    end
+
+    do
+        CASE("should only relate alive entities")
+        local world = jecs.world()
+        local Eats = world:entity()
+        local Apples = world:component()
+        local Oranges = world:component()
+        local bob = world:entity()
+        local alice = world:entity()
+
+        world:set(bob, Apples, "apples")
+        world:set(bob, pair(Eats, Apples), "bob eats apples")
+        world:set(alice, pair(Eats, Oranges), "alice eats oranges")
+
+        world:delete(Apples)
+        local Wildcard = jecs.Wildcard
+
+        local count = 0
+        for _, data in world:query(pair(Wildcard, Apples)) :: any do
+            count += 1
+        end
+
+        world:delete(pair(Eats, Apples))
+
+        CHECK(count == 0)
+        CHECK(world:get(bob, pair(Eats, Apples)) == nil)
+    end
+
+    do
+        CASE("should error when setting invalid pair")
+        local world = jecs.world()
+        local Eats = world:component()
+        local Apples = world:component()
+        local bob = world:entity()
+
+        world:delete(Apples)
+        CHECK_EXPECT_ERR(function()
+            world:set(bob, pair(Eats, Apples), "bob eats apples")
+        end)
+    end
+
+    do
+        CASE("should find target for ChildOf")
+        local world = jecs.world()
+        local ChildOf = jecs.ChildOf
+
+        local Name = world:component()
+
+        local bob = world:entity()
+        local alice = world:entity()
+        local sara = world:entity()
+
+        world:add(bob, pair(ChildOf, alice))
+        world:set(bob, Name, "bob")
+        world:add(sara, pair(ChildOf, alice))
+        world:set(sara, Name, "sara")
+        CHECK(world:parent(bob) == alice) -- O(1)
+
+        local count = 0
+        for _, name in world:query(Name, pair(ChildOf, alice)) :: any do
+            count += 1
+        end
+        CHECK(count == 2)
+    end
+
+    do
+        CASE("despawning while iterating")
+        local world = jecs.world()
+        local A = world:component()
+        local B = world:component()
+
+        local e1 = world:entity()
+        local e2 = world:entity()
+        world:add(e1, A)
+        world:add(e2, A)
+        world:add(e2, B)
+
+        local count = 0
+        for id in world:query(A) do
+            world:clear(id)
+            count += 1
+        end
+        CHECK(count == 2)
+    end
+
+    do
+        CASE("should not find any entities")
+        local world = jecs.world()
+
+        local Hello = world:component()
+        local Bob = world:component()
+
+        local helloBob = world:entity()
+        world:add(helloBob, pair(Hello, Bob))
+        world:add(helloBob, Bob)
+
+        local withoutCount = 0
+        for _ in world:query(pair(Hello, Bob)):without(Bob) :: any do
+            withoutCount += 1
+        end
+
+        CHECK(withoutCount == 0)
+    end
+
+    do
+        CASE("world:query():without()")
+        -- REGRESSION TEST
+        local world = jecs.world()
+        local _1, _2, _3 = world:component(), world:component(), world:component()
+
+        local counter = 0
+        for e, a, b in world:query(_1, _2):without(_3) :: any do
+            counter += 1
+        end
+        CHECK(counter == 0)
+    end
+end)
+
+TEST("world:remove()", function()
+    do
+        CASE("should allow remove a component that doesn't exist on entity")
+        local world = jecs.world()
+
+        local Health = world:component()
+        local Poison = world:component()
+
+        local id = world:entity()
+        do
+            world:remove(id, Poison)
+            CHECK(true) -- Didn't error
+        end
+
+        world:set(id, Health, 50)
+        world:remove(id, Poison)
+
+        CHECK(world:get(id, Poison) == nil)
+        CHECK(world:get(id, Health) == 50)
+    end
+end)
+
+TEST("world:set()", function()
+    do
+        CASE("Removing exclusive pair should traverse backwards on edge")
+        local world = jecs.world()
+        local a = world:entity()
+        local b = world:entity()
+        local c = world:entity()
+
+        local BattleLink = world:component()
+        world:add(BattleLink, jecs.Exclusive)
+
+        world:set(a, pair(BattleLink, b), {
+            timestamp = 1,
+            transform = vector.create(1, 2, 3),
+        })
+        world:set(a, pair(BattleLink, c), {
+            timestamp = 2,
+            transform = vector.create(1, 2, 3),
+        })
+
+        CHECK(not world:has(a, pair(BattleLink, b)))
+        CHECK(world:has(a, pair(BattleLink, c)))
+
+        world:remove(a, pair(BattleLink, c))
+
+        CHECK(not world:has(a, pair(BattleLink, b)))
+        CHECK(not world:has(a, pair(BattleLink, c)))
+        CHECK(not world:target(a, BattleLink))
+    end
+
+    do
+        CASE("Exclusive relations")
+        local world = jecs.world()
+        local A = world:component()
+        world:add(A, jecs.Exclusive)
+
+        local B = world:component()
+        local C = world:component()
+
+        local e = world:entity()
+        world:set(e, pair(A, B), true)
+        world:set(e, pair(A, C), true)
+
+        CHECK(world:has(e, pair(A, B)) == false)
+        CHECK(world:has(e, pair(A, C)) == true)
+
+        -- We have to test the path that checks the uncached method
+        local e1 = world:entity()
+
+        world:set(e1, pair(A, B), true)
+        world:set(e1, pair(A, C), true)
+
+        CHECK(world:has(e1, pair(A, B)) == false)
+        CHECK(world:has(e1, pair(A, C)) == true)
+    end
+
+    do
+        CASE("exclusive relations invoke hooks")
+        local world = jecs.world()
+        local A = world:component()
+        local B = world:component()
+        local C = world:component()
+
+        local e_ptr: jecs.Entity = (jecs.Rest :: any) + 1
+
+        world:add(A, jecs.Exclusive)
+        local on_remove_call = false
+        world:set(A, jecs.OnRemove, function(e, id)
+            on_remove_call = true
+        end)
+
+        local on_add_call_count = 0
+        world:set(A, jecs.OnAdd, function(e, id)
+            on_add_call_count += 1
+        end)
+
+        local e = world:entity()
+        CHECK(e == e_ptr)
+        world:set(e, pair(A, B))
+        CHECK(on_add_call_count == 1)
+        world:set(e, pair(A, C))
+        CHECK(on_add_call_count == 2)
+        CHECK(on_remove_call)
+
+        CHECK(world:has(e, pair(A, B)) == false)
+        CHECK(world:has(e, pair(A, C)) == true)
+
+        -- We have to ensure that it actually invokes hooks everytime it
+        -- traverses the archetype
+        e = world:entity()
+        world:add(e, pair(A, B))
+        CHECK(on_add_call_count == 3)
+        world:add(e, pair(A, C))
+        CHECK(on_add_call_count == 4)
+        CHECK(on_remove_call)
+
+        CHECK(world:has(e, pair(A, B)) == false)
+        CHECK(world:has(e, pair(A, C)) == true)
+    end
+
+    if NOT_APPLICABLE then
+        CASE("archetype move")
+        local world = jecs.world()
+
+        local d = dwi(world)
+
+        local _1 = world:component()
+        local _2 = world:component()
+        local e = world:entity()
+        -- An entity starts without an archetype or row
+        -- should therefore not need to copy over data
+        CHECK(d.tbl(e) == world.ROOT_ARCHETYPE)
+        CHECK(d.row(e) == 0)
+
+        local archetypes = #world.archetypes
+        -- This should create a new archetype since it is the first
+        -- entity to have moved there
+        world:set(e, _1, 1)
+        local oldRow = d.row(e)
+        local oldArchetype = d.archetype(e)
+        CHECK(#world.archetypes == archetypes + 1)
+        CHECK(oldArchetype == "1")
+        CHECK(d.tbl(e))
+        CHECK(oldRow == 1)
+
+        world:set(e, _2, 2)
+        CHECK(d.archetype(e) == "1_2")
+        -- Should have tuple of fields to the next archetype and set the component data
+        CHECK(d.tuple(e, 1, 2))
+        -- Should have moved the data from the old archetype
+        CHECK(world.archetype_index[oldArchetype].columns[_1 :: any][oldRow] == nil)
+    end
+
+    do
+        CASE("pairs")
+        local world = jecs.world()
+
+        local C1 = world:component()
+        local C2 = world:component()
+        local T1 = world:entity()
+        local T2 = world:entity()
+
+        local e = world:entity()
+
+        world:set(e, pair(C1, C2), true)
+        world:set(e, pair(C1, T1), true)
+        world:set(e, pair(T1, C1), true)
+
+        CHECK_EXPECT_ERR(function()
+            world:set(e, pair(T1, T2), true :: any)
+        end)
+
+        CHECK(world:get(e, pair(C1, C2)))
+        CHECK(world:get(e, pair(C1, T1)))
+        CHECK(world:get(e, pair(T1, C1)))
+        CHECK(not world:get(e, pair(T1, T2)))
+
+        local e2 = world:entity()
+
+        CHECK_EXPECT_ERR(function()
+            world:set(e2, pair(jecs.ChildOf, e), true :: any)
+        end)
+        CHECK(not world:get(e2, pair(jecs.ChildOf, e)))
+    end
+end)
+
+TEST("world:target()", function()
+    if NOT_APPLICABLE then
+        CASE("nth index")
+        local world = jecs.world()
+        local A = world:component()
+        world:set(A, jecs.Name, "A")
+        local B = world:component()
+        world:set(B, jecs.Name, "B")
+        local C = world:component()
+        world:set(C, jecs.Name, "C")
+        local D = world:component()
+        world:set(D, jecs.Name, "D")
+        local E = world:component()
+        world:set(E, jecs.Name, "E")
+        local e = world:entity()
+
+        world:add(e, pair(A, B))
+        world:add(e, pair(A, C))
+        world:add(e, pair(A, D))
+        world:add(e, pair(A, E))
+        world:add(e, pair(B, C))
+        world:add(e, pair(B, D))
+        world:add(e, pair(C, D))
+
+        CHECK((pair(A, B) :: any) < (pair(A, C) :: any))
+        CHECK((pair(A, C) :: any) < (pair(A, D) :: any))
+        CHECK((pair(C, A) :: any) < (pair(C, D) :: any))
+
+        CHECK(jecs.pair_first(world, pair(B, C)) == B)
+        local r = (jecs.entity_index_try_get(world.entity_index :: any, e :: any) :: any) :: jecs.Record
+        local archetype = r.archetype
+        local function cdr(id)
+            return assert(jecs.component_record(world, id))
+        end
+        local idr_b_c = cdr(pair(B, C))
+        local idr_a_wc = cdr(pair(A, __))
+        local idr_a_e = cdr(pair(A, E))
+
+        CHECK(idr_a_wc.counts[archetype.id] == 4)
+        CHECK(idr_b_c.records[archetype.id] > idr_a_e.records[archetype.id])
+        CHECK(world:target(e, A, 0) == B)
+        CHECK(world:target(e, A, 1) == C)
+        CHECK(world:target(e, A, 2) == D)
+        CHECK(world:target(e, A, 3) == E)
+        CHECK(world:target(e, B, 0) == C)
+        CHECK(world:target(e, B, 1) == D)
+        CHECK(world:target(e, C, 0) == D)
+        CHECK(world:target(e, C, 1) == nil)
+
+        CHECK(cdr(pair(A, B)).records[archetype.id] == 1)
+        CHECK(cdr(pair(A, C)).records[archetype.id] == 2)
+        CHECK(cdr(pair(A, D)).records[archetype.id] == 3)
+        CHECK(cdr(pair(A, E)).records[archetype.id] == 4)
+
+        CHECK(world:target(e, C, 0) == D)
+        CHECK(world:target(e, C, 1) == nil)
+    end
+
+    do
+        CASE("infer index when unspecified")
+        local world = jecs.world()
+        local A = world:component()
+        local B = world:component()
+        local C = world:component()
+        local D = world:component()
+        local e = world:entity()
+
+        world:add(e, pair(A, B))
+        world:add(e, pair(A, C))
+        world:add(e, pair(B, C))
+        world:add(e, pair(B, D))
+        world:add(e, pair(C, D))
+
+        CHECK(world:target(e, A) == world:target(e, A, 0))
+        CHECK(world:target(e, B) == world:target(e, B, 0))
+        CHECK(world:target(e, C) == world:target(e, C, 0))
+    end
+
+    do
+        CASE("loop until no target")
+        local world = jecs.world()
+
+        local ROOT = world:entity()
+        local e1 = world:entity()
+        local targets = {}
+
+        for i = 1, 10 do
+            local target = world:entity()
+            targets[i] = target
+            world:add(e1, pair(ROOT, target))
+        end
+
+        local i = 0
+        local target = world:target(e1, ROOT, 0)
+        while target do
+            i += 1
+            CHECK(targets[i] == target)
+            target = world:target(e1, ROOT, i)
+        end
+
+        CHECK(i == 10)
+    end
+end)
+
+TEST("world:targets()", function()
+    do
+        CASE("should find single relation")
+        local world = jecs.world()
+
+        local Alice = world:entity()
+        local Bob = world:entity()
+        local Likes = world:entity()
+
+        world:add(Alice, jecs.pair(Likes, Bob))
+
+        local i = 0
+        for target in world:targets(Alice, Likes) do
+            i += 1
+            CHECK(target == Bob)
+        end
+        CHECK(i == 1)
+    end
+    do
+        CASE("basic iteration")
+        local world = jecs.world()
+
+        local ROOT = world:entity()
+        local e1 = world:entity()
+        local targets = {}
+
+        for i = 1, 10 do
+            local target = world:entity()
+            targets[i] = target
+            world:add(e1, pair(ROOT, target))
+        end
+
+        local i = 0
+        for target in world:targets(e1, ROOT) do
+            i += 1
+            CHECK(targets[i] == target)
+        end
+
+        CHECK(i == 10)
+    end
+    do
+        CASE("multiple iterations")
+        local world = jecs.world()
+
+        local ROOT = world:entity()
+        local OTHER = world:entity()
+
+        local e = world:entity()
+
+        local root_targets = {}
+        local other_targets = {}
+
+        for i = 1, 5 do
+            local t = world:entity()
+            root_targets[i] = t
+            world:add(e, pair(ROOT, t))
+        end
+
+        for i = 1, 3 do
+            local t = world:entity()
+            other_targets[i] = t
+            world:add(e, pair(OTHER, t))
+        end
+
+        local i = 0
+        for target in world:targets(e, ROOT) do
+            i += 1
+            CHECK(root_targets[i] == target)
+        end
+        CHECK(i == 5)
+
+        local j = 0
+        for target in world:targets(e, OTHER) do
+            j += 1
+            CHECK(other_targets[j] == target)
+        end
+        CHECK(j == 3)
+    end
+    do
+        CASE("empty iterator")
+        local world = jecs.world()
+
+        local ROOT = world:entity()
+        local OTHER = world:entity()
+
+        local e = world:entity()
+
+        world:add(e, pair(ROOT, world:entity()))
+
+        local count = 0
+        for _ in world:targets(e, OTHER) do
+            count += 1
+        end
+
+        CHECK(count == 0)
+    end
+    do
+        CASE("should ignore deleted targets")
+        local world = jecs.world()
+
+        local ROOT = world:entity()
+        local e = world:entity()
+
+        local alive = {}
+        local dead = {}
+
+        for i = 1, 3 do
+            local t = world:entity()
+            alive[#alive + 1] = t
+            world:add(e, pair(ROOT, t))
+        end
+
+        for i = 1, 2 do
+            local t = world:entity()
+            dead[#dead + 1] = t
+            world:add(e, pair(ROOT, t))
+            world:delete(t)
+        end
+
+        local count = 0
+        for t in world:targets(e, ROOT) do
+            count += 1
+            CHECK(t ~= nil)
+        end
+
+        CHECK(count == #alive)
+    end
+    if NOT_APPLICABLE then
+        CASE("should properly handle rapid add/remove calls")
+        local world = jecs.world()
+
+        local ROOT = world:entity()
+        local e = world:entity()
+
+        local alive = {}
+        local all_targets = {} :: { Entity }
+
+        for i = 1, 100 do
+            local t = world:entity()
+            all_targets[#all_targets + 1] = t
+
+            world:add(e, jecs.pair(ROOT, t))
+            alive[t] = true
+        end
+
+        for i = 1, 500 do
+            local t: Entity
+            while t == nil do
+                t = all_targets[math.random(#all_targets)]
+            end
+
+            if math.random() < 0.5 then
+                world:remove(e, jecs.pair(ROOT, t))
+                alive[t] = nil
+            else
+                world:add(e, jecs.pair(ROOT, t))
+                alive[t] = true
+            end
+        end
+
+        local entity_index = world.entity_index
+        local function entity_index_check_alive(entity)
+            local r = entity_index.sparse_array[ECS_ID(entity)]
+
+            if not r or r.dense == 0 then
+                return false
+            end
+
+            local dense = r.dense
+            if dense > entity_index.alive_count then
+                return false
+            end
+            return entity_index.dense_array[dense] ~= nil
+        end
+
+        for i = 1, 10 do
+            local seen = {}
+            for t in world:targets(e, ROOT) do
+                CHECK(entity_index_check_alive(t))
+                CHECK(entity_index_check_alive(jecs.pair(ROOT, t)))
+
+                CHECK(alive[t] == true)
+
+                CHECK(seen[t] == nil)
+                seen[t] = true
+            end
+
+            for t, _ in pairs(alive) do
+                CHECK(seen[t] == true)
+            end
+
+            for j = 1, #all_targets do
+                local t = all_targets[j]
+
+                if math.random() < 0.5 then
+                    world:remove(e, jecs.pair(ROOT, t))
+                    alive[t] = nil
+                else
+                    world:add(e, jecs.pair(ROOT, t))
+                    alive[t] = true
+                end
+            end
+        end
+    end
+end)
+
+TEST("#adding a recycled target", function()
+    local world = jecs.world()
+    local R = world:component()
+
+    local e = world:entity()
+    local T = world:entity()
+    world:add(e, pair(R, T))
+    world:delete(T)
+    CHECK(not world:has(e, pair(R, T)))
+    local T2 = world:entity()
+    world:add(e, pair(R, T2))
+    CHECK(world:target(e, R) ~= T)
+    CHECK(world:target(e, R) ~= 0 :: any)
+end)
+
+TEST("#repro2", function()
+    local world = jecs.world()
+    local Lifetime = world:component() :: Id<number>
+    world:set(Lifetime, jecs.Name, "Lifetime")
+    local Particle = world:entity()
+    world:set(Particle, jecs.Name, "Particle")
+    local Beam = world:entity()
+
+    local entity = world:entity()
+    world:set(entity, pair(Lifetime, Particle), 1)
+    world:set(entity, pair(Lifetime, Beam), 2)
+    world:set(entity, pair(world:component(), world:component()), 6) -- noise
+
+    CHECK(world:get(entity, pair(Lifetime, Particle)) == 1)
+    CHECK(world:get(entity, pair(Lifetime, Beam)) == 2)
+
+    CHECK(world:target(entity, Lifetime, 0) == Particle)
+    CHECK(world:target(entity, Lifetime, 1) == Beam)
+
+    -- entity_visualizer.components(world, entity)
+
+    -- print(CHECK(world:has(jecs.ChildOf, jecs.Exclusive)))
+
+    for e in world:each(pair(Lifetime, __)) do
+        local i = 0
+        local nth = world:target(e, Lifetime, i)
+        while nth do
+            -- entity_visualizer.components(world, e)
+            local data = world:get(e, pair(Lifetime, nth)) :: number
+            if data > 0 then
+                data -= 1
+                world:set(e, pair(Lifetime, nth), data)
+            end
+            i += 1
+            nth = world:target(e, Lifetime, i)
+        end
+    end
+
+    CHECK(world:get(entity, pair(Lifetime, Particle)) == 0)
+    CHECK(world:get(entity, pair(Lifetime, Beam)) == 1)
+end)
+
+TEST("another", function()
+    local world = jecs.world()
+    -- world = lifetime_tracker_add(world, {padding_enabled=false})
+    local e1 = world:entity()
+    local e2 = world:entity()
+    local e3 = world:entity()
+    world:delete(e2)
+    local e2_e3 = pair(e2, e3)
+    CHECK(jecs.pair_first(world, e2_e3) == 0 :: any)
+    CHECK(jecs.pair_second(world, e2_e3) == e3)
+    CHECK_EXPECT_ERR(function()
+        world:add(e1, pair(e2, e3))
+    end)
+end)
+
+SKIP_TEST("#repro", function()
+    local world = jecs.world()
+
+    local function getTargets(relation)
+        local tgts = {}
+        local pairwildcard = pair(relation, jecs.Wildcard)
+        local idr = assert(jecs.component_record(world, pairwildcard))
+        local counts = idr.counts
+        local records = idr.records
+        for _, archetype in world:query(pairwildcard):archetypes() do
+            local archetype_id = archetype.id
+            local count = counts[archetype_id]
+            local tr = records[archetype_id]
+            local types = archetype.types
+            for _, entity in archetype.entities do
+                for i = 0, count - 1 do
+                    local tgt = jecs.pair_second(world, types[i + tr] :: any)
+                    table.insert(tgts, tgt)
+                end
+            end
+        end
+        return tgts
+    end
+
+    local Attacks = world:component()
+    local Eats = world:component()
+
+    local function setAttacksAndEats(entity1, entity2)
+        world:add(entity1, pair(Attacks, entity2))
+        world:add(entity1, pair(Eats, entity2))
+    end
+
+    local e1 = world:entity()
+    local e2 = world:entity()
+    local e3 = world:entity()
+    setAttacksAndEats(e3, e1)
+    setAttacksAndEats(e3, e2)
+    setAttacksAndEats(e1, e2)
+    local d = dwi(world)
+    world:delete(e2)
+    local types1 = { pair(Attacks, e1), pair(Eats, e1) }
+    table.sort(types1)
+
+    CHECK(d.tbl(e1).type == "")
+    CHECK(d.tbl(e3).type == table.concat(types1, "_"))
+
+    for _, entity in getTargets(Attacks) do
+        CHECK(entity == e1)
+    end
+    for _, entity in getTargets(Eats) do
+        CHECK(entity == e1)
+    end
+end)
+
+TEST("Hooks", function()
+    do
+        CASE("OnAdd")
+        local world = jecs.world()
+        local Transform = world:component()
+        local e1 = world:entity()
+        world:set(Transform, jecs.OnAdd, function(entity)
+            CHECK(e1 == entity)
+        end)
+        world:add(e1, Transform)
+    end
+
+    do
+        CASE("OnSet")
+        local world = jecs.world()
+        local Number = world:component()
+        local e1 = world:entity()
+
+        local call = 0
+        world:set(Number, jecs.OnChange, function(entity, data)
+            CHECK(e1 == entity)
+            if call == 1 then
+                CHECK(false)
+            elseif call == 2 then
+                CHECK(world:get(entity, Number) == data)
+            end
+            CHECK(data == 1)
+        end)
+
+        call = 1
+        world:set(e1, Number, 1)
+        call = 2
+        world:set(e1, Number, 1)
+    end
+
+    do
+        CASE("OnRemove")
+        do
+            -- basic
+            local world = jecs.world()
+            local A = world:component() :: Id<boolean>
+            local e1 = world:entity()
+            world:set(A, jecs.OnRemove, function(entity)
+                CHECK(e1 == entity)
+                CHECK(world:has(e1, A))
+            end)
+            world:add(e1, A)
+
+            world:remove(e1, A)
+            CHECK(not world:has(e1, A))
+        end
+        do
+            -- [BUG] https://github.com/Ukendio/jecs/issues/118
+            local world = jecs.world()
+            local A = world:component()
+            local B = world:component()
+            local e = world:entity()
+
+            world:set(A, jecs.OnRemove, function(entity: jecs.Entity)
+                world:set(entity, B, true)
+                CHECK(world:get(entity, A))
+                CHECK(world:get(entity, B))
+            end)
+
+            world:set(e, A, true)
+            world:remove(e, A)
+            CHECK(not world:get(e, A))
+            CHECK(world:get(e, B))
+        end
+    end
+end)
+
+TEST("change tracking", function()
+    do
+        CASE("#1")
+        local world = jecs.world()
+        local Foo = world:component() :: Id<number>
+        local Previous = jecs.Rest
+
+        local q1 = world:query(Foo):without(pair(Previous, Foo)):cached()
+
+        local e1 = world:entity()
+        world:set(e1, Foo, 1)
+        local e2 = world:entity()
+        world:set(e2, Foo, 2)
+
+        local i = 0
+        for e, new in q1 do
+            i += 1
+            world:set(e, pair(Previous, Foo), new)
+        end
+
+        CHECK(i == 2)
+        local j = 0
+        for e, new in q1 do
+            j += 1
+            world:set(e, pair(Previous, Foo), new)
+        end
+
+        CHECK(j == 0)
+    end
+
+    do
+        CASE("#2")
+        local world = jecs.world()
+        local component = world:component() :: Id<number>
+        local tag = world:entity()
+        local previous = jecs.Rest
+
+        local q1 = world:query(component):without(pair(previous, component), tag):cached()
+
+        local testEntity = world:entity()
+
+        world:set(testEntity, component, 10)
+
+        local i = 0
+        for entity, number in q1 do
+            i += 1
+            world:add(testEntity, tag)
+        end
+
+        CHECK(i == 1)
+
+        for e, n in q1 do
+            world:set(e, pair(previous, component), n)
+        end
+    end
+end)
+
+TEST("repro", function()
+    do
+        CASE("#1")
+        local world = jecs.world()
+        local reproEntity = world:component()
+        local components = { Cooldown = world:component() :: Id<number> }
+        world:set(reproEntity, components.Cooldown, 2)
+
+        local function updateCooldowns(dt: number)
+            local toRemove = {}
+
+            local it = world:query(components.Cooldown):iter()
+            for id, cooldown in it do
+                cooldown -= dt
+
+                if cooldown <= 0 then
+                    table.insert(toRemove, id)
+                    -- world:remove(id, components.Cooldown)
+                else
+                    world:set(id, components.Cooldown, cooldown)
+                end
+            end
+
+            for _, id in toRemove do
+                world:remove(id, components.Cooldown)
+                CHECK(not world:get(id, components.Cooldown))
+            end
+        end
+
+        updateCooldowns(1.5)
+        updateCooldowns(1.5)
+    end
+
+    do
+        CASE("#2") -- ISSUE #171
+        local world = jecs.world()
+        local component1 = world:component()
+        local tag1 = world:entity()
+
+        local query = world:query(component1):with(tag1):cached()
+
+        local entity = world:entity()
+        world:set(entity, component1, "some data")
+
+        local counter = 0
+        for x in query:iter() do
+            counter += 1
+        end
+        CHECK(counter == 0)
+    end
+end)
+
+TEST("wildcard query", function()
+    do
+        CASE("#1")
+        local world = jecs.world()
+        local pair = jecs.pair
+
+        local Relation = world:entity()
+        local Wildcard = jecs.Wildcard
+        local A = world:entity()
+
+        local relationship = pair(Relation, Wildcard)
+        local query = world:query(relationship):cached()
+
+        local entity = world:entity()
+
+        local p = pair(Relation, A)
+        CHECK(jecs.pair_first(world, p) == Relation)
+        CHECK(jecs.pair_second(world, p) == A)
+        world:add(entity, pair(Relation, A))
+
+        local counter = 0
+        for e in query:iter() do
+            counter += 1
+        end
+        CHECK(counter == 1)
+    end
+    do
+        CASE("#2")
+        local world = jecs.world()
+        local pair = jecs.pair
+
+        local Relation = world:entity()
+        local Wildcard = jecs.Wildcard
+        local A = world:entity()
+
+        local relationship = pair(Relation, Wildcard)
+
+        local entity = world:entity()
+
+        world:add(entity, pair(Relation, A))
+
+        local counter = 0
+        for e in world:query(relationship):iter() do
+            counter += 1
+        end
+        CHECK(counter == 1)
+    end
+    do
+        CASE("#3")
+        local world = jecs.world()
+        local pair = jecs.pair
+
+        local Relation = world:entity()
+        local Wildcard = jecs.Wildcard
+        local A = world:entity()
+
+        local entity = world:entity()
+
+        world:add(entity, pair(Relation, A))
+
+        local relationship = pair(Relation, Wildcard)
+        local query = world:query(relationship):cached()
+
+        local counter = 0
+        for e in query:iter() do
+            counter += 1
+        end
+        CHECK(counter == 1)
+    end
+end)
+
+print(`not applicable (jecs internals): {#skipped_tests} tests + 11 cases`)
+-- a failed case must fail the process (CI reads the exit code)
+assert(FINISH() == 0, "some test cases failed")

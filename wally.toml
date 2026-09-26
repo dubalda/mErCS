@@ -1,0 +1,15 @@
+[package]
+name = "dubalda/mercs"
+version = "0.1.0"
+registry = "https://github.com/UpliftGames/wally-index"
+realm = "shared"
+license = "MIT"
+# the package is the library only: wally 0.3 packs every file that `include` does not
+# override, so everything is excluded first
+exclude = ["**"]
+include = ["default.project.json", "src", "src/**", "wally.toml", "README.md", "LICENSE"]
+
+# only for the tests, the benchmarks and the Studio check: the library has no dependencies
+[dev-dependencies]
+jecs = "ukendio/jecs@0.11.0"
+jabby = "alicesaidhi/jabby@0.5.1"

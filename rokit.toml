@@ -1,0 +1,17 @@
+# Toolchain for mErCS development (managed by Rokit).
+# luau      - CLI runtime for tests and benchmarks (-O2, --codegen)
+# luau-lsp  - static type checking (luau-lsp analyze)
+# stylua    - formatting
+# selene    - linting
+# wally     - dev packages: jecs and jabby for comparisons, tests and the Studio check (DevPackages/)
+# wally-package-types - exported types in the Wally link modules (optional, see docs/development.md)
+# rojo      - builds of the library model and the Studio places and sourcemaps
+
+[tools]
+luau = "luau-lang/luau@0.703.0"
+luau-lsp = "johnnymorganz/luau-lsp@1.70.0"
+stylua = "johnnymorganz/stylua@2.5.2"
+selene = "kampfkarren/selene@0.31.0"
+wally = "upliftgames/wally@0.3.2"
+wally-package-types = "JohnnyMorganz/wally-package-types@1.6.2"
+rojo = "rojo-rbx/rojo@7.7.0"

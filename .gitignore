@@ -12,3 +12,31 @@ profile.svg
 
 # Time trace
 trace.json
+
+# Roblox type definitions downloaded by tools/check.sh
+tmp/
+
+# Places and models built with Rojo (studio/studio.project.json, default.project.json)
+*.rbxl
+*.rbxlx
+*.rbxm
+*.rbxmx
+
+.vscode/
+
+# Wally packages (wally install)
+Packages/
+ServerPackages/
+DevPackages/
+
+# Rojo sourcemaps (rojo sourcemap: luau-lsp, wally-package-types)
+sourcemap.json
+
+# The documentation site built by Moonwave (npx moonwave build)
+build/
+
+# The model and the Wally package built by CI (rojo build, wally package)
+mercs.rbxm
+mercs.zip
+
+.mcp.json
