@@ -1,7 +1,8 @@
 # Releases a version when a tag vX.Y.Z is pushed: checks that the tag matches wally.toml, runs
 # the checks and the tests, publishes the package to Wally and creates the GitHub release with
-# the model (mercs.rbxm). Needs the WALLY_AUTH_TOKEN secret: the token of `wally login` (the
-# registry rejects the automatic GITHUB_TOKEN). See docs/development/README.md.
+# the model (mercs.rbxm); the text of the release is the section of the tag in CHANGELOG.md.
+# Needs the WALLY_AUTH_TOKEN secret: the token of `wally login` (the registry rejects the
+# automatic GITHUB_TOKEN). See docs/development/README.md.
 name: Release
 
 on:
@@ -25,6 +26,19 @@ jobs:
             echo "::error::the tag $GITHUB_REF_NAME does not match version $version of wally.toml"
             exit 1
           fi
+      - name: Release notes from CHANGELOG.md
+        # the section "## vX.Y.Z ..." of the tag, up to the next "## " heading
+        run: |
+          awk -v tag="$GITHUB_REF_NAME" '
+            /^## / { if (found) exit; if ($2 == tag) { found = 1; next } }
+            found { print }
+          ' CHANGELOG.md > release-notes.md
+          if grep -q '[^[:space:]]' release-notes.md; then
+            echo "the release text is the section $GITHUB_REF_NAME of CHANGELOG.md"
+          else
+            echo "::warning::CHANGELOG.md has no section $GITHUB_REF_NAME: the release gets generated notes"
+            rm release-notes.md
+          fi
       - run: wally install
       - run: bash tools/check.sh
       - run: bash tools/test.sh
@@ -43,4 +57,10 @@ jobs:
       - name: GitHub release with the model
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create "$GITHUB_REF_NAME" mercs.rbxm --title "mErCS $GITHUB_REF_NAME" --generate-notes
+        run: |
+          if [ -f release-notes.md ]; then
+            notes=(--notes-file release-notes.md)
+          else
+            notes=(--generate-notes)
+          fi
+          gh release create "$GITHUB_REF_NAME" mercs.rbxm --title "mErCS $GITHUB_REF_NAME" "${notes[@]}"
