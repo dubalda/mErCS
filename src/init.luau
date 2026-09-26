@@ -2372,6 +2372,25 @@ local function world_new(debug: boolean?): World
         end
     end
 
+    -- Whether the slot has any id (its signature is not empty).
+    local function slot_has_ids(slot: number): boolean
+        for k = 1, sig_flat_used do
+            local mask = sig_flat[k][slot]
+            if mask and mask ~= 0 then
+                return true
+            end
+        end
+        local more = sig_more[slot]
+        if more then
+            for _, mask in more do
+                if mask ~= 0 then
+                    return true
+                end
+            end
+        end
+        return false
+    end
+
     local function world_clear(_: any, entity: i53)
         local slot = entity % ENTITY_MASK
         if alive[slot] ~= entity then
@@ -2584,6 +2603,12 @@ local function world_new(debug: boolean?): World
             id_used[slot] = nil
             if delete_depth == 0 and deferred[1] ~= nil then
                 drain_deferred()
+            end
+            -- a hook of the cascade may have given the entity ids again (a child that writes
+            -- into its parent while the parent is deleted): they go as well, or the freed slot
+            -- would keep them for the entity that reuses it
+            if alive[slot] == entity and slot_has_ids(slot) then
+                clear_slot(entity, slot, true)
             end
         else
             clear_slot(entity, slot, true)

@@ -679,6 +679,28 @@ TEST("hooks that change the entity being deleted", function()
         end
     end
     CHECK(q_calls == 2)
+
+    CASE("ids written into a parent by the hooks of its cascade do not stay in the world")
+    local Mark = world:entity()
+    local Counter = world:component()
+    world:set(Mark, ecs.OnRemove, function(entity: any)
+        local parent = world:parent(entity)
+        if parent then
+            world:set(parent, Counter, 1)
+        end
+    end)
+    local owner = world:entity()
+    local parent = world:entity()
+    world:add(parent, pair(ecs.ChildOf, owner))
+    local child = world:entity()
+    world:add(child, pair(ecs.ChildOf, parent))
+    world:add(child, Mark)
+    world:delete(parent)
+    CHECK(not world:contains(parent) and not world:contains(child))
+    CHECK(count(world:query(Counter)) == 0)
+    for _ = 1, 4 do
+        CHECK(not world:has(world:entity(), Counter))
+    end
 end)
 
 TEST("on_remove hooks set, changed and released at any time", function()
