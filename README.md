@@ -36,7 +36,7 @@ change tracking by ticks, disabled entities, hierarchies of any depth.
 Copy `src/init.luau` into your project as a ModuleScript (for example
 `ReplicatedStorage.mErCS`; `src/jabby.luau` is an optional child module for the jabby
 debugger), or sync the repository with Rojo (`default.project.json`), or depend on it through
-Wally (`mercs = "dubalda/mercs@0.1.1"`). The module has no dependencies; `--!native` is enabled
+Wally (`mercs = "dubalda/mercs@0.1.2"`). The module has no dependencies; `--!native` is enabled
 at the top of the file.
 
 ## Quick start

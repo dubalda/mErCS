@@ -4,8 +4,8 @@ registry = "test"
 
 [[package]]
 name = "alicesaidhi/jabby"
-version = "0.5.1"
-dependencies = [["jecs", "ukendio/jecs@0.10.4"], ["pebble", "alicesaidhi/pebble@0.2.0"], ["vide", "centau/vide@0.4.1"]]
+version = "0.6.1"
+dependencies = [["jecs", "ukendio/jecs@0.11.0"], ["pebble", "alicesaidhi/pebble@0.2.0"], ["vide", "centau/vide@0.4.1"]]
 
 [[package]]
 name = "alicesaidhi/pebble"
@@ -19,13 +19,8 @@ dependencies = []
 
 [[package]]
 name = "dubalda/mercs"
-version = "0.1.1"
-dependencies = [["jabby", "alicesaidhi/jabby@0.5.1"], ["jecs", "ukendio/jecs@0.11.0"]]
-
-[[package]]
-name = "ukendio/jecs"
-version = "0.10.4"
-dependencies = []
+version = "0.1.2"
+dependencies = [["jabby", "alicesaidhi/jabby@0.6.1"], ["jecs", "ukendio/jecs@0.11.0"]]
 
 [[package]]
 name = "ukendio/jecs"
