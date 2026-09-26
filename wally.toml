@@ -1,8 +1,11 @@
 [package]
 name = "dubalda/mercs"
-version = "0.1.0"
+version = "0.1.1"
 registry = "https://github.com/UpliftGames/wally-index"
 realm = "shared"
+description = "ECS for Luau and Roblox built on inverted bitsets, with a jecs-like API"
+homepage = "https://dubalda.github.io/mErCS/"
+repository = "https://github.com/dubalda/mErCS"
 license = "MIT"
 # the package is the library only: wally 0.3 packs every file that `include` does not
 # override, so everything is excluded first
