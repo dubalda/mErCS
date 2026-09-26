@@ -1,3 +1,4 @@
 std = "roblox"
-# vendored code (testkit), Wally packages and the copied jecs test suite
-exclude = ["vendor/**", "Packages/**", "DevPackages/**", "test/jecs_compat/**"]
+# the Roblox type definitions downloaded by tools/check.sh (tmp/), vendored code (testkit),
+# Wally packages and the copied jecs test suite
+exclude = ["tmp/**", "vendor/**", "Packages/**", "DevPackages/**", "test/jecs_compat/**"]

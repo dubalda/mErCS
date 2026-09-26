@@ -1,6 +1,6 @@
 # Checks every pull request and every push to main: formatting, lints and types, the tests in
 # the interpreter and with native code, the builds of the model and the Wally package, and the
-# documentation site (built, not published). See docs/development.md.
+# documentation site (built, not published). See docs/development/README.md.
 name: CI
 
 on:
@@ -74,7 +74,7 @@ jobs:
         with:
           node-version: 22
       - name: README links for the site
-        # docs/x.md on GitHub is docs/x on the site (README.md becomes the home page)
+        # docs/x/README.md on GitHub is docs/x on the site (README.md becomes the home page)
         run: |
-          sed -i -E 's#\]\(docs/([a-z-]+)\.md(\#[a-z0-9-]+)?\)#](docs/\1\2)#g' README.md
+          sed -i -E 's#\]\(docs/([a-z-]+)/README\.md(\#[a-z0-9-]+)?\)#](docs/\1\2)#g' README.md
       - run: npx --yes moonwave@1.4.2 build

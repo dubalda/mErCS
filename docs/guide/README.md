@@ -1,7 +1,3 @@
----
-sidebar_position: 1
----
-
 # Guide
 
 How mErCS works and how to use it. Every function is described in the API reference, which
@@ -9,7 +5,7 @@ is generated from the doc comments of `src/`: [mErCS](https://dubalda.github.io/
 (the module, the builtin ids and types), [World](https://dubalda.github.io/mErCS/api/World),
 [Query](https://dubalda.github.io/mErCS/api/Query) and the
 [jabby adapter](https://dubalda.github.io/mErCS/api/jabby). The names follow
-[jecs](https://github.com/Ukendio/jecs); [the comparison](jecs-comparison.md) lists the
+[jecs](https://github.com/Ukendio/jecs); [the comparison](../jecs-comparison/README.md) lists the
 differences.
 
 ```luau
@@ -264,7 +260,7 @@ data of the relation, or of the target for a tag relation), `ecs.Query<T...>`, `
 
 The library has no functions that exist only for jecs code: the jecs helpers and the calls
 that would do nothing here are not provided, and
-[Migrating from jecs](jecs-comparison.md#migrating-from-jecs) lists what to write instead.
+[Migrating from jecs](../jecs-comparison/README.md#migrating-from-jecs) lists what to write instead.
 What jabby reads from jecs internals lives in the [jabby adapter](#introspection-and-jabby).
 
 `query:cached()` does nothing on a shared query (without a concrete pair and without change

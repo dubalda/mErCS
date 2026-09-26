@@ -1,6 +1,6 @@
 # Builds the documentation site with Moonwave (the API reference from the doc comments of src/,
 # the pages of docs/, README.md as the home page) and publishes it to GitHub Pages
-# (Settings → Pages → Source: GitHub Actions). See docs/development.md.
+# (Settings → Pages → Source: GitHub Actions). See docs/development/README.md.
 name: Documentation
 
 on:
@@ -33,9 +33,9 @@ jobs:
         with:
           node-version: 22
       - name: README links for the site
-        # docs/x.md on GitHub is docs/x on the site (README.md becomes the home page)
+        # docs/x/README.md on GitHub is docs/x on the site (README.md becomes the home page)
         run: |
-          sed -i -E 's#\]\(docs/([a-z-]+)\.md(\#[a-z0-9-]+)?\)#](docs/\1\2)#g' README.md
+          sed -i -E 's#\]\(docs/([a-z-]+)/README\.md(\#[a-z0-9-]+)?\)#](docs/\1\2)#g' README.md
       - run: npx --yes moonwave@1.4.2 build
       - uses: actions/upload-pages-artifact@v5
         with:

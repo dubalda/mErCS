@@ -3,3 +3,5 @@ vendor/
 # Wally packages
 Packages/
 DevPackages/
+# Roblox type definitions that tools/check.sh downloads when the VS Code extension has none (CI)
+tmp/

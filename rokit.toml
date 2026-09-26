@@ -4,7 +4,7 @@
 # stylua    - formatting
 # selene    - linting
 # wally     - dev packages: jecs and jabby for comparisons, tests and the Studio check (DevPackages/)
-# wally-package-types - exported types in the Wally link modules (optional, see docs/development.md)
+# wally-package-types - exported types in the Wally link modules (optional, see docs/development/README.md)
 # rojo      - builds of the library model and the Studio places and sourcemaps
 
 [tools]

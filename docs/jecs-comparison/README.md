@@ -54,7 +54,7 @@ visualiser) are not applicable and are listed in `test/jecs_compat/README.md`.
   `new_low_id`, `query:iter()` and `is_tag` are not provided: they would only repeat native
   calls (see [Migrating from jecs](#migrating-from-jecs)).
 - jecs internals (`query:archetypes()`, `world.entity_index`, `entity_index_try_get`) are
-  not provided either; the [jabby adapter](intro.md#introspection-and-jabby) gives the debugger what it reads.
+  not provided either; the [jabby adapter](../guide/README.md#introspection-and-jabby) gives the debugger what it reads.
 - An uncached query can be iterated again (jecs drains it after the first loop).
 - `get` / `has` take up to 8 ids positionally (jecs: 4).
 - The iteration order is ascending by entity slot, not by archetype.
@@ -221,7 +221,7 @@ the minimum and the maximum, not the mean.
    | `world:cleanup()`, `query:fini()` | delete the call: there is nothing to release |
    | `jecs.ArchetypeCreate`, `jecs.ArchetypeDelete` | delete: there are no archetypes |
 
-   jabby needs the [adapter](intro.md#introspection-and-jabby) instead of the plain module.
+   jabby needs the [adapter](../guide/README.md#introspection-and-jabby) instead of the plain module.
 
    Then run the game: the world API, pairs, wildcards, hooks, signals, cleanup policies,
    `Name`, `jecs.component()` / `jecs.tag()` / `jecs.meta()` and the `ECS_*` helpers keep their
@@ -232,7 +232,7 @@ the minimum and the maximum, not the mean.
    hottest loops); hooks that use `oldarchetype` read the entity with `world:get` /
    `world:has`.
 3. Remove most `:cached()` calls: shared queries are cached already (see
-   [Coming from jecs](intro.md#coming-from-jecs)). Replace the observer addon with signals,
+   [Coming from jecs](../guide/README.md#coming-from-jecs)). Replace the observer addon with signals,
    hooks or `world:track` with the `:added` / `:changed` / `:removed` filters.
 4. Replace "collect the matches, then change them" loops with batch operations
    (`query:add_all`, `set_all`, `remove_all`, `delete_all`, `count`), and state flags stored

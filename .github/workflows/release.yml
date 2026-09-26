@@ -1,7 +1,7 @@
 # Releases a version when a tag vX.Y.Z is pushed: checks that the tag matches wally.toml, runs
 # the checks and the tests, publishes the package to Wally and creates the GitHub release with
 # the model (mercs.rbxm). Needs the WALLY_AUTH_TOKEN secret: the token of `wally login` (the
-# registry rejects the automatic GITHUB_TOKEN). See docs/development.md.
+# registry rejects the automatic GITHUB_TOKEN). See docs/development/README.md.
 name: Release
 
 on:
@@ -35,7 +35,7 @@ jobs:
           WALLY_AUTH_TOKEN: ${{ secrets.WALLY_AUTH_TOKEN }}
         run: |
           if [ -z "$WALLY_AUTH_TOKEN" ]; then
-            echo "::error::the WALLY_AUTH_TOKEN secret is not set: add the token of 'wally login' (docs/development.md)"
+            echo "::error::the WALLY_AUTH_TOKEN secret is not set: add the token of 'wally login' (docs/development/README.md)"
             exit 1
           fi
           wally login --token "$WALLY_AUTH_TOKEN"

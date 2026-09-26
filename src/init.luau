@@ -68,7 +68,7 @@
 
     get/has take at most 8 ids (get_list/has_all take any number); hooks get (entity, id,
     value); query:each is the fastest way to iterate. The API reference is the block of doc
-    comments after the types (published on the documentation site); docs/intro.md is the guide.
+    comments after the types (published on the documentation site); docs/guide/README.md is the guide.
 ]]
 
 --------------------------------------------------------------------------------
@@ -297,7 +297,7 @@ export type World = {
 
 --------------------------------------------------------------------------------
 -- API reference: Moonwave doc comments, published on the documentation site
--- (moonwave.toml; docs/intro.md is the guide)
+-- (moonwave.toml; docs/guide/README.md is the guide)
 --------------------------------------------------------------------------------
 
 --[=[

@@ -60,7 +60,7 @@ bench/gc.luau          garbage collector access that works in the luau CLI and i
 bench/visual/          Benchmarker plugin files (*.bench.luau): jecs against this library
 studio/                a Roblox place that runs the fuzz test, the frame and the matrix (check.project.json: its tree)
 vendor/testkit.luau    the test kit of the jecs suite (MIT)
-docs/                  the guide (intro.md), the comparison with jecs, this file
+docs/                  the index (README.md) and a folder per page: guide/, jecs-comparison/, development/
 moonwave.toml          the documentation site (Moonwave)
 .github/workflows/     CI, releases and the documentation site
 ```
@@ -145,7 +145,7 @@ How the plugin runs a bench file, which matters when writing a new one:
 The results, including an error message, are stored in the `BenchResults` attribute of the
 bench module. Its "Average" is the midpoint of the minimum and the maximum, not the mean:
 compare the medians (50th percentile). The results of these files, with screenshots, are in
-[Roblox Studio: Benchmarker](jecs-comparison.md#roblox-studio-benchmarker).
+[Roblox Studio: Benchmarker](../jecs-comparison/README.md#roblox-studio-benchmarker).
 
 ## Roblox Studio
 
@@ -245,16 +245,19 @@ The Wally package holds only the library: `wally.toml` excludes everything
 
 [Moonwave](https://eryn.io/moonwave/) builds it: the API reference from the doc comments of
 `src/` (the `--[=[ ]=]` blocks after the types of `src/init.luau`, and `src/jabby.luau`), the
-pages of `docs/` (`intro.md`, the guide, comes first: Moonwave links the navigation bar to
-it), and `README.md` as the home page. It needs Node.js 18 or newer:
+pages of `docs/`, and `README.md` as the home page. It needs Node.js 18 or newer:
 
 ```sh
 npx moonwave@1.4.2 dev     # a local preview that reloads on changes
 npx moonwave@1.4.2 build   # the static site in build/
 ```
 
-- The workflows rewrite the README links `docs/x.md` to `docs/x` before the build (the site
-  serves the pages without `.md`); a local preview shows these links as broken.
+- `docs/` has an index, `docs/README.md`, and a folder per page with a `README.md`, which
+  GitHub shows when the folder is opened. The index has `id: intro` in its front matter:
+  Moonwave links the navigation bar to the doc `intro`. The `_category_.json` of a folder
+  gives the label and the position of the page in the sidebar.
+- The workflows rewrite the README links `docs/x/README.md` to `docs/x` before the build
+  (the site serves a folder page at `docs/x`); a local preview shows these links as broken.
 - The pages are MDX: `<https://...>` autolinks break the build, write `[text](url)`.
 - Generics in the name of a `@type` break its page: write `@type Pair Id<First | Second>` and
   give `Pair<First, Second>` in the text. Parameters and returns may use generics.

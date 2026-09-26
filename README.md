@@ -6,7 +6,7 @@ it. Adding or removing a component never moves an entity and never creates an ar
 frequent structural changes — state tags, relationships, spawning and despawning — stay O(1),
 memory does not grow with the number of component combinations, and there is nothing to clean
 up. The API follows [jecs](https://github.com/Ukendio/jecs); moving jecs code over takes a few
-mechanical changes (see [Migrating from jecs](docs/jecs-comparison.md#migrating-from-jecs)).
+mechanical changes (see [Migrating from jecs](docs/jecs-comparison/README.md#migrating-from-jecs)).
 
 Status: pre-release. Tested with the standalone `luau` 0.703 CLI (interpreter and native code
 generation) and in Roblox Studio with the Benchmarker plugin and the jabby debugger; the full
@@ -26,7 +26,7 @@ Studio check (`studio/`) is pending.
 
 In Roblox Studio (the Benchmarker plugin, native code) mErCS takes 0.53× of the jecs time to
 spawn entities, 0.17× to remove a component, 0.22× for a hierarchy with relationships and
-0.10× for batch changes; see the [results and screenshots](docs/jecs-comparison.md#roblox-studio-benchmarker).
+0.10× for batch changes; see the [results and screenshots](docs/jecs-comparison/README.md#roblox-studio-benchmarker).
 
 Beyond jecs: `query:each` (the fastest loop), OR terms, batch operations on query matches,
 change tracking by ticks, disabled entities, hierarchies of any depth.
@@ -80,11 +80,11 @@ world:query(Position):with(Frozen):remove_all(Velocity)
 The [documentation site](https://dubalda.github.io/mErCS/) holds the API reference (built
 from the doc comments of `src/`) and these pages:
 
-- [Guide](docs/intro.md) — worlds, components, queries, batch operations, relationships,
+- [Guide](docs/guide/README.md) — worlds, components, queries, batch operations, relationships,
   hooks, change tracking, the jabby adapter, types.
-- [Comparison with jecs](docs/jecs-comparison.md) — design, differences, benchmarks,
+- [Comparison with jecs](docs/jecs-comparison/README.md) — design, differences, benchmarks,
   migrating from jecs.
-- [Development](docs/development.md) — layout, tests, checks, benchmarks, Roblox Studio,
+- [Development](docs/development/README.md) — layout, tests, checks, benchmarks, Roblox Studio,
   CI and releases.
 
 ## License

@@ -1,1 +1,5 @@
-*        text eol=lf
+# Text files are stored and checked out with LF; binary files (detected, and the images
+# explicitly) are never converted.
+* text=auto eol=lf
+*.png binary
+*.PNG binary
