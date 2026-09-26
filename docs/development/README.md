@@ -185,13 +185,19 @@ The workflows of `.github/workflows/` get the tools from `rokit.toml` (the
 | Workflow | When | What |
 |---|---|---|
 | `ci.yml` | every pull request and push to `main` | `tools/check.sh`; `tools/test.sh` in the interpreter and with native code, plus 3 fuzz runs of 400 rounds (`wide hooks`); the model `mercs.rbxm` and the Wally package as artifacts; the documentation site is built, not published |
-| `release.yml` | a pushed tag `vX.Y.Z` | the tag must match `version` in `wally.toml`; checks and tests; `wally publish`; a GitHub release with `mercs.rbxm` |
+| `release.yml` | a pushed tag `vX.Y.Z` | the tag must match `version` in `wally.toml`; checks and tests; `wally publish`; a GitHub release with `mercs.rbxm`, whose text is the section of the tag in `CHANGELOG.md` (generated notes when there is none) |
 | `docs.yml` | a push to `main` that changes `src/`, `docs/`, `README.md` or `moonwave.toml` | builds the documentation site and publishes it to GitHub Pages |
 
-To release a version, set it in `wally.toml`, commit, then push the tag:
+To release a version:
+
+1. Add a section `## vX.Y.Z — date` at the top of `CHANGELOG.md`. It becomes the text of the
+   GitHub release (up to the next `## ` heading), so write links as absolute URLs. The site
+   shows `CHANGELOG.md` as its Changelog page.
+2. Set the version (without the `v`) in `wally.toml`.
+3. Commit, wait for a green CI, then push the tag:
 
 ```sh
-git tag v0.2.0
+git tag -a v0.2.0 -m "mErCS v0.2.0"
 git push origin v0.2.0
 ```
 
