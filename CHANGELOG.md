@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v0.1.2 — 2026-09-26
 
 ### Fixed
 
@@ -8,6 +8,11 @@
   hook sets a component of its parent while the parent is deleted) no longer leaves those ids
   on the freed slot: the deleted entity stayed in queries as a dead id, and the next entity
   that reused the slot inherited the ids.
+
+### Installation
+
+- Wally: `mercs = "dubalda/mercs@0.1.2"`.
+- Roblox model: `mercs.rbxm`, attached to this release.
 
 ## v0.1.1 — 2026-09-26
 
