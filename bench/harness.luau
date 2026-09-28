@@ -16,7 +16,10 @@
 local gc = require("./gc")
 
 export type Impl = {
+    -- the key of the `impls` option of bench/run.luau
     name: string,
+    -- the column header, with the version (the name when absent)
+    label: string?,
     ecs: any,
     features: { [string]: boolean },
     -- Creates a component id without hitting implementation limits.
@@ -181,7 +184,7 @@ local function run(impls: { Impl }, scenarios: { Scenario }, options: Options)
 
     local header = pad("scenario", NAME_WIDTH)
     for _, impl in active do
-        header ..= pad(impl.name, CELL_WIDTH)
+        header ..= pad(impl.label or impl.name, CELL_WIDTH)
     end
     print(header)
     print(string.rep("-", NAME_WIDTH + CELL_WIDTH * #active))
@@ -257,7 +260,7 @@ local function run(impls: { Impl }, scenarios: { Scenario }, options: Options)
         for index, impl in active do
             local result = results[index]
             if result.error then
-                print(`  ! {impl.name}: {result.error}`)
+                print(`  ! {impl.label or impl.name}: {result.error}`)
             end
         end
     end

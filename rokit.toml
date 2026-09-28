@@ -8,8 +8,8 @@
 # rojo      - builds of the library model and the Studio places and sourcemaps
 
 [tools]
-luau = "luau-lang/luau@0.703.0"
-luau-lsp = "johnnymorganz/luau-lsp@1.70.0"
+luau = "luau-lang/luau@0.740.0"
+luau-lsp = "johnnymorganz/luau-lsp@1.70.1"
 stylua = "johnnymorganz/stylua@2.5.2"
 selene = "kampfkarren/selene@0.31.0"
 wally = "upliftgames/wally@0.3.2"

@@ -4,10 +4,11 @@
 	Benchmark entry point.
 
 	Run from the repository root (all arguments are optional):
-		luau -O2 bench/run.luau -a filter=query,pair impls=jecs,lib,best reps=5 n=131072
+		luau -O2 bench/run.luau -a filter=query,pair impls=jecs,previous,lib reps=5 n=131072
 		luau -O2 --codegen bench/run.luau -a ...
 
 	`filter` is a comma-separated list of substrings matched against "<group>.<name>".
+	`impls` picks among jecs, previous (the previous release, after tools/previous.sh) and lib.
 ]]
 
 local harness = require("./harness")

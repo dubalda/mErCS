@@ -59,14 +59,14 @@ return {
     AfterEach = function() end,
 
     Functions = {
-        ["Jecs"] = function(_Profiler: any)
+        [libs.jecs_label] = function(_Profiler: any)
             for _ = 1, 10 do
                 for _entity, _a, _b, _c, _d in jecs_setup.query do
                 end
             end
         end,
 
-        ["mErCS"] = function(_Profiler: any)
+        [libs.lib_label] = function(_Profiler: any)
             for _ = 1, 10 do
                 for _entity, _a, _b, _c, _d in lib_setup.query do
                 end
@@ -74,7 +74,7 @@ return {
         end,
 
         -- the fastest loop of mErCS: a callback per entity
-        ["mErCS each"] = function(_Profiler: any)
+        [`{libs.lib_label} each`] = function(_Profiler: any)
             local function visit(_entity: any, _a: any, _b: any, _c: any, _d: any) end
             for _ = 1, 10 do
                 lib_setup.query:each(visit)

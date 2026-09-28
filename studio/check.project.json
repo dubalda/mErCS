@@ -23,6 +23,12 @@
       "scenarios": {
         "$path": "../bench/scenarios.luau"
       },
+      "shapes": {
+        "$path": "../bench/shapes.luau"
+      },
+      "versions": {
+        "$path": "../bench/versions.luau"
+      },
       "frame_scene": {
         "$path": "../bench/frame_scene.luau"
       },

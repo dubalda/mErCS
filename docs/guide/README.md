@@ -16,6 +16,7 @@ local world = ecs.world()
 ## Contents
 
 - [Worlds, entities and ids](#worlds-entities-and-ids)
+- [Slot pools](#slot-pools)
 - [Components and tags](#components-and-tags)
 - [Queries](#queries)
 - [Batch operations](#batch-operations)
@@ -31,7 +32,9 @@ local world = ecs.world()
 
 A world holds entities and the components, tags and pairs on them. `ecs.world(true)` makes a
 debug world: changes of entities or ids that are not alive raise errors instead of being
-ignored, which helps while code is written or migrated.
+ignored, which helps while code is written or migrated; every match list that a cached query
+updates after a change (see [Queries](#queries)) is checked against a scan of the bitsets, and
+a query that takes its list as it is checks that none of its ids changed.
 
 Entity ids are numbers: slot + generation × 2^24. A deleted slot is reused with the next
 generation, so an old handle of it is not alive anymore — `world:contains(e)` tells.
@@ -42,6 +45,27 @@ removes the ids and keeps the entity.
 `world:component()` makes an id that can hold data (an entity with the `Component` trait);
 the first 256 are the ids 1..256, then any entity id: there is no limit. Networked worlds can
 split the id space with `world:range(first, last)`.
+
+## Slot pools
+
+Every component, tag and pair keeps a bitset over the entity slots, and a query reads 32 slots
+per word. When a kind of entities is created among many others (creatures, each followed by
+its hundreds of skills and effects), each creature sits alone in its word and its value page,
+and a query over the creatures reads a word per creature. A slot pool keeps such a kind
+together:
+
+```luau
+local creatures = world:pool()
+local npc = creatures:entity() -- world:entity() for the skills does not scatter the creatures
+world:set(npc, Model, model)
+```
+
+- `pool:entity()` takes a slot from blocks of 256 slots (one value page) reserved for the pool;
+  `world:delete` gives the slot back to the pool, with the next generation.
+- Pool entities are ordinary entities: every world call and every query accepts them.
+- Each pool takes at least one block of 256 slots: pools are for kinds with many entities.
+- The slots of a reserved block count as used for `world:exists`; `world:range` bounds the
+  blocks as well.
 
 ## Components and tags
 
@@ -79,16 +103,26 @@ local ok = q:has(entity)                          -- the entity matches the quer
 - A query never goes stale: the ids in it may be created and deleted at any time.
 - `world:query(...)` inside a system is cheap. Queries of the same shape (returned ids,
   `with` and `without` ids) share one internal state, so a query written inline allocates
-  only a small handle. While the result does not change and its matches are scattered, the
-  shared state keeps a dense list of them (up to 65 536 entities) and iterates that.
+  only a small handle.
+- A cached query whose matches are scattered keeps a list of them (up to 65 536 entities),
+  grouped by value page, and iterates that. Between two loops it notes the slots whose ids
+  changed and updates only those in the list, so a tag toggled on a few entities costs a few
+  list edits, not a scan of the bitsets; many changes at once (batch operations, `remove_all`,
+  hundreds of edits) make it scan again. A query that matches nothing keeps an empty list.
+- Before a loop, a query with a list checks whether its ids changed since its previous loop.
+  When no id of any cached query changed anywhere in the world since then, it skips that check
+  as well: a loop over an empty list then costs a comparison.
 - Queries with change filters or on pairs with a concrete target get their own state: call
-  `q:cached()` on such a query when it is stored and iterated many times. An iteration of a
-  stored query allocates nothing.
+  `q:cached()` on such a query when it is stored and iterated many times. `q:cached()` also
+  prepares a query that has not been iterated yet (picks how it iterates and builds its list),
+  so that its first loop costs no more than the next ones. An iteration of a stored query
+  allocates nothing.
 - Changing the current entity inside the loop is allowed, deleting it too. Changes of other
   entities may or may not be seen by the running loop; an entity deleted ahead of the loop
   (for example by a `ChildOf` cascade) may still be returned once, as a dead id with nil
   values: loops that delete other entities should check `world:contains(e)`.
-- Loops over the same query may be nested, also when the inner loop changes the world. The
+- Loops over the same query may be nested, also when the inner loop changes the world, and a
+  for-in loop may be left with `break` (the next update of the list copies it once). The
   iteration order is ascending by entity slot.
 
 ### The fast path: `spans` and `column`
@@ -158,9 +192,17 @@ for entity in world:query(ecs.pair(Likes, ecs.Wildcard)) do end -- any target of
   `R` is deleted, and `world:add(R, ecs.pair(ecs.OnDeleteTarget, ecs.Delete))` deletes the
   sources of a deleted target (`ChildOf` does this). The default is `Remove`: they lose the id
   or the pair.
-- The record of a pair is freed when its last entity loses it or when its relation or target
-  is deleted: nothing accumulates. Cascading deletes of any depth work (past 100 nested levels
-  the rest is queued).
+- The record of a pair lives while an entity has the pair. The records that no entity has
+  are freed in batches, once there are more than 256 of them and they are more than a quarter
+  of all pair records (a pair added again before that keeps its record), and the records of
+  a relation or a target are freed when it is deleted: nothing accumulates.
+- Cascading deletes of any depth work. Past 100 nested levels the rest is queued: the queued
+  entities lose the id being deleted at once (its `OnRemove` runs for them with
+  `deleting = true`) and are deleted after the cascade.
+- `ecs.pair(ecs.Wildcard, T)` (any relation to `T`) is built from the pairs of `T` the first
+  time a query, `has`, `world:each` or `remove` reads it, and kept up to date from then on;
+  until then the pairs of `T` cost nothing more. It returns the value of a pair only when a
+  pair of `T` holds data.
 
 ## Hooks and signals
 
@@ -175,12 +217,21 @@ disconnect()
 
 - Hooks may be set and removed at any time; hooks set on a relation apply to all its pairs.
 - A hook and the signal listeners of an id (change tracking included) all run, the hook
-  first, whatever the order they were set in.
+  first, whatever the order they were set in. They run after what the library itself does
+  for its builtin ids (`Exclusive`, `OnAdd`, `OnChange`, `OnRemove`), which they cannot
+  replace.
+- Signals and change tracking take a component, a tag or a relation, which covers all its
+  pairs: `world:added(Likes, fn)` runs for every pair of `Likes`. A pair (`ecs.pair(Likes, bob)`
+  or a wildcard pair) raises an error.
 - A listener may connect or disconnect listeners, itself included, while it runs: the change
   applies from the next event.
 - `OnRemove` runs before anything is removed, so the other values of the entity can still be
   read; `deleting` is true when the entity itself is being deleted. When a hook removes
   another id of the entity, the `OnRemove` of that id runs once, from the removal.
+- An error raised by a hook or a listener is not caught: the call that ran it stops half
+  done. When it interrupts a delete, the cascade stops, and the world may no longer finish
+  the cascades deeper than 100 levels queued afterwards or run the hooks of that entity
+  again. Treat such an error as fatal for the world.
 
 ## Change tracking
 
@@ -253,7 +304,8 @@ for entity, position, health in world:query(Position, Health) do end -- Vector3,
 ```
 
 Exported types: `ecs.Id<T>`, `ecs.Entity<T>`, `ecs.Component<T>`, `ecs.Pair<R, T>` (the
-data of the relation, or of the target for a tag relation), `ecs.Query<T...>`, `ecs.World`.
+data of the relation, or of the target for a tag relation), `ecs.Query<T...>`, `ecs.World`,
+`ecs.Pool`.
 `test/types.luau` shows the typed API as a whole.
 
 ## Coming from jecs
@@ -263,6 +315,7 @@ that would do nothing here are not provided, and
 [Migrating from jecs](../jecs-comparison/README.md#migrating-from-jecs) lists what to write instead.
 What jabby reads from jecs internals lives in the [jabby adapter](#introspection-and-jabby).
 
-`query:cached()` does nothing on a shared query (without a concrete pair and without change
-filters): `world:query(...)` returns a state that is cached already. Hooks do not receive the
-`oldarchetype` argument of jecs (there are no archetypes).
+`world:query(...)` returns a state that is cached already for a shared query (without a
+concrete pair and without change filters); `query:cached()` on it only prepares it, like jecs
+matches its archetypes in `cached()`. Hooks do not receive the `oldarchetype` argument of jecs
+(there are no archetypes).

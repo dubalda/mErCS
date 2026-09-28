@@ -20,9 +20,10 @@ local countrz = bit32.countrz
 
 local JECS_COMPONENT_LIMIT = 256
 
-local function jecs_impl(jecs: any): Impl
+local function jecs_impl(jecs: any, label: string?): Impl
     return {
         name = "jecs",
+        label = label,
         ecs = jecs,
         features = { pairs = true },
         component = function(world: any): any
@@ -49,10 +50,11 @@ local function jecs_impl(jecs: any): Impl
     }
 end
 
--- Implementation entry for a module with the library API (the library and its snapshots).
-local function library_impl(name: string, module: any): Impl
+-- Implementation entry for a module with the library API (the library and its releases).
+local function library_impl(name: string, module: any, label: string?): Impl
     return {
         name = name,
+        label = label,
         ecs = module,
         features = { many_ids = true, pairs = true, each = true },
         component = function(world: any): any

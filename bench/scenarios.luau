@@ -15,6 +15,7 @@
 ]]
 
 local harness = require("./harness")
+local shapes = require("./shapes")
 
 type Impl = harness.Impl
 type Scenario = harness.Scenario
@@ -1323,6 +1324,11 @@ local function build(N: number): { Scenario }
             end
         end,
     })
+
+    ---------------------------------------------------------------------------
+    -- query shapes: query cases and a sparse world (bench/shapes.luau)
+    ---------------------------------------------------------------------------
+    shapes(add, N)
 
     return list
 end

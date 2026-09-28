@@ -1,0 +1,24 @@
+{
+  "name": "mErCS Benchmarker",
+  "emitLegacyScripts": false,
+  "tree": {
+    "$className": "DataModel",
+    "ReplicatedStorage": {
+      "mErCSCheck": {
+        "$className": "Folder",
+        "src": {
+          "$path": "src"
+        },
+        "DevPackages": {
+          "$path": "DevPackages"
+        },
+        "bench": {
+          "$className": "Folder",
+          "visual": {
+            "$path": "bench/visual"
+          }
+        }
+      }
+    }
+  }
+}

@@ -5,7 +5,8 @@
     pair (Targeting, enemy), and switch state tags. In an archetype ECS every target makes an
     archetype that outlives the enemy until the world is cleaned up. Prints the heap size and
     the time per frame every 1000 frames, for jecs (without and with world:cleanup() every 600
-    frames) and for mErCS.
+    frames), the previous release of the library when tools/previous.sh has extracted it, and
+    the current library.
 
     Run from the repository root:
         luau -O2 bench/leak.luau
@@ -14,6 +15,8 @@
 local gc = require("./gc")
 local jecs = require("@jecs")
 local lib = require("@lib")
+local previous_release = require("./previous")
+local versions = require("./versions")
 
 local UNITS = 500
 local ENEMIES = 200
@@ -97,10 +100,13 @@ local function session(name: string, ecs: any, cleanup_every: number?)
             t = os.clock()
         end
     end
-    print(string.format("%-22s %s", name, table.concat(line, " | ")))
+    print(string.format("%-29s %s", name, table.concat(line, " | ")))
 end
 
 print(`heap growth and time per frame at frames 1000..{FRAMES} ({UNITS} units, {ENEMIES} enemies)`)
-session("jecs", jecs, nil)
-session("jecs + cleanup / 600", jecs, 600)
-session("mErCS", lib, nil)
+session(versions.jecs, jecs, nil)
+session(`{versions.jecs} + cleanup / 600`, jecs, 600)
+if previous_release then
+    session(`mErCS {previous_release.version}`, previous_release.ecs, nil)
+end
+session(versions.library, lib, nil)

@@ -94,6 +94,14 @@ local _ids: { ecs.Id } = world:ids(e)
 local _slot: number = ecs.ECS_ID(e)
 local _generation: number = ecs.ECS_GENERATION(e)
 
+-- slot pools: their entities are ordinary entities
+local npcs: ecs.Pool = world:pool()
+local npc = npcs:entity()
+world:set(npc, Health, 10)
+local _npc_slot: number = ecs.ECS_ID(npc)
+local _npc_health: number? = world:get(npc, Health)
+world:delete(npc)
+
 world:delete(e)
 assert(not world:contains(e), "deleted")
 print("types: ok")

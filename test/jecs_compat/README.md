@@ -1,7 +1,7 @@
 # jecs compatibility tests
 
-`tests.luau` is the jecs test suite (`test/tests.luau` of the fork `dubalda/jecs`, commit `082ec88`) run against
-mErCS: `.luaurc` maps `@jecs` to `shim.luau`. The shim returns the module of the jabby
+`tests.luau` is the test suite of jecs 0.11.0 (`test/tests.luau`) run against mErCS: `.luaurc`
+maps `@jecs` to `shim.luau`. The shim returns the module of the jabby
 adapter (`src/jabby.luau`), whose worlds come attached: the suite uses `query:iter()`,
 `query:archetypes()`, `world.entity_index` and `entity_index_try_get`, which only the adapter
 has. It also adds `bulk_insert` / `bulk_remove`, which the library does not have, as loops of

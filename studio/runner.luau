@@ -15,6 +15,7 @@ local RunService = game:GetService("RunService")
 
 local lib = require("../src")
 local jecs = require("../DevPackages/jecs")
+local versions = require("../bench/versions")
 
 return function()
     local side = if RunService:IsServer() then "server" else "client"
@@ -29,13 +30,13 @@ return function()
     end
     task.wait()
     local frame_scene = require("../bench/frame_scene")
-    frame_scene({ { "jecs", jecs }, { "lib", lib } })
+    frame_scene({ { versions.jecs, jecs }, { versions.library, lib } })
     task.wait()
 
     local harness = require("../bench/harness")
     local defs = require("../bench/impl_defs")
     local build = require("../bench/scenarios")
-    local impls = { defs.jecs(jecs), defs.library("lib", lib) }
+    local impls = { defs.jecs(jecs, versions.jecs), defs.library("lib", lib, versions.library) }
     -- fewer entities than bench/run.luau (131 072) keep every step short enough for Studio
     local n = 32768
     print(`single operations: n = {n}, minimum of 3 runs (memory rows are approximate: no forced GC)`)

@@ -1,5 +1,5 @@
 --[[
-    jecs test suite (the fork dubalda/jecs, commit 082ec88) run against mErCS through the
+    The test suite of jecs 0.11.0 run against mErCS through the
     "@jecs" alias (see .luaurc and shim.luau). Tests and cases that inspect jecs internals
     (archetypes, entity_index, component records, the entity visualiser) are disabled:
     TEST -> SKIP_TEST, "do CASE" -> "if NOT_APPLICABLE then CASE". See README.md.
