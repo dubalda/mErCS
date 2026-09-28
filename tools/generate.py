@@ -9,8 +9,8 @@ rewrites the code between the markers
     -- @generated <name> end
 
 in src/init.luau: the direct for-in iterators (bitset spans), the list iterators (the match
-list of a cached query) and the matching each() loops. Run from the repository root, then
-format:
+list of a cached query, grouped by value page) and the matching each() loops. Run from the
+repository root, then format:
 
     python tools/generate.py && stylua src
 """
@@ -144,64 +144,71 @@ def direct_iterator(n: int, indent: str) -> list[str]:
 
 
 def list_iterator(n: int, indent: str) -> list[str]:
-    """for-in over the match list of a cached query; page references change per group.
+    """for-in over the match list of a cached query, group by group (the matches of one value
+    page): the array of the group holds the entity of the k-th match at 2k - 1 and its index
+    in the page at 2k; a group of one match is read from firsts / first_lis instead; the page
+    references change per group.
 
     Returns the step function and a reset function: a cached query reuses both across
     iterations. The first time the step reaches the end it clears query.list_busy and counts
-    the loop out of query.list_readers.
+    the loop out of query.list_readers, unless the list tables were replaced since the step
+    was made (query.list_epoch differs from the epoch of list_iter). Groups are never empty.
     """
     i = indent
-    if n == 0:
-        return [
-            f"{i}local j, done = 0, false",
-            f"{i}return function(): ...any",
-            f"{i}{T}local k = j + 1",
-            f"{i}{T}j = k",
-            f"{i}{T}local e = entities[k]",
-            f"{i}{T}if e == nil and not done then",
-            f"{i}{T}{T}done = true",
-            f"{i}{T}{T}query.list_busy = false",
-            f"{i}{T}{T}query.list_readers -= 1",
-            f"{i}{T}end",
-            f"{i}{T}return e",
-            f"{i}end, function()",
-            f"{i}{T}j, done = 0, false",
-            f"{i}end",
-        ]
-    pages = ", ".join(f"p{k}" for k in range(1, n + 1))
     vals = "".join(f", p{k}[li]" for k in range(1, n + 1))
+    lines = [f"{i}local g, j, last = 0, 0, 0", f"{i}local items = EMPTY"]
+    if n > 0:
+        pages = ", ".join(f"p{k}" for k in range(1, n + 1))
+        lines.append(
+            f"{i}local {', '.join(f'g{k}' for k in range(1, n + 1))} = "
+            + ", ".join(f"pages_lists[{k}]" for k in range(1, n + 1))
+        )
+        lines.append(f"{i}local {pages} = " + ", ".join("EMPTY" for _ in range(n)))
     # the position is read into a local once: every read of an upvalue costs
-    return (
-        [
-            f"{i}local j, g, group_last = 0, 0, 0",
-            f"{i}local {pages} = " + ", ".join("EMPTY" for _ in range(n)),
-            f"{i}return function(): ...any",
-            f"{i}{T}local k = j + 1",
-            f"{i}{T}j = k",
-            f"{i}{T}if k > group_last then",
-            f"{i}{T}{T}local next_g = g + 1",
-            f"{i}{T}{T}local last = ends[next_g]",
-            f"{i}{T}{T}if last == nil then",
-            f"{i}{T}{T}{T}if g >= 0 then",
-            f"{i}{T}{T}{T}{T}g = -1 -- the end is counted once",
-            f"{i}{T}{T}{T}{T}query.list_busy = false",
-            f"{i}{T}{T}{T}{T}query.list_readers -= 1",
-            f"{i}{T}{T}{T}end",
-            f"{i}{T}{T}{T}return nil",
-            f"{i}{T}{T}end",
-            f"{i}{T}{T}g = next_g",
-            f"{i}{T}{T}group_last = last",
-        ]
-        + [f"{i}{T}{T}p{k} = g{k}[next_g]" for k in range(1, n + 1)]
-        + [
-            f"{i}{T}end",
-            f"{i}{T}local li = locals[k]",
-            f"{i}{T}return entities[k]{vals}",
-            f"{i}end, function()",
-            f"{i}{T}j, g, group_last = 0, 0, 0",
-            f"{i}end",
-        ]
-    )
+    lines += [
+        f"{i}return function(): ...any",
+        f"{i}{T}local k = j + 2",
+        f"{i}{T}if k > last then",
+        f"{i}{T}{T}local next_g = g + 1",
+        f"{i}{T}{T}local size = sizes[next_g]",
+        f"{i}{T}{T}if size == nil then",
+        f"{i}{T}{T}{T}if g >= 0 then",
+        f"{i}{T}{T}{T}{T}g = -1 -- the end is counted once",
+        f"{i}{T}{T}{T}{T}if query.list_epoch == epoch then",
+        f"{i}{T}{T}{T}{T}{T}query.list_busy = false",
+        f"{i}{T}{T}{T}{T}{T}query.list_readers -= 1",
+        f"{i}{T}{T}{T}{T}end",
+        f"{i}{T}{T}{T}end",
+        f"{i}{T}{T}{T}return nil",
+        f"{i}{T}{T}end",
+        f"{i}{T}{T}g = next_g",
+    ]
+    lines += [f"{i}{T}{T}p{k} = g{k}[next_g]" for k in range(1, n + 1)]
+    lines += [
+        f"{i}{T}{T}if size == 1 then",
+        f"{i}{T}{T}{T}-- a group of one match: its array is not read",
+        f"{i}{T}{T}{T}j, last = 0, 0",
+    ]
+    if n > 0:
+        lines.append(f"{i}{T}{T}{T}local li = first_lis[next_g]")
+    lines += [
+        f"{i}{T}{T}{T}return firsts[next_g]{vals}",
+        f"{i}{T}{T}end",
+        f"{i}{T}{T}last = size * 2",
+        f"{i}{T}{T}items = gitems[next_g]",
+        f"{i}{T}{T}k = 2",
+        f"{i}{T}end",
+        f"{i}{T}j = k",
+    ]
+    if n > 0:
+        lines.append(f"{i}{T}local li = items[k]")
+    lines += [
+        f"{i}{T}return items[k - 1]{vals}",
+        f"{i}end, function()",
+        f"{i}{T}g, j, last = 0, 0, 0",
+        f"{i}end",
+    ]
+    return lines
 
 
 def direct_each(n: int, indent: str) -> list[str]:
@@ -268,25 +275,45 @@ def direct_each(n: int, indent: str) -> list[str]:
 
 
 def list_each(n: int, indent: str) -> list[str]:
-    """Callback loop over the match list of a cached query, group by group."""
+    """Callback loop over the match list of a cached query, group by group; a group of one
+    match is read from firsts / first_lis."""
     i = indent
-    if n == 0:
-        return [f"{i}for j = 1, count do", f"{i}{T}callback(entities[j])", f"{i}end"]
     vals = "".join(f", p{k}[li]" for k in range(1, n + 1))
-    return (
-        [
-            f"{i}local k = 0",
-            f"{i}for g = 1, groups do",
-            f"{i}{T}local {', '.join(f'p{k}' for k in range(1, n + 1))} = " + ", ".join(f"g{k}[g]" for k in range(1, n + 1)),
-            f"{i}{T}local last = ends[g]",
-            f"{i}{T}for j = k + 1, last do",
-            f"{i}{T}{T}local li = locals[j]",
-            f"{i}{T}{T}callback(entities[j]{vals})",
-            f"{i}{T}end",
-            f"{i}{T}k = last",
-            f"{i}end",
+    lines = []
+    if n > 0:
+        lines.append(
+            f"{i}local {', '.join(f'g{k}' for k in range(1, n + 1))} = "
+            + ", ".join(f"pages_lists[{k}]" for k in range(1, n + 1))
+        )
+    lines += [f"{i}for g = 1, groups do", f"{i}{T}local size = sizes[g]"]
+    if n > 0:
+        lines.append(
+            f"{i}{T}local {', '.join(f'p{k}' for k in range(1, n + 1))} = "
+            + ", ".join(f"g{k}[g]" for k in range(1, n + 1))
+        )
+    lines.append(f"{i}{T}if size == 1 then")
+    if n > 0:
+        lines.append(f"{i}{T}{T}local li = first_lis[g]")
+    lines += [
+        f"{i}{T}{T}callback(firsts[g]{vals})",
+        f"{i}{T}else",
+        f"{i}{T}{T}local items = gitems[g]",
+    ]
+    if n == 0:
+        lines += [
+            f"{i}{T}{T}for k = 1, size * 2, 2 do",
+            f"{i}{T}{T}{T}callback(items[k])",
+            f"{i}{T}{T}end",
         ]
-    )
+    else:
+        lines += [
+            f"{i}{T}{T}for k = 2, size * 2, 2 do",
+            f"{i}{T}{T}{T}local li = items[k]",
+            f"{i}{T}{T}{T}callback(items[k - 1]{vals})",
+            f"{i}{T}{T}end",
+        ]
+    lines += [f"{i}{T}end", f"{i}end"]
+    return lines
 
 
 def chain(fn, indent_level: int, wide: bool = False) -> str:

@@ -46,18 +46,23 @@ src/jabby.luau         the adapter for the jabby debugger (a child module the li
 tools/generate.py      regenerates the iterator sections: python tools/generate.py && stylua src
 tools/check.sh         formatting, lints and types, checked like the editor does
 tools/test.sh          every test, the example and a fuzz run (--codegen: with native code)
+tools/previous.sh      the previous release from its git tag into tmp/previous, for the benchmarks
 test/core.luau         core semantics, run against jecs and this library
 test/lib.luau          library features, the model tests
 test/types.luau        typed API usage (must type-check)
-test/fuzz.luau         random operations against a model
+test/fuzz.luau         random operations against a model (flags: wide, hooks, sparse, pool, verify, churn)
 test/jabby.luau        the jabby adapter: what jabby reads from its jecs module and a world
 test/jecs_compat/      the jecs test suite run against this library (125/125 applicable)
 examples/basics.luau   a runnable tour of the API
-bench/run.luau         the benchmark matrix (harness.luau, scenarios.luau, impls.luau, impl_defs.luau)
-bench/frame.luau       a synthetic game frame for both libraries (frame_scene.luau)
+bench/run.luau         the benchmark matrix (harness.luau, scenarios.luau, shapes.luau, impls.luau, impl_defs.luau)
+bench/query_cases.luau query cases where an archetype ECS is at its best: jecs for-in against query:each
+bench/frame.luau       a synthetic game frame (frame_scene.luau)
 bench/leak.luau        a long session with changing relationship targets (memory growth)
 bench/gc.luau          garbage collector access that works in the luau CLI and in Roblox
+bench/versions.luau    the versions of jecs and the library in the output of the benchmarks
+bench/previous.luau    the previous release (tmp/previous) when tools/previous.sh has extracted it
 bench/visual/          Benchmarker plugin files (*.bench.luau): jecs against this library
+benchmarker.project.json  a place with the libraries and bench/visual only, for the Benchmarker plugin
 studio/                a Roblox place that runs the fuzz test, the frame and the matrix (check.project.json: its tree)
 vendor/testkit.luau    the test kit of the jecs suite (MIT)
 docs/                  the index (README.md) and a folder per page: guide/, jecs-comparison/, development/
@@ -77,10 +82,18 @@ bash tools/test.sh --codegen   # native code
 first failure with a non-zero exit code (a failed case of the test kit fails its file).
 
 `test/fuzz.luau` takes a seed, a number of rounds and flags: `wide` creates 300 ids first
-(records beyond the shared signature tables), `hooks` adds hooks that change the entity:
+(records beyond the shared signature tables), `hooks` adds hooks that change the entity,
+`sparse` creates up to 300 empty entities after each entity of the model (the matches spread
+over many value pages and every bitset level), `pool` creates half of the entities of the
+model from a slot pool, `verify` uses a debug world, which checks every patched match list
+of a cached query against a scan of its bitsets and, when a query takes its list as it is,
+that none of its records changed, and `churn` adds and removes pairs with 400 targets on an
+entity outside the model after every operation, so that the pair records left empty (those
+of the model too) are freed in batches between and inside the operations of the model:
 
 ```sh
 luau test/fuzz.luau -a 42 400 wide hooks
+luau test/fuzz.luau -a 7 400 sparse pool verify hooks wide churn
 ```
 
 ## Checks
@@ -97,22 +110,44 @@ luau-lsp server of the installed VS Code extension (the version the editor uses)
 ## Benchmarks in the luau CLI
 
 ```sh
-luau -O2 bench/run.luau -a impls=jecs,lib reps=7          # the matrix, interpreter
-luau -O2 --codegen bench/run.luau -a filter=query,pair     # native code, some groups
-luau -O2 bench/frame.luau                                  # the synthetic frame
-luau -O2 bench/leak.luau                                   # a long session
+bash tools/previous.sh                                      # the previous release, once (optional)
+luau -O2 bench/run.luau -a reps=9                           # the matrix, interpreter
+luau -O2 --codegen bench/run.luau -a filter=query,pair      # native code, some groups
+luau -O2 --codegen bench/run.luau -a "filter=query cases,sparse" # the query shapes (bench/shapes.luau)
+luau -O2 --codegen bench/query_cases.luau                   # the query cases, with the test kit of jecs
+luau -O2 bench/frame.luau                                   # the synthetic frame
+luau -O2 bench/leak.luau                                    # a long session
 ```
 
-`bench/run.luau` arguments: `filter` (substrings of "group.name"), `impls`, `reps`, `n`.
-Time is the minimum over the runs divided by the operations; memory is the heap growth kept
-after the run and a full collection.
+The benchmarks compare jecs (the Wally dev packages), the previous release of the library and
+the current one, and print their versions (`bench/versions.luau`). `tools/previous.sh` puts the
+previous release (the newest tag other than the version in `wally.toml`, or a tag given as its
+argument) into `tmp/previous`; without it the benchmarks compare jecs and the current library.
+
+`bench/run.luau` arguments: `filter` (substrings of "group.name"), `impls` (`jecs`, `previous`,
+`lib`), `reps`, `n`. Time is the minimum over the runs divided by the operations; memory is the
+heap growth kept after the run and a full collection.
+
+The groups `query cases` and `sparse world` (`bench/shapes.luau`) time one pass of a query with
+the changes a game makes before it: five cases where an archetype ECS is at its best (entity
+ids scattered by churn, a tag of the query toggled between loops, four values read per match,
+a `(*, T)` wildcard over changing pairs, a query that almost never matches), and creatures
+scattered among their children (skills), also created from a slot pool. A loop over matches is
+the for-in loop for jecs and `query:each` for this library (it replaces the for-in loop fully
+when the loop does not break). Their worlds have fixed sizes at `n = 131072` and shrink with a
+smaller `n`.
+
+`bench/query_cases.luau` runs the same five cases with the test kit of jecs: one run per case,
+first loops included; the matrix takes the minimum of several runs.
 
 ## Benchmarker (Roblox Studio)
 
 `bench/visual/*.bench.luau` follow the format of the Benchmarker plugin (the same as
 `jecs/test/benches/visual`): `ParameterGenerator`, `BeforeAll` / `AfterAll` /
-`BeforeEach` / `AfterEach` and `Functions` with a `Jecs` and a `mErCS` entry. The
-parameters are generated before every call and give each function its own fresh world.
+`BeforeEach` / `AfterEach` and `Functions` with an entry for jecs and one for mErCS, named with
+their versions (`jecs 0.11.0`, `mErCS 0.2.0`: `libs.luau` reads the version of jecs from its
+Wally package and holds the version of mErCS). The parameters are generated before every call
+and give each function its own fresh world.
 
 | File | What |
 |---|---|
@@ -123,9 +158,28 @@ parameters are generated before every call and give each function its own fresh 
 | `remove.bench.luau` | remove one of 5 components from 1000 entities |
 | `pairs.bench.luau` | 100 parents with 10 `ChildOf` children that also target a parent through a relation, then the parents are deleted |
 | `batch.bench.luau` | add and remove a tag on half of 2000 entities: batch operations against a jecs collect-and-change loop |
+| `query_scattered.bench.luau` | a query case: a 4-component query over 50 000 entities scattered by churn |
+| `query_churn.bench.luau` | a query case: a tag of the query toggled on 1 or 100 entities before each pass (70 000 entities) |
+| `query_read4.bench.luau` | a query case: 4 values read per match (80 000 entities) |
+| `query_wildcard.bench.luau` | a query case: `(*, T)` over 64 relations with a pair toggled before each pass (20 000 entities) |
+| `query_empty.bench.luau` | a query case: 100 passes of a query that never matches (100 000 entities) |
 
-They live in the Studio check place (below); open the Benchmarker plugin and run the files
-from `ReplicatedStorage.mErCSCheck.bench.visual`. The plugin requires a clone of each
+The `query_*` files share `query_worlds.luau` (the worlds of `bench/query_cases.luau`, built
+when a file is required) and run the same loops: the for-in loop for jecs, `query:each` for
+mErCS.
+
+The template `benchmarker.project.json` builds a place with only what the bench files need
+(the library, the Wally dev packages and `bench/visual`, at the same paths as in the Studio
+check place) and no scripts that run on Play:
+
+```sh
+wally install
+rojo build benchmarker.project.json -o benchmarker.rbxl   # or: rojo serve benchmarker.project.json
+```
+
+Open the place (or sync it into an open one), open the Benchmarker plugin and run the files
+from `ReplicatedStorage.mErCSCheck.bench.visual`. The same files are in the Studio check place
+(below). The plugin requires a clone of each
 `*.bench` module, which has no parent, so the bench files reach `libs.luau` from
 `ReplicatedStorage` (relative requires fail in a clone); `libs.luau` itself requires jecs from
 the Wally dev packages and the library by relative paths.
@@ -184,7 +238,7 @@ The workflows of `.github/workflows/` get the tools from `rokit.toml` (the
 
 | Workflow | When | What |
 |---|---|---|
-| `ci.yml` | every pull request and push to `main` | `tools/check.sh`; `tools/test.sh` in the interpreter and with native code, plus 3 fuzz runs of 400 rounds (`wide hooks`); the model `mercs.rbxm` and the Wally package as artifacts; the documentation site is built, not published |
+| `ci.yml` | every pull request and push to `main` | `tools/check.sh`; `tools/test.sh` in the interpreter and with native code, plus 3 fuzz runs of 400 rounds (`wide hooks`) and 2 with `sparse pool verify hooks wide churn`; the model `mercs.rbxm` and the Wally package as artifacts; the documentation site is built, not published |
 | `release.yml` | a pushed tag `vX.Y.Z` | the tag must match `version` in `wally.toml`; checks and tests; `wally publish`; a GitHub release with `mercs.rbxm`, whose text is the section of the tag in `CHANGELOG.md` (generated notes when there is none) |
 | `docs.yml` | a push to `main` that changes `src/`, `docs/`, `README.md` or `moonwave.toml` | builds the documentation site and publishes it to GitHub Pages |
 
@@ -193,7 +247,8 @@ To release a version:
 1. Add a section `## vX.Y.Z — date` at the top of `CHANGELOG.md`. It becomes the text of the
    GitHub release (up to the next `## ` heading), so write links as absolute URLs. The site
    shows `CHANGELOG.md` as its Changelog page.
-2. Set the version (without the `v`) in `wally.toml`.
+2. Set the version (without the `v`) in `wally.toml`, and in the output of the benchmarks:
+   `library` in `bench/versions.luau` and `LIBRARY_VERSION` in `bench/visual/libs.luau`.
 3. Commit, wait for a green CI, then push the tag:
 
 ```sh

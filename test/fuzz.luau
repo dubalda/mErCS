@@ -15,9 +15,17 @@
     creates 300 other ids first, so that the relation records get signature indices beyond
     the shared signature tables; "hooks" adds hooks that change the entity, except when it is
     deleted: adding T2 sets C2 to 42, removing T2 removes C1, removing T1 (a tracked id: the
-    hook runs with the tracking signal) sets C2 to 5, removing a pair of R2 sets C2 to 7):
+    hook runs with the tracking signal) sets C2 to 5, removing a pair of R2 sets C2 to 7;
+    "sparse" creates up to 300 empty entities after each entity of the model, so that the
+    matches spread over many value pages and all bitset levels; "pool" creates half of the
+    entities of the model from a slot pool; "verify" uses a debug world, which checks every
+    patched match list of a cached query against a scan of its bitsets; "churn" adds and
+    removes pairs with 400 targets on an entity outside the model after every operation, so
+    that the pair records left empty (those of the model too) are freed in batches between
+    and inside the operations of the model):
         luau test/fuzz.luau
-        luau test/fuzz.luau -a 42 400 wide hooks
+        luau test/fuzz.luau -a 42 400 wide hooks churn
+        luau test/fuzz.luau -a 7 300 sparse pool verify hooks churn
 ]]
 
 local ecs = require("../src")
@@ -27,6 +35,10 @@ local seed = tonumber(args[1]) or 20260926
 local rounds = tonumber(args[2]) or 150
 local wide = table.find(args, "wide") ~= nil
 local hooks = table.find(args, "hooks") ~= nil
+local sparse = table.find(args, "sparse") ~= nil
+local pooled = table.find(args, "pool") ~= nil
+local verify = table.find(args, "verify") ~= nil
+local churn = table.find(args, "churn") ~= nil
 
 local function next_int(low: number, high: number): number
     seed = seed * 16807 % 2147483647
@@ -35,12 +47,35 @@ end
 
 local pair = ecs.pair
 local W = ecs.Wildcard
-local world = ecs.world()
+local world = ecs.world(verify)
+local pool = if pooled then world:pool() else nil
 
 if wide then
     local holder = world:entity()
     for _ = 1, 300 do
         world:add(holder, world:entity())
+    end
+end
+
+-- "churn": a relation, an entity and targets outside the model; churn_step adds and removes
+-- pairs of them in a fixed order (it draws no random numbers: the operations of the model are
+-- the same with and without the flag)
+local churn_relation: any, churn_holder: any = nil, nil
+local churn_targets: { any } = {}
+local churn_next = 0
+if churn then
+    churn_relation, churn_holder = world:entity(), world:entity()
+    for i = 1, 400 do
+        churn_targets[i] = world:entity()
+    end
+end
+
+local function churn_step()
+    for _ = 1, 8 do
+        churn_next = churn_next % #churn_targets + 1
+        local t = churn_targets[churn_next]
+        world:add(churn_holder, pair(churn_relation, t))
+        world:remove(churn_holder, pair(churn_relation, t))
     end
 end
 
@@ -137,7 +172,12 @@ local function fail(message: string)
 end
 
 local function spawn(): any
-    local e = world:entity()
+    local e = if pool and next_int(1, 2) == 1 then pool:entity() else world:entity()
+    if sparse then
+        for _ = 1, next_int(0, 300) do
+            world:entity() -- not in the model: it never gets an id
+        end
+    end
     model[e] = { values = {}, r1 = {}, r3 = {} }
     table.insert(list, e)
     return e
@@ -845,6 +885,9 @@ end
 for round = 1, rounds do
     for _ = 1, 40 do
         mutate()
+        if churn then
+            churn_step()
+        end
     end
     check_tracking()
     check_entities()

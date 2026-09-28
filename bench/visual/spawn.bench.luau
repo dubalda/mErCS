@@ -43,11 +43,11 @@ return {
     AfterEach = function() end,
 
     Functions = {
-        ["Jecs"] = function(_Profiler: any, jecs_setup: Setup, _lib_setup: Setup)
+        [libs.jecs_label] = function(_Profiler: any, jecs_setup: Setup, _lib_setup: Setup)
             spawn(jecs_setup)
         end,
 
-        ["mErCS"] = function(_Profiler: any, _jecs_setup: Setup, lib_setup: Setup)
+        [libs.lib_label] = function(_Profiler: any, _jecs_setup: Setup, lib_setup: Setup)
             spawn(lib_setup)
         end,
     },

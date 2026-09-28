@@ -1,9 +1,11 @@
 --!strict
 --!optimize 2
 --[[
-    Implementations compared by the benchmark matrix (bench/run.luau): jecs and this library.
-    Each entry provides the module with the jecs-compatible API plus two helpers, see
-    bench/impl_defs.luau.
+    Implementations compared by the benchmark matrix (bench/run.luau): jecs, the previous
+    release of the library when tools/previous.sh has extracted it (bench/previous.luau), and
+    the current library. Each entry provides the module with the jecs-compatible API plus two
+    helpers, see bench/impl_defs.luau; the keys for the `impls` option are jecs, previous and
+    lib, the column headers carry the versions.
 
     Usage:
         local impls = require("./impls")
@@ -11,12 +13,15 @@
 
 local harness = require("./harness")
 local defs = require("./impl_defs")
+local previous = require("./previous")
+local versions = require("./versions")
 
 type Impl = harness.Impl
 
-local list: { Impl } = {
-    defs.jecs(require("@jecs")),
-    defs.library("lib", require("@lib")),
-}
+local list: { Impl } = { defs.jecs(require("@jecs"), versions.jecs) }
+if previous then
+    table.insert(list, defs.library("previous", previous.ecs, `mErCS {previous.version}`))
+end
+table.insert(list, defs.library("lib", require("@lib"), versions.library))
 
 return list

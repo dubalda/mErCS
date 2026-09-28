@@ -44,6 +44,11 @@ jobs:
           for seed in 1 2 3; do
             luau $FLAGS test/fuzz.luau -a "$seed" 400 wide hooks
           done
+          # scattered slots, a slot pool, every patched match list checked by a debug world, and
+          # empty pair records freed in batches between and inside the operations of the model
+          for seed in 4 5; do
+            luau $FLAGS test/fuzz.luau -a "$seed" 400 sparse pool verify hooks wide churn
+          done
 
   build:
     name: Model and Wally package

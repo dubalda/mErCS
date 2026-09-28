@@ -44,7 +44,7 @@ return {
     AfterEach = function() end,
 
     Functions = {
-        ["Jecs"] = function(_Profiler: any, s: Setup, _lib_setup: Setup)
+        [libs.jecs_label] = function(_Profiler: any, s: Setup, _lib_setup: Setup)
             local world = s.world
             local matches = {}
             for e in world:query(s.position):with(s.marked) do
@@ -62,7 +62,7 @@ return {
             end
         end,
 
-        ["mErCS"] = function(_Profiler: any, _jecs_setup: Setup, s: Setup)
+        [libs.lib_label] = function(_Profiler: any, _jecs_setup: Setup, s: Setup)
             local world = s.world
             world:query(s.position):with(s.marked):add_all(s.stunned)
             world:query(s.stunned):remove_all(s.stunned)

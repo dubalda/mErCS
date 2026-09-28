@@ -2,8 +2,11 @@
 --# selene: allow(empty_loop) -- benchmark loops iterate for their cost only
 --[[
     Tests of mErCS features that the shared core suite (test/core.luau) and the jecs
-    suite (test/jecs_compat) do not cover: query:each, cached query list mode, changes during
-    iteration, more than 4 ids in get/has, relationships, cleanup without leftovers, signals.
+    suite (test/jecs_compat) do not cover: query:each, cached query list mode and its patches
+    after small changes, empty queries, changes during iteration, more than 4 ids in get/has,
+    relationships and (*, T) targets, slot pools, large worlds, cleanup without leftovers,
+    signals, hooks of ids beyond the shared signature tables, cascades deeper than 100 levels,
+    hooks and signals on builtin ids, and pair records freed in batches.
 
     Run from the repository root:
         luau test/lib.luau
@@ -1676,6 +1679,7 @@ TEST("introspection", function()
         names[name] = id
     end
     CHECK(names.e == e and names["mercs.ChildOf"] == ecs.ChildOf)
+    CHECK(names["mercs.Disabled"] == ecs.Disabled)
 end)
 
 TEST("random operations against a model", function()
@@ -1862,6 +1866,990 @@ TEST("random operations against a model", function()
     compare({ ids[1], ids[2] }, {})
     compare({ ids[1] }, { ids[2] })
     CHECK(mismatches == 0)
+end)
+
+-- Entities of a query as a set, from a for-in loop and from each, and whether both agree with
+-- the expected set (a table entity -> true).
+local function same_matches(q: any, expected: { [any]: boolean }): boolean
+    local n_expected = 0
+    for _ in expected do
+        n_expected += 1
+    end
+    local seen, ok = 0, true
+    for e in q do
+        seen += 1
+        if not expected[e] then
+            ok = false
+        end
+    end
+    local each_seen = 0
+    q:each(function(e: any)
+        each_seen += 1
+        if not expected[e] then
+            ok = false
+        end
+    end)
+    return ok and seen == n_expected and each_seen == n_expected
+end
+
+TEST("cached match lists follow small changes", function()
+    -- a debug world checks every patched list against a scan of the bitsets
+    local world = ecs.world(true)
+    local A, T = world:component() :: ecs.Component<number>, world:entity()
+    local filler = world:component()
+    local list = {}
+    for i = 1, 3000 do
+        local e = world:entity()
+        world:set(e, filler, i)
+        if i % 3 == 0 then
+            world:set(e, A, i)
+            table.insert(list, e)
+        end
+    end
+    local q = world:query(A):without(T):cached()
+    local expected: { [any]: boolean } = {}
+    for _, e in list do
+        expected[e] = true
+    end
+
+    CASE("a stable list, then single changes")
+    CHECK(same_matches(q, expected))
+    CHECK(same_matches(q, expected))
+    local ok = true
+    for k = 1, 50 do
+        local e = list[(k * 37) % #list + 1]
+        if expected[e] then
+            world:add(e, T)
+            expected[e] = nil
+        else
+            world:remove(e, T)
+            expected[e] = true
+        end
+        ok = ok and same_matches(q, expected)
+    end
+    CHECK(ok)
+
+    CASE("many changes between two loops")
+    for k = 1, 700 do
+        local e = list[(k * 101) % #list + 1]
+        if expected[e] then
+            world:add(e, T)
+            expected[e] = nil
+        else
+            world:remove(e, T)
+            expected[e] = true
+        end
+    end
+    CHECK(same_matches(q, expected))
+
+    CASE("a deleted match and a new entity in its slot")
+    local gone = list[10]
+    world:delete(gone)
+    expected[gone] = nil
+    local fresh = world:entity()
+    CHECK(ecs.ECS_ID(fresh) == ecs.ECS_ID(gone))
+    world:set(fresh, A, -1)
+    expected[fresh] = true
+    CHECK(same_matches(q, expected))
+    local value = nil
+    q:each(function(e: any, a: any)
+        if e == fresh then
+            value = a
+        end
+    end)
+    CHECK(value == -1)
+
+    CASE("batch operations")
+    world:query(A):add_all(T)
+    CHECK(same_matches(q, {}))
+    world:query(A):remove_all(T)
+    for e in world:query(A) do
+        expected[e] = true
+    end
+    CHECK(same_matches(q, expected))
+
+    CASE("a loop over the list keeps its matches while a nested loop sees a change")
+    local before = count(q)
+    local outer = 0
+    local nested = -1
+    local left: any = nil
+    for e in q do
+        outer += 1
+        if outer == 3 then
+            left = e
+            world:add(e, T) -- the current entity leaves the query
+            nested = count(q)
+        end
+    end
+    expected[left] = nil
+    CHECK(outer == before and nested == before - 1)
+    CHECK(same_matches(q, expected))
+
+    CASE("loops left with break, then changes and nested loops")
+    for _ in q do
+        break
+    end
+    ok = true
+    for k = 1, 20 do
+        local e = list[(k * 53) % #list + 1]
+        if expected[e] then
+            world:add(e, T)
+            expected[e] = nil
+        else
+            world:remove(e, T)
+            expected[e] = true
+        end
+        ok = ok and same_matches(q, expected)
+        if k % 5 == 0 then
+            for _ in q do
+                break
+            end
+        end
+    end
+    CHECK(ok)
+    -- a loop that runs to the end while a nested loop sees a change
+    local now = count(q)
+    local visited = 0
+    local changed: any = nil
+    local seen_inside = -1
+    for e in q do
+        visited += 1
+        if visited == 2 then
+            changed = e
+            world:add(e, T)
+            seen_inside = count(q)
+        end
+    end
+    expected[changed] = nil
+    CHECK(visited == now and seen_inside == now - 1)
+    CHECK(same_matches(q, expected))
+end)
+
+TEST("a query that takes its list as it is sees every change", function()
+    -- a loop after which nothing that cached queries observe changed takes the list as it is;
+    -- a debug world checks that none of the records of the query changed then
+    local world = ecs.world(true)
+    local A, B = world:component() :: ecs.Component<number>, world:component() :: ecs.Component<number>
+    local R = world:component() :: ecs.Component<number>
+    local T, target = world:entity(), world:entity()
+    local filler = world:component()
+    local list = {}
+    for i = 1, 2000 do
+        local e = world:entity()
+        world:set(e, filler, i)
+        if i % 40 == 0 then
+            world:set(e, A, i)
+            table.insert(list, e)
+        end
+    end
+    local q = world:query(A):without(T):cached()
+    local function expected(): { [any]: boolean }
+        local set = {}
+        for _, e in list do
+            if world:contains(e) and world:has(e, A) and not world:has(e, T) and not world:has(e, ecs.Disabled) then
+                set[e] = true
+            end
+        end
+        return set
+    end
+    -- two loops: the second one takes the list as it is
+    local function twice(query: any, set: { [any]: boolean }): boolean
+        local first = same_matches(query, set)
+        return same_matches(query, set) and first
+    end
+    local function same_twice(): boolean
+        return twice(q, expected())
+    end
+    CHECK(same_twice())
+
+    CASE("single changes, Disabled and clear")
+    world:add(list[1], T)
+    CHECK(same_twice())
+    world:add(list[2], ecs.Disabled)
+    CHECK(same_twice())
+    world:remove(list[2], ecs.Disabled)
+    world:clear(list[3])
+    CHECK(same_twice())
+    world:set(list[3], A, 3)
+    CHECK(same_twice())
+
+    CASE("batch operations")
+    world:query(A):add_all(T)
+    CHECK(same_twice())
+    world:remove_all(T)
+    CHECK(same_twice())
+    for k = 1, 5 do
+        world:set(list[k], B, k)
+    end
+    world:query(B):remove_all(A)
+    CHECK(same_twice())
+    world:query(filler):with(B):set_all(A, 0)
+    CHECK(same_twice())
+    world:query(B):delete_all()
+    CHECK(same_twice())
+
+    CASE("new records and pairs")
+    local C = world:component()
+    world:set(list[10], C, 1)
+    CHECK(same_twice())
+    local q2 = world:query(A, ecs.pair(ecs.Wildcard, target)):cached()
+    local with_target: { [any]: boolean } = {}
+    CHECK(twice(q2, with_target))
+    world:add(list[11], ecs.pair(T, target))
+    with_target[list[11]] = true
+    CHECK(twice(q2, with_target))
+    -- the first pair with a value: the wildcard returns values from now on
+    world:set(list[12], ecs.pair(R, target), 5)
+    with_target[list[12]] = true
+    CHECK(twice(q2, with_target))
+    world:delete(target)
+    CHECK(twice(q2, {}))
+    CHECK(same_twice())
+end)
+
+TEST("empty queries", function()
+    local world = ecs.world(true)
+    local A, B = world:component(), world:component()
+    local list = {}
+    for i = 1, 2000 do
+        local e = world:entity()
+        if i % 2 == 0 then
+            world:set(e, A, i)
+        else
+            world:set(e, B, i)
+        end
+        list[i] = e
+    end
+
+    CASE("no overlap: empty, and the first match appears")
+    local q = world:query(A, B):cached()
+    local empty = true
+    for _ = 1, 3 do
+        empty = empty and count(q) == 0
+    end
+    CHECK(empty)
+    world:set(list[2], B, 0)
+    CHECK(same_matches(q, { [list[2]] = true }))
+    world:remove(list[2], B)
+    CHECK(same_matches(q, {}))
+
+    CASE("a required id without a record")
+    local Rare = world:entity()
+    local r = world:query(A):with(Rare):cached()
+    empty = true
+    for _ = 1, 3 do
+        empty = empty and count(r) == 0
+    end
+    CHECK(empty)
+    world:add(list[4], Rare)
+    CHECK(same_matches(r, { [list[4]] = true }))
+end)
+
+TEST("groups of one match and larger groups", function()
+    local world = ecs.world(true)
+    local A, T = world:component() :: ecs.Component<number>, world:entity()
+    local expected: { [any]: boolean } = {}
+    local lone: any = nil
+    -- one match per value page, then a dense page
+    for i = 1, 20 * 256 do
+        local e = world:entity()
+        if i % 256 == 7 or (i > 19 * 256 and i % 3 == 0) then
+            world:set(e, A, i)
+            expected[e] = true
+            if i == 5 * 256 + 7 then
+                lone = e
+            end
+        end
+    end
+    local q = world:query(A):without(T):cached()
+    CHECK(same_matches(q, expected))
+    CHECK(same_matches(q, expected))
+    local wrong, n = 0, 0
+    for e, a in q do
+        n += 1
+        if a ~= world:get(e, A) then
+            wrong += 1
+        end
+    end
+    CHECK(wrong == 0 and n > 0)
+
+    CASE("a group of one match gets a second one, then loses the first")
+    local neighbour = world:entity(ecs.ECS_COMBINE(ecs.ECS_ID(lone) + 1, 0))
+    world:set(neighbour, A, 1)
+    expected[neighbour] = true
+    CHECK(same_matches(q, expected))
+    world:add(lone, T)
+    expected[lone] = nil
+    CHECK(same_matches(q, expected))
+end)
+
+TEST("(*, T) wildcard targets", function()
+    local world = ecs.world(true)
+    local R1, R2, T = world:entity(), world:entity(), world:entity()
+    local Data = world:component() :: ecs.Component<number>
+    local a, b, c = world:entity(), world:entity(), world:entity()
+    local W = ecs.Wildcard
+
+    CASE("pairs added before the first read")
+    world:add(a, pair(R1, T))
+    world:add(b, pair(R1, T))
+    world:add(b, pair(R2, T))
+    CHECK(world:has(a, pair(W, T)) and world:has(b, pair(W, T)) and not world:has(c, pair(W, T)))
+    CHECK(same_matches(world:query(pair(W, T)), { [a] = true, [b] = true }))
+
+    CASE("a slot with two pairs of the target keeps it until both are gone")
+    world:remove(b, pair(R1, T))
+    CHECK(world:has(b, pair(W, T)))
+    world:remove(b, pair(R2, T))
+    CHECK(not world:has(b, pair(W, T)))
+    CHECK(same_matches(world:query(pair(W, T)), { [a] = true }))
+
+    CASE("a cached query follows later changes")
+    local q = world:query(pair(W, T)):cached()
+    CHECK(same_matches(q, { [a] = true }))
+    world:add(c, pair(R2, T))
+    CHECK(same_matches(q, { [a] = true, [c] = true }))
+    world:remove(c, pair(W, T))
+    CHECK(same_matches(q, { [a] = true }))
+
+    CASE("values: nil for tag pairs, the value of a data pair once one exists")
+    local nils = true
+    for _, v in world:query(pair(W, T)) do
+        nils = nils and v == nil
+    end
+    CHECK(nils)
+    world:set(c, pair(Data, T), 5)
+    local value = nil
+    for e, v in world:query(pair(W, T)) do
+        if e == c then
+            value = v
+        end
+    end
+    CHECK(value == 5)
+
+    CASE("deleting a relation keeps the other pairs of the target")
+    world:add(b, pair(R2, T))
+    world:delete(R2)
+    CHECK(not world:has(b, pair(W, T)) and world:has(a, pair(W, T)))
+    CHECK(same_matches(q, { [a] = true, [c] = true }))
+
+    CASE("deleting the target removes every pair")
+    world:delete(T)
+    CHECK(not world:has(a, pair(R1, W)) and not world:has(c, pair(Data, W)))
+end)
+
+TEST("slot pools", function()
+    local world = ecs.world(true)
+    local Model = world:component() :: ecs.Component<number>
+    local npcs = world:pool()
+
+    CASE("pool entities take consecutive slots between other entities")
+    local list = {}
+    for i = 1, 300 do
+        list[i] = npcs:entity()
+        world:set(list[i], Model, i)
+        for _ = 1, 20 do
+            world:entity() -- skills and effects
+        end
+    end
+    local consecutive = true
+    for i = 2, 256 do
+        consecutive = consecutive and ecs.ECS_ID(list[i]) == ecs.ECS_ID(list[i - 1]) + 1
+    end
+    CHECK(consecutive)
+    CHECK(ecs.ECS_ID(list[1]) % 256 == 0) -- a block starts a value page
+
+    CASE("a query over them reads runs of full words")
+    local runs = 0
+    for _first, _last, mask in world:query(Model):spans() do
+        if mask == 0xFFFFFFFF then
+            runs += 1
+        end
+    end
+    CHECK(runs > 0 and count(world:query(Model)) == 300)
+
+    CASE("a deleted pool entity gives its slot back to the pool")
+    local old = list[5]
+    world:delete(old)
+    local other = world:entity()
+    CHECK(ecs.ECS_ID(other) ~= ecs.ECS_ID(old))
+    local reused = npcs:entity()
+    CHECK(ecs.ECS_ID(reused) == ecs.ECS_ID(old) and ecs.ECS_GENERATION(reused) == 1)
+    CHECK(world:contains(reused) and not world:contains(old))
+
+    CASE("pool entities work with every call")
+    local parent = npcs:entity()
+    local child = npcs:entity()
+    world:add(child, pair(ecs.ChildOf, parent))
+    world:set(child, Model, 1)
+    world:delete(parent)
+    CHECK(not world:contains(child))
+
+    CASE("an explicit id inside a block leaves the pool")
+    local slot: number = ecs.ECS_ID(npcs:entity() :: any) + 1
+    local taken: any = world:entity(slot)
+    CHECK(world:contains(taken))
+    local next_one = npcs:entity()
+    CHECK(ecs.ECS_ID(next_one) ~= slot)
+
+    CASE("world:range bounds the blocks")
+    local ranged = ecs.world()
+    ranged:range(1000, 1300)
+    local pool = ranged:pool()
+    local e = pool:entity()
+    CHECK(ecs.ECS_ID(e) >= 1024 and ecs.ECS_ID(e) < 1300)
+    CHECK_EXPECT_ERR(function()
+        for _ = 1, 400 do
+            pool:entity()
+        end
+        return true
+    end)
+end)
+
+TEST("large worlds and scattered members", function()
+    local world = ecs.world(true)
+    local A, T = world:component() :: ecs.Component<number>, world:entity()
+    local expected: { [any]: boolean } = {}
+    local order: { any } = {}
+    for i = 1, 150000 do
+        local e = world:entity()
+        if i % 30011 == 0 or i % 9973 == 0 then
+            world:set(e, A, i)
+            expected[e] = true
+            table.insert(order, e)
+        end
+    end
+
+    CASE("matches far apart, in ascending slot order")
+    local q = world:query(A):cached()
+    local same = true
+    for _ = 1, 3 do
+        same = same and same_matches(q, expected)
+    end
+    CHECK(same)
+    local k, ordered = 0, true
+    for e in world:query(A) do
+        k += 1
+        ordered = ordered and e == order[k]
+    end
+    CHECK(ordered and k == #order)
+
+    CASE("a tag toggled on scattered entities")
+    local toggled: { [any]: boolean } = {}
+    for round = 1, 3000 do
+        local e = order[round % #order + 1]
+        if toggled[e] then
+            world:remove(e, T)
+            toggled[e] = nil
+        else
+            world:add(e, T)
+            toggled[e] = true
+        end
+    end
+    local tagged, wrong = 0, 0
+    for e in world:query(T) do
+        tagged += 1
+        if not toggled[e] then
+            wrong += 1
+        end
+    end
+    local n_toggled = 0
+    for _ in toggled do
+        n_toggled += 1
+    end
+    CHECK(tagged == n_toggled and wrong == 0)
+    for i = 1, 5000 do
+        local e = order[i % #order + 1]
+        if not toggled[e] then
+            world:add(e, T)
+            world:remove(e, T)
+        end
+    end
+    CHECK(count(world:query(T)) == n_toggled)
+end)
+
+TEST("on_remove hooks run once, whatever the signature index of the id", function()
+    local world = ecs.world()
+    local Low = world:component()
+    world:add(world:entity(), Low) -- the record of Low: a small signature index
+    for _ = 1, 300 do
+        world:add(world:entity(), world:entity()) -- 300 more records
+    end
+    -- records beyond the shared signature tables (index > 256)
+    local High = world:component()
+    world:add(world:entity(), High)
+    local Rel = world:entity()
+    world:add(world:entity(), pair(Rel, world:entity()))
+    local calls = { low = 0, high = 0, rel = 0 }
+    world:set(Low, ecs.OnRemove, function()
+        calls.low += 1
+    end)
+    world:set(High, ecs.OnRemove, function()
+        calls.high += 1
+    end)
+    world:set(Rel, ecs.OnRemove, function()
+        calls.rel += 1
+    end)
+    local function hooked_entity(): any
+        local e = world:entity()
+        world:add(e, Low)
+        world:set(e, High, 1)
+        world:add(e, pair(Rel, world:entity()))
+        return e
+    end
+
+    CASE("delete")
+    world:delete(hooked_entity())
+    CHECK(calls.low == 1 and calls.high == 1 and calls.rel == 1)
+
+    CASE("clear")
+    local e = hooked_entity()
+    world:clear(e)
+    CHECK(calls.low == 2 and calls.high == 2 and calls.rel == 2)
+    CHECK(#world:ids(e) == 0)
+
+    CASE("hooks only beyond the shared signature tables")
+    world:remove(Low, ecs.OnRemove)
+    world:delete(hooked_entity())
+    CHECK(calls.low == 2 and calls.high == 3 and calls.rel == 3)
+end)
+
+TEST("an entity that takes a slot inside an on_remove hook runs its own hooks", function()
+    local world = ecs.world()
+    local X = world:component()
+    local first: any, second: any = nil, nil
+    local calls: { any } = {}
+    world:set(X, ecs.OnRemove, function(e: any)
+        table.insert(calls, e)
+        if e == first and second == nil then
+            world:delete(first)
+            second = world:entity() -- takes the slot of the first entity
+            world:add(second, X)
+            world:delete(second)
+        end
+    end)
+    first = world:entity()
+    world:add(first, X)
+
+    CASE("the hook runs for the new entity while the old one is cleared")
+    world:clear(first)
+    CHECK(ecs.ECS_ID(second) == ecs.ECS_ID(first))
+    CHECK(#calls == 2 and calls[1] == first and calls[2] == second)
+    CHECK(not world:contains(first) and not world:contains(second))
+    CHECK(count(world:query(X)) == 0)
+end)
+
+TEST("cascades deeper than 100 levels through tags, relations and ChildOf", function()
+    local N = 250
+    local function survivors(world: any, list: { any }): number
+        local n = 0
+        for _, e in list do
+            if world:contains(e) then
+                n += 1
+            end
+        end
+        return n
+    end
+
+    CASE("a tag with (OnDelete, Delete): each entity has the previous one")
+    local world = ecs.world()
+    local V = world:component()
+    local removed, bad = 0, 0
+    world:set(V, ecs.OnRemove, function(_e: any, _id: any, deleting: any)
+        removed += 1
+        if not deleting then
+            bad += 1
+        end
+    end)
+    local chain: { any } = {}
+    for i = 1, N do
+        local e = world:entity()
+        world:add(e, pair(ecs.OnDelete, ecs.Delete))
+        world:set(e, V, i)
+        if i > 1 then
+            world:add(e, chain[i - 1])
+        end
+        chain[i] = e
+    end
+    world:delete(chain[1])
+    CHECK(survivors(world, chain) == 0)
+    CHECK(removed == N and bad == 0 and count(world:query(V)) == 0)
+    -- the signature indices of the freed records serve new records
+    local fresh = world:entity()
+    for _ = 1, 40 do
+        world:add(fresh, world:entity())
+    end
+    CHECK(#world:ids(fresh) == 40)
+    world:delete(fresh)
+    CHECK(not world:contains(fresh))
+
+    CASE("a relation with (OnDelete, Delete): each entity has a pair of the previous one")
+    local target = world:entity()
+    local links: { any } = {}
+    for i = 1, N do
+        local e = world:entity()
+        world:add(e, pair(ecs.OnDelete, ecs.Delete))
+        if i > 1 then
+            world:add(e, pair(links[i - 1], target))
+        end
+        links[i] = e
+    end
+    world:delete(links[1])
+    CHECK(survivors(world, links) == 0 and world:contains(target))
+    CHECK(count(world:query(pair(ecs.Wildcard, target))) == 0)
+    local other = world:entity()
+    world:add(other, pair(world:entity(), target))
+    CHECK(#world:ids(other) == 1 and count(world:query(pair(ecs.Wildcard, target))) == 1)
+
+    CASE("ChildOf: the hook of every child runs once, for a deleted child of a live parent")
+    local tree = ecs.world()
+    local calls: { [any]: number } = {}
+    local wrong = 0
+    tree:set(ecs.ChildOf, ecs.OnRemove, function(e: any, _id: any, deleting: any)
+        calls[e] = (calls[e] or 0) + 1
+        local parent = tree:parent(e)
+        if not deleting or parent == nil or not tree:contains(parent) then
+            wrong += 1
+        end
+    end)
+    local nodes: { any } = { tree:entity() }
+    for i = 2, N do
+        local node = tree:entity()
+        tree:add(node, pair(ecs.ChildOf, nodes[i - 1]))
+        nodes[i] = node
+    end
+    tree:delete(nodes[1])
+    local once = true
+    for i = 2, N do
+        once = once and calls[nodes[i]] == 1
+    end
+    CHECK(survivors(tree, nodes) == 0 and once and wrong == 0)
+    CHECK(count(tree:query(pair(ecs.ChildOf, ecs.Wildcard))) == 0)
+end)
+
+TEST("hooks and signals on builtin ids keep the internal hooks", function()
+    -- whether Exclusive still acts on a relation whose (R, *) record exists, after `setup`
+    local function exclusive_after(setup: (world: any) -> ()): boolean
+        local world = ecs.world()
+        setup(world)
+        local Rel = world:entity()
+        local e, t1, t2 = world:entity(), world:entity(), world:entity()
+        world:add(e, pair(Rel, t1))
+        world:add(Rel, ecs.Exclusive)
+        world:add(e, pair(Rel, t2))
+        local exclusive = not world:has(e, pair(Rel, t1)) and world:target(e, Rel) == t2
+        world:remove(Rel, ecs.Exclusive)
+        world:add(e, pair(Rel, t1))
+        return exclusive and world:has(e, pair(Rel, t1)) and world:has(e, pair(Rel, t2))
+    end
+
+    CASE("a listener, a hook or tracking on Exclusive")
+    local seen = 0
+    CHECK(exclusive_after(function(world: any)
+        world:added(ecs.Exclusive, function()
+            seen += 1
+        end)
+    end))
+    CHECK(exclusive_after(function(world: any)
+        world:set(ecs.Exclusive, ecs.OnAdd, function()
+            seen += 10
+        end)
+    end))
+    CHECK(exclusive_after(function(world: any)
+        world:removed(ecs.Exclusive, function()
+            seen += 100
+        end)
+    end))
+    CHECK(exclusive_after(function(world: any)
+        world:track(ecs.Exclusive)
+    end))
+    CHECK(seen == 111)
+
+    CASE("a listener on OnAdd: hooks set later reach the records that exist")
+    local world = ecs.world()
+    local A = world:component()
+    world:add(world:entity(), A) -- the record of A exists
+    local listened = 0
+    local disconnect = world:added(ecs.OnAdd, function()
+        listened += 1
+    end)
+    local calls = 0
+    world:set(A, ecs.OnAdd, function()
+        calls += 1
+    end)
+    world:set(world:entity(), A, 1)
+    CHECK(listened == 1 and calls == 1)
+    disconnect()
+    world:remove(A, ecs.OnAdd)
+    world:set(world:entity(), A, 2)
+    CHECK(calls == 1)
+
+    CASE("a hook on OnAdd itself")
+    local fresh = ecs.world()
+    local B = fresh:component()
+    fresh:add(fresh:entity(), B)
+    local meta = 0
+    fresh:set(ecs.OnAdd, ecs.OnAdd, function()
+        meta += 1 -- OnAdd is added to B below
+    end)
+    local b_calls = 0
+    fresh:set(B, ecs.OnAdd, function()
+        b_calls += 1
+    end)
+    fresh:set(fresh:entity(), B, 1)
+    CHECK(meta == 1 and b_calls == 1)
+
+    CASE("signals and tracking take a relation, not a pair")
+    local R, T = world:entity(), world:entity()
+    local w: any = world
+    CHECK_EXPECT_ERR(function()
+        w:added(pair(R, T), function() end)
+    end)
+    CHECK_EXPECT_ERR(function()
+        w:changed(pair(R, ecs.Wildcard), function() end)
+    end)
+    CHECK_EXPECT_ERR(function()
+        w:removed(pair(ecs.Wildcard, T), function() end)
+    end)
+    CHECK_EXPECT_ERR(function()
+        w:track(pair(R, T))
+    end)
+    local pairs_seen = 0
+    world:added(R, function()
+        pairs_seen += 1
+    end)
+    world:add(world:entity(), pair(R, T))
+    CHECK(pairs_seen == 1) -- the relation covers its pairs
+end)
+
+TEST("values on tag pairs, queries without terms", function()
+    local world = ecs.world()
+    local w: any = world
+    local R, T = world:entity(), world:entity()
+    local e = world:entity()
+
+    CASE("a value on a tag pair raises an error, also when the entity has the pair")
+    CHECK_EXPECT_ERR(function()
+        w:set(e, pair(R, T), 5)
+    end)
+    CHECK(world:has(e, pair(R, T))) -- the pair stays added, as a tag does
+    CHECK_EXPECT_ERR(function()
+        w:set(e, pair(R, T), 5)
+    end)
+    CHECK(world:get(e, pair(R, T)) == nil)
+    w:set(e, pair(R, T), nil) -- nil is no value
+    CHECK(world:has(e, pair(R, T)))
+
+    CASE("a query without terms matches nothing, has() included")
+    local q = world:query()
+    CHECK(count(q) == 0 and q:count() == 0 and not q:has(e))
+    CHECK(not world:query():without(T):has(e))
+    world:add(e, T)
+    CHECK(world:query():with(T):has(e))
+end)
+
+TEST("pair records left without members are freed in batches", function()
+    CASE("the records of pairs that are gone do not add up")
+    do
+        local world = ecs.world()
+        local Likes = world:entity()
+        local e = world:entity()
+        local targets: { any } = {}
+        for i = 1, 20000 do
+            targets[i] = world:entity()
+        end
+        gc.full()
+        local before = gc.kb()
+        for i = 1, 20000 do
+            world:add(e, pair(Likes, targets[i]))
+            world:remove(e, pair(Likes, targets[i]))
+        end
+        gc.full()
+        -- 0.2.0 before this change kept every record until its target was deleted: 33 MB
+        CHECK(gc.kb() - before < 4096)
+        CHECK(world:target(e, Likes) == nil and count(world:query(pair(Likes, ecs.Wildcard))) == 0)
+    end
+
+    CASE("a pair added again after its record was freed")
+    local world = ecs.world()
+    local Owns = world:component() :: ecs.Component<string>
+    local added = 0
+    world:set(Owns, ecs.OnAdd, function()
+        added += 1
+    end)
+    local holder = world:entity()
+    -- more empty pair records than a batch: the ones before them are freed
+    local function empty_batch()
+        for _ = 1, 600 do
+            local t = world:entity()
+            world:add(holder, pair(Owns, t))
+            world:remove(holder, pair(Owns, t))
+        end
+    end
+    local e, item = world:entity(), world:entity()
+    world:set(e, pair(Owns, item), "sword")
+    world:remove(e, pair(Owns, item))
+    empty_batch()
+    world:set(e, pair(Owns, item), "shield")
+    CHECK(world:get(e, pair(Owns, item)) == "shield" and world:target(e, Owns) == item)
+    CHECK(added == 602) -- the hook of the relation reaches the new record
+    CHECK(count(world:query(pair(Owns, item))) == 1 and count(world:query(pair(ecs.Wildcard, item))) == 1)
+    local parent, child = world:entity(), world:entity()
+    world:add(child, pair(ecs.ChildOf, parent))
+    world:remove(child, pair(ecs.ChildOf, parent))
+    empty_batch()
+    CHECK(world:parent(child) == nil and count(world:children(parent)) == 0)
+    world:add(child, pair(ecs.ChildOf, parent))
+    CHECK(world:parent(child) == parent and count(world:children(parent)) == 1)
+    world:delete(parent)
+    CHECK(not world:contains(child))
+
+    CASE("an exclusive relation switches to a pair whose record is freed during the switch")
+    local X, Y = world:entity(), world:entity()
+    world:add(X, ecs.Exclusive)
+    local f, t1, t2 = world:entity(), world:entity(), world:entity()
+    local other, helper = world:entity(), world:entity()
+    local spares: { any } = {}
+    for i = 1, 600 do
+        spares[i] = world:entity()
+        world:add(helper, pair(Y, spares[i]))
+    end
+    world:add(f, pair(X, t1))
+    local armed = true
+    world:set(X, ecs.OnRemove, function(entity: any)
+        if armed and entity == f then
+            armed = false
+            -- the record of (X, t2), which f is getting, is left empty...
+            world:add(other, pair(X, t2))
+            world:remove(other, pair(X, t2))
+            -- ...and a batch of empty pair records is freed, that record included
+            for _, s in spares do
+                world:remove(helper, pair(Y, s))
+            end
+        end
+    end)
+    world:add(f, pair(X, t2))
+    CHECK(not armed and world:target(f, X) == t2 and world:has(f, pair(X, t2)))
+    CHECK(not world:has(f, pair(X, t1)) and count(world:query(pair(X, t2))) == 1)
+
+    CASE("pairs with many targets against a model, with cached queries (debug world)")
+    local seed = 4242
+    local function next_int(low: number, high: number): number
+        seed = seed * 16807 % 2147483647
+        return low + seed % (high - low + 1)
+    end
+    local debug_world = ecs.world(true)
+    local Data = debug_world:component() :: ecs.Component<number>
+    local Excl = debug_world:entity()
+    debug_world:add(Excl, ecs.Exclusive)
+    local data_added = 0
+    debug_world:set(Data, ecs.OnAdd, function()
+        data_added += 1
+    end)
+    local targets: { any } = {}
+    local sources: { any } = {}
+    for i = 1, 600 do
+        targets[i] = debug_world:entity()
+    end
+    -- the model: source -> target -> value, and source -> exclusive target
+    local data: { [any]: { [any]: number } } = {}
+    local excl: { [any]: any } = {}
+    for i = 1, 50 do
+        local s = debug_world:entity()
+        sources[i] = s
+        data[s] = {}
+    end
+    local watched = targets[1] -- never deleted
+    local by_data = debug_world:query(pair(Data, ecs.Wildcard)):cached()
+    local by_target = debug_world:query(pair(ecs.Wildcard, watched)):cached()
+    local by_pair = debug_world:query(pair(Data, watched)):cached()
+    local mismatches, expected_added = 0, 0
+    local function check()
+        for s, set in data do
+            for t, value in set do
+                if debug_world:get(s, pair(Data, t)) ~= value then
+                    mismatches += 1
+                end
+            end
+            if debug_world:target(s, Excl) ~= excl[s] then
+                mismatches += 1
+            end
+            if debug_world:has(s, pair(Data, ecs.Wildcard)) ~= (next(set) ~= nil) then
+                mismatches += 1
+            end
+            local n = 0
+            for _ in debug_world:targets(s, Data) do
+                n += 1
+            end
+            for _ in set do
+                n -= 1
+            end
+            if n ~= 0 then
+                mismatches += 1
+            end
+        end
+        local want_data, want_target, want_pair = 0, 0, 0
+        for s, set in data do
+            if next(set) ~= nil then
+                want_data += 1
+            end
+            if set[watched] ~= nil or excl[s] == watched then
+                want_target += 1
+            end
+            if set[watched] ~= nil then
+                want_pair += 1
+            end
+        end
+        local n_pair = 0
+        for s, value in by_pair do
+            n_pair += 1
+            if data[s][watched] ~= value then
+                mismatches += 1
+            end
+        end
+        if count(by_data) ~= want_data or count(by_target) ~= want_target or n_pair ~= want_pair then
+            mismatches += 1
+        end
+    end
+    for round = 1, 40 do
+        for _ = 1, 200 do
+            local s = sources[next_int(1, #sources)]
+            local t = targets[next_int(1, #targets)]
+            local roll = next_int(1, 100)
+            if roll <= 35 then
+                local value = next_int(1, 1000)
+                if data[s][t] == nil then
+                    expected_added += 1
+                end
+                debug_world:set(s, pair(Data, t), value)
+                data[s][t] = value
+            elseif roll <= 70 then
+                debug_world:remove(s, pair(Data, t))
+                data[s][t] = nil
+            elseif roll <= 90 then
+                debug_world:add(s, pair(Excl, t))
+                excl[s] = t
+            else
+                debug_world:remove(s, pair(Excl, ecs.Wildcard))
+                excl[s] = nil
+            end
+        end
+        if round % 5 == 0 then
+            -- a target is deleted: its pairs go, a new target takes its place
+            local k = next_int(2, #targets)
+            local t = targets[k]
+            debug_world:delete(t)
+            for s, set in data do
+                set[t] = nil
+                if excl[s] == t then
+                    excl[s] = nil
+                end
+            end
+            targets[k] = debug_world:entity()
+        end
+        check()
+    end
+    CHECK(mismatches == 0 and data_added == expected_added)
 end)
 
 -- a failed case must fail the process (CI reads the exit code)

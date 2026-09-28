@@ -5,7 +5,8 @@
     live for a while and despawn, spawners create new ones, units switch AI states through
     tags, damage marks entities with a one-frame tag, and attachments follow their parents.
 
-    The module is a function of the implementations to compare, a list of { name, module }:
+    The module is a function of the implementations to compare, a list of { name, module }
+    (the names carry the versions, see bench/versions.luau):
     it prints the time per frame (minimum and median over the measured frames), once with the
     queries written inline in every frame and once with queries created before the loop and
     marked :cached() (the recommended jecs style), and returns the times. The implementations
@@ -14,7 +15,7 @@
 
     Usage:
         local frame_scene = require("./frame_scene")
-        local report = frame_scene({ { "jecs", jecs }, { "lib", lib } })
+        local report = frame_scene({ { "jecs 0.11.0", jecs }, { "mErCS 0.2.0", lib } })
 ]]
 
 local gc = require("./gc")
@@ -198,7 +199,7 @@ local function run(impls: { { any } }): Report
         print(if stored then "queries created once, :cached()" else "queries written inline")
         for _, entry in impls do
             local r = results[entry[1]]
-            print(string.format("  %-5s min %.3f ms  median %.3f ms", entry[1], r[1] * 1e3, r[2] * 1e3))
+            print(string.format("  %-12s min %.3f ms  median %.3f ms", entry[1], r[1] * 1e3, r[2] * 1e3))
         end
     end
     return report
