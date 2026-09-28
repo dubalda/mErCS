@@ -53,19 +53,21 @@
       hooks have to run first.
     - Relationships: a pair (R, T) is a record of its own, reached from the relation record
       (R, *), which keeps the pairs of every entity (target() reads it). The target record
-      (*, T) lists the pairs with target T for cleanup policies; from the first time a query,
-      has() or an iteration reads it, it also keeps the bitset of the slots that have any of
-      them (with a count for the slots that have several). Pair records left without members
-      are freed in batches (free_empty_pairs), a (*, T) record with the last pair record of T,
-      and all of them when R or T is deleted.
+      (*, T) lists the pairs with target T for cleanup policies (a small record until then);
+      from the first time a query, has() or an iteration reads it, it also keeps the bitset of
+      the slots that have any of them (with a count for the slots that have several). Pair
+      records left without members are freed in batches (free_empty_pairs), a (*, T) record
+      with the last pair record of T, and all of them when R or T is deleted.
 
     Queries AND the bitsets of the included ids and AND-NOT the excluded ones; full words are
     merged into runs and iterated sequentially. A cached query with scattered matches keeps a
-    list of them grouped by value page, and after a few changes it re-checks only the slots
-    noted in the journals of its records (patch_list) instead of scanning again; an empty
-    result is kept as an empty list. Queries created on every call share their state by shape
-    (see query_state): an inline world:query allocates only a small handle, and iterating
-    allocates nothing.
+    list of them grouped by value page, and after a few changes (a quarter of the list at
+    most) it re-checks only the slots noted in the journals of its records (patch_list)
+    instead of scanning again; an empty result is kept as an empty list. Queries created on
+    every call share their state by shape (see query_state): an inline world:query allocates
+    only a small handle, and iterating allocates nothing; the shapes that have a deleted
+    entity id are dropped (prune_shapes). A query that is not shared reuses the iteration
+    contexts of the world (spare_contexts).
     Value pages of dense components are preallocated arrays, of sparse ones small hash tables.
 
     Also: Disabled (hidden from queries that do not name it), change tracking (world:track,
@@ -125,7 +127,8 @@ type Record = {
     -- presence: words[w] holds 32 slots, sums[sw] (sw >= 1) marks the non-empty words of 1024
     -- slots, and sums[-tw] (the third level, "tops", in the same table) the non-empty summary
     -- words of 32768 slots; an emptied entry stays 0 (see word_last), and zeros counts the
-    -- words emptied since the zeros were last dropped
+    -- words emptied since the zeros were last dropped. A lazy (*, T) record has none of the
+    -- fields from here to journal_mask (and no multi) until target_materialize adds them.
     words: Words,
     sums: Words,
     word_count: number,
@@ -227,9 +230,11 @@ type QueryState = {
     term_any: { { Words } }?,
     term_without: { Words }?,
     terms_empty: boolean?,
-    -- shared query (see world_query): modifiers return shared variants, never change it
+    -- shared query (see query_state): modifiers return shared variants, never change it;
+    -- variants is false once the state has left the tree of shapes (see prune_shapes): the
+    -- modifiers return queries of their own then
     shared: boolean?,
-    variants: { [any]: any }?,
+    variants: { [any]: any } | false | nil,
     -- reusable iteration contexts of a cached query (see new_direct and query_each)
     direct: any?,
     each_ctx: any?,
@@ -418,8 +423,9 @@ export type World = {
     Creates a world. With `debug = true`, `set`, `add`, `remove`, `delete`, `clear` and the
     batch operations raise an error for an entity or an id that is not alive (an outdated
     handle) instead of ignoring the call, every match list that a cached query updates after a
-    change is checked against a scan of the bitsets, and a query that takes its list as it is
-    checks that none of its ids changed.
+    change is checked against a scan of the bitsets, a query that takes its list as it is
+    checks that none of its ids changed, and the world warns once when its 1024 shared query
+    states are in use (a query of a new shape then builds a new state on every call).
 ]=]
 
 --[=[
@@ -994,11 +1000,13 @@ export type World = {
     - A query never goes stale: its ids may be created and deleted at any time.
     - A query written inline in a system is cheap: queries of the same shape share one
       state, so an inline query allocates only a small handle, and an iteration of a stored
-      query allocates nothing.
-    - A cached query with scattered matches keeps a list of them; after a few changes it
-      updates only the changed slots of the list, and a query that matches nothing costs a
-      check of its ids per loop (a comparison when no id of any cached query changed in the
-      world since its previous loop).
+      query allocates nothing. A world shares up to 1024 shapes; the shapes of an entity used
+      as a term are dropped when the entity is deleted.
+    - A cached query with scattered matches keeps a list of them; after a few changes (up to
+      a quarter of the list) it updates only the changed slots of the list, after more it
+      passes over the bitsets once, and a query that matches nothing costs a check of its ids
+      per loop (a comparison when no id of any cached query changed in the world since its
+      previous loop).
     - The current entity may be changed or deleted inside the loop. Changes of other
       entities may or may not be seen by the running loop; an entity deleted ahead of the
       loop may still be returned once (check [World:contains]).
@@ -1177,8 +1185,11 @@ local TOP_SLOTS = 32768 -- slots per word of the third bitset level (tops)
 -- change journals (see note): entries of a new journal and the most a journal grows to
 local JOURNAL_MIN = 16
 local JOURNAL_MAX = 512
--- a cached query re-checks at most this many noted slots between two loops (more: a rescan)
+-- a cached query re-checks at most this many noted slots between two loops, and at most a
+-- quarter of its match list, but always up to CHANGE_MIN (more: a pass over the bitsets, see
+-- iteration_mode)
 local CHANGE_LIMIT = 1024
+local CHANGE_MIN = 32
 -- slots are reserved for a pool (see world:pool) in aligned blocks of this many
 local POOL_BLOCK = PAGE_SIZE
 -- pair records left without members are freed in batches, once there are more than this many
@@ -1194,6 +1205,10 @@ local MAX_SHAPES = 1024
 local TRACK_KINDS = { "added", "changed", "removed" }
 
 local TOO_MANY_IDS = "at most 8 ids can be passed; use get_list/has_all for more"
+-- reported once by a debug world whose shared query states ran out (see share_shape)
+local SHAPES_EXHAUSTED = `mErCS: {MAX_SHAPES} query shapes are shared, the most a world keeps; a query of a new `
+    .. "shape builds a new state on every world:query call. Entity ids used as query terms make a shape "
+    .. "per entity: see the Queries section of the guide."
 
 local function NOOP(): any
     return nil
@@ -1322,6 +1337,78 @@ local function shareable(id: i53): boolean
     return id < PAIR_OFFSET or is_wildcard(id)
 end
 
+-- The query states that a world shares by shape (see query_state in world_new). The shape of
+-- a state is a path of ids in a tree of nodes, root[id1][id2]...query: the roots are roots[n]
+-- for world:query with n ids, and variants[kind] of a shared state for its variants (with,
+-- without, any). count is the number of shared states (at most MAX_SHAPES); keys[id] holds
+-- the nodes that have a child keyed by the entity id `id` (see prune_shapes); warned: a debug
+-- world has reported that the shared states ran out.
+type Shapes = {
+    roots: { [number]: any },
+    count: number,
+    keys: { [i53]: { [any]: boolean } },
+    warned: boolean,
+}
+
+local drop_shapes: (shapes: Shapes, node: any) -> ()
+
+-- A shared state leaves the tree with its variants and stops counting. A handle that keeps
+-- it keeps a working query, whose modifiers return queries of their own (variants == false,
+-- see shared_variant). A state reached twice counts once.
+local function drop_state(shapes: Shapes, state: QueryState)
+    local variants = state.variants
+    if variants == false then
+        return
+    end
+    state.variants = false
+    shapes.count -= 1
+    if variants then
+        for _, root in variants do
+            drop_shapes(shapes, root)
+        end
+    end
+end
+
+-- The states of a subtree that is cut off the tree leave it, and its nodes leave keys.
+function drop_shapes(shapes: Shapes, node: any)
+    for key, child in node do
+        if key == "query" then
+            drop_state(shapes, child)
+            continue
+        end
+        if key < PAIR_OFFSET then
+            local parents = shapes.keys[key]
+            if parents then
+                parents[node] = nil
+                if next(parents) == nil then
+                    shapes.keys[key] = nil
+                end
+            end
+        end
+        drop_shapes(shapes, child)
+    end
+end
+
+-- An entity id is generational: once the entity is deleted, a shape that has its id can never
+-- match again (world:entity(id) that makes the id alive again gets new shapes). world_delete
+-- cuts the branches keyed by the id off the tree, so that they keep no memory and take no
+-- room among the MAX_SHAPES shared states. Pairs are not keyed here: a pair drops the
+-- generations of its ids, and the pair of a reused slot is the same shape.
+local function prune_shapes(shapes: Shapes, entity: i53)
+    local parents = shapes.keys[entity]
+    if parents == nil then
+        return
+    end
+    shapes.keys[entity] = nil
+    for parent in parents do
+        local child = parent[entity]
+        if child ~= nil then
+            parent[entity] = nil
+            drop_shapes(shapes, child)
+        end
+    end
+end
+
 -- The callback of a record whose id has an internal hook (see internal_hooks in world_new):
 -- the internal hook, then `hook` (the hook of the id or the dispatcher of its signals).
 local function chain_hooks(internal: Hook?, hook: Hook?): Hook?
@@ -1393,8 +1480,11 @@ local function world_new(debug: boolean?): World
     -- the first ChildOf pair of every slot (slot_pair of the (ChildOf, *) record), for parent()
     local childof_pairs: { [number]: Record }? = nil
 
-    -- id_used[slot]: the entity of the slot is (or was) a component, tag, relation or target
+    -- id_used[slot]: the entity of the slot is (or was) a component, tag, relation or target,
+    -- or a term of a shared query shape (world_delete cleans up after such an entity)
     local id_used: { [number]: boolean } = {}
+    -- the query states shared by shape (see query_state)
+    local shapes: Shapes = { roots = {}, count = 0, keys = {}, warned = false }
 
     local world = {} :: any
     -- the presence words of the Component trait (set when its record is created)
@@ -1944,13 +2034,14 @@ local function world_new(debug: boolean?): World
     local world_has_pair: (entity: i53, id: i53) -> boolean
 
     -- A (*, T) record starts lazy: pairs come and go without touching it, and nothing reads
-    -- its bits. The first query, has(), iteration or removal that needs them builds them from
-    -- the pairs of T (target_materialize), and from then on the record is eager: it keeps the
-    -- bit of a slot while the slot has at least one pair with T, and multi counts the pairs of
-    -- the slots that have more than one. A second pair of a slot does not change the presence,
-    -- so it does not change the version either. Most targets (parents, the targets of
-    -- one-to-one relations) are never read through (*, T) and cost nothing more than their
-    -- pairs.
+    -- its bits. A lazy record is small (see wildcard_record): it has no presence tables, no
+    -- journal and no counts. The first query, has(), iteration or removal that needs its bits
+    -- builds them from the pairs of T (target_materialize), and from then on the record is
+    -- eager: it keeps the bit of a slot while the slot has at least one pair with T, and multi
+    -- counts the pairs of the slots that have more than one. A second pair of a slot does not
+    -- change the presence, so it does not change the version either. Most targets (parents,
+    -- the targets of one-to-one relations) are never read through (*, T) and cost little more
+    -- than their pairs.
 
     -- Builds the presence of a lazy (*, T) record from the pairs of its target; the record is
     -- eager from then on.
@@ -1959,7 +2050,15 @@ local function world_new(debug: boolean?): World
             return
         end
         rec.eager = true
-        local words = rec.words
+        -- the fields that a lazy record does not have
+        local words: Words = {}
+        rec.words = words
+        rec.sums = {}
+        rec.word_count = 0
+        rec.zeros = 0
+        rec.journal = false
+        rec.journal_mask = 0
+        rec.multi = false
         for _, pair_rec in rec.pairs :: { [i53]: Record } do
             for w, word in pair_rec.words do
                 if word == 0 then
@@ -2060,27 +2159,37 @@ local function world_new(debug: boolean?): World
         if rec then
             return rec
         end
-        rec = new_record(id, if relation then KIND_RELATION else KIND_TARGET, false)
+        if relation == nil then
+            -- a lazy (*, T) record: 8 fields, which a table holds in 8 hash slots (a record
+            -- made by new_record takes 16, and two tables); target_materialize adds the rest.
+            -- No words in pwords: has() finds the record through lazy_words.
+            rec = {
+                id = id,
+                kind = KIND_TARGET,
+                index = 0,
+                version = 0,
+                pairs = {},
+                target = target,
+                eager = false,
+                data_pairs = 0,
+            } :: any
+            records[id] = rec
+            records_generation += 1
+            changes_stamp += 1
+            id_used[(target :: i53) % ENTITY_MASK] = true
+            return rec
+        end
+        rec = new_record(id, KIND_RELATION, false)
         rec.pairs = {}
-        if relation then
-            rec.relation = relation
-        else
-            rec.target = target
+        rec.relation = relation
+        id_used[relation % ENTITY_MASK] = true
+        rec.slot_pair = {}
+        rec.slot_pairs = {}
+        if relation == EcsChildOf then
+            childof_pairs = rec.slot_pair
         end
-        id_used[(relation or target :: i53) % ENTITY_MASK] = true
-        if relation then
-            rec.slot_pair = {}
-            rec.slot_pairs = {}
-            if relation == EcsChildOf then
-                childof_pairs = rec.slot_pair
-            end
-            rec.exclusive = world_has_pair(relation, EcsExclusive)
-            set_hooked(rec, hook_for("on_remove", EcsOnRemove, relation) ~= nil)
-        else
-            -- lazy: no words in pwords (has() finds the record through lazy_words)
-            rec.eager = false
-            rec.multi = false
-        end
+        rec.exclusive = world_has_pair(relation, EcsExclusive)
+        set_hooked(rec, hook_for("on_remove", EcsOnRemove, relation) ~= nil)
         rec.data_pairs = 0
         return rec
     end
@@ -3244,6 +3353,8 @@ local function world_new(debug: boolean?): World
                 return -- deleted by a hook
             end
             cleanup_ids(entity, delete_policy)
+            -- the shared query shapes that have the id can never match again
+            prune_shapes(shapes, entity)
             id_used[slot] = nil
             if delete_depth == 0 and deferred[1] ~= nil then
                 drain_deferred()
@@ -3259,6 +3370,11 @@ local function world_new(debug: boolean?): World
         end
         if alive[slot] ~= entity then
             return -- deleted by a hook
+        end
+        if id_used[slot] then
+            -- a hook of this delete made query shapes with the entity (after its shapes were
+            -- pruned, or when it was no id before): they go too
+            prune_shapes(shapes, entity)
         end
         local marked = last_marked[slot]
         if marked then
@@ -4805,6 +4921,12 @@ local function world_new(debug: boolean?): World
         return ctx
     end
 
+    -- The iteration contexts of queries that are not cached (created on every call: pairs
+    -- with a concrete target, change filters, shapes beyond MAX_SHAPES), reused while no loop
+    -- runs on them, so that such a query does not build its iterator on every call: [n] is
+    -- the for-in context for n returned ids (new_direct), .each the context of query:each.
+    local spare_contexts: { [any]: any } = {}
+
     local function direct_iter(query: QueryState): (any, any, any)
         if query_needs_generic(query) then
             return generic_iter(query)
@@ -4812,9 +4934,16 @@ local function world_new(debug: boolean?): World
         local ctx = query.direct
         if ctx == nil or ctx.busy then
             -- first iteration, or the previous loop was left early or is still running
-            ctx = new_direct(#query.ids)
+            local n = #query.ids
             if query.is_cached then
+                ctx = new_direct(n)
                 query.direct = ctx
+            else
+                ctx = spare_contexts[n]
+                if ctx == nil or ctx.busy then
+                    ctx = new_direct(n)
+                    spare_contexts[n] = ctx
+                end
             end
         end
         local driver = plan_query(query, ctx.others, ctx.without)
@@ -5537,15 +5666,11 @@ local function world_new(debug: boolean?): World
     -- removed from its group, found through list_ghint or a binary search; a group is created
     -- or removed with its first or last match. A noted first slot of a page (new_page notes a
     -- page creation so) makes its group read its page references again. While a loop over the
-    -- list has not finished, the list is copied first (detach_list). Many changes at once
-    -- rebuild the whole list. Returns false when the list grew past LIST_MAX (the query
-    -- iterates the bitsets then).
+    -- list has not finished, the list is copied first (detach_list). The changes are few for
+    -- the list (iteration_mode passes over the bitsets after more). Returns false when the list
+    -- grew past LIST_MAX (the query iterates the bitsets then).
     local function patch_list(query: QueryState): boolean
         local changes = change_count
-        if changes > 32 and changes * 4 > query.list_count then
-            build_list(query)
-            return query.list_count <= LIST_MAX
-        end
         if query.terms_generation ~= records_generation then
             term_words(query)
         end
@@ -5803,9 +5928,11 @@ local function world_new(debug: boolean?): World
     end
 
     -- Mode of a query for this iteration: 1 = direct, 2 = match list. A cached query whose
-    -- records changed a little since its previous loop picks its mode (or patches its list)
-    -- at once; after other changes it iterates the bitsets once and picks the mode at its next
-    -- loop. The loops of a query call it only when list_unchanged does not hold.
+    -- records changed a little since its previous loop (noted changes: at most a quarter of
+    -- its match list, CHANGE_MIN..CHANGE_LIMIT) picks its mode (or patches its list) at once;
+    -- after more changes it iterates the bitsets once and picks the mode at its next loop, so
+    -- a query whose entities change by many before every loop is not rebuilding its list all
+    -- the time. The loops of a query call it only when list_unchanged does not hold.
     local function iteration_mode(query: QueryState): number
         if not query.listable then
             return 1
@@ -5828,6 +5955,9 @@ local function world_new(debug: boolean?): World
         local observed = query.observed
         local versions = query.versions
         local n = 0
+        -- the noted changes are re-checked one by one while they are few for the match list:
+        -- more of them cost more than one pass over the bitsets
+        local limit = math.clamp(query.list_count // 4, CHANGE_MIN, CHANGE_LIMIT)
         for k = 1, query.observed_records :: number do
             local rec = observed[k]
             do
@@ -5840,9 +5970,9 @@ local function world_new(debug: boolean?): World
                         local count = version - seen
                         local journal = rec.journal
                         local size = rec.journal_mask + 1
-                        if not journal or count > size or n + count > CHANGE_LIMIT then
+                        if not journal or count > size or n + count > limit then
                             status = 2
-                            if journal and count > size and count <= JOURNAL_MAX then
+                            if journal and count > size and count <= limit and count <= JOURNAL_MAX then
                                 -- the journal is too short for the changes between two loops
                                 -- of this query: a longer one serves the next loops
                                 while size < count do
@@ -6180,10 +6310,16 @@ local function world_new(debug: boolean?): World
         end
         local ctx = query.each_ctx
         if ctx == nil or ctx.busy then
-            local advance, bind = new_advance()
-            ctx = { busy = false, others = {}, without = {}, advance = advance, bind = bind }
-            if query.is_cached then
-                query.each_ctx = ctx
+            -- an uncached query takes the spare context while no loop runs on it
+            ctx = if query.is_cached then nil else spare_contexts.each
+            if ctx == nil or ctx.busy then
+                local advance, bind = new_advance()
+                ctx = { busy = false, others = {}, without = {}, advance = advance, bind = bind }
+                if query.is_cached then
+                    query.each_ctx = ctx
+                else
+                    spare_contexts.each = ctx
+                end
             end
         end
         local driver = plan_query(query, ctx.others, ctx.without)
@@ -6844,12 +6980,11 @@ local function world_new(debug: boolean?): World
     Query.__iter = query_iter
 
     -- Shared queries: world:query returns one query object per shape (the returned ids, then
-    -- the ids of :with and :without), kept in a tree of shapes. A shared query is cached and
-    -- never changes; its modifiers return the shared variant (or a new query when the variant
-    -- cannot be shared). Pairs with a concrete target are not shared (see shareable): their
-    -- number is unbounded. At most MAX_SHAPES states are shared.
-    local shapes: { [any]: any } = {}
-    local shape_count = 0
+    -- the ids of :with and :without), kept in a tree of shapes (see Shapes). A shared query is
+    -- cached and never changes; its modifiers return the shared variant (or a new query when
+    -- the variant cannot be shared). Pairs with a concrete target are not shared (see
+    -- shareable): their number is unbounded. At most MAX_SHAPES states are shared; the shapes
+    -- of a deleted entity leave the tree (see prune_shapes).
 
     local function make_cached(query: QueryState): QueryState
         if not query.is_cached then
@@ -6969,7 +7104,60 @@ local function world_new(debug: boolean?): World
         return query
     end
 
-    -- The shared variant of a shared query for `kind` ("with" or "without") and the given ids.
+    -- A shape that has no state yet: `state`, its new state, is shared when there is room for it
+    -- and every entity id of the given ids is alive (a dead id matches nothing, and a shape of
+    -- it would never be pruned); otherwise the caller uses it unshared. The path of the shape is
+    -- created only now, from owner[key] (a root of the tree) through the given ids, so a shape
+    -- that is not shared leaves nothing in the tree. The entity ids of the path are noted in
+    -- shapes.keys, and world_delete prunes their shapes (see prune_shapes).
+    local function share_shape(owner: any, key: any, state: QueryState, ...: i53): QueryState
+        if shapes.count >= MAX_SHAPES then
+            if debug and not shapes.warned then
+                shapes.warned = true
+                local report = warn or print -- the luau CLI has no warn
+                report(SHAPES_EXHAUSTED)
+            end
+            return state
+        end
+        local n = select("#", ...)
+        for i = 1, n do
+            local id = select(i, ...)
+            if id < PAIR_OFFSET and alive[id % ENTITY_MASK] ~= id then
+                return state
+            end
+        end
+        local node: any = owner[key]
+        if node == nil then
+            node = {}
+            owner[key] = node
+        end
+        for i = 1, n do
+            local id = select(i, ...)
+            local child = node[id]
+            if child == nil then
+                child = {}
+                node[id] = child
+                if id < PAIR_OFFSET then
+                    local parents = shapes.keys[id]
+                    if parents == nil then
+                        parents = {}
+                        shapes.keys[id] = parents
+                        id_used[id % ENTITY_MASK] = true
+                    end
+                    parents[node] = true
+                end
+            end
+            node = child
+        end
+        shapes.count += 1
+        make_cached(state)
+        state.shared = true
+        node.query = state
+        return state
+    end
+
+    -- The shared variant of a shared query for `kind` ("with", "without" or "any") and the
+    -- given ids.
     local function shared_variant(
         query: QueryState,
         kind: string,
@@ -6977,37 +7165,27 @@ local function world_new(debug: boolean?): World
         ...: i53
     ): QueryState
         local variants = query.variants
-        if variants == nil then
-            variants = {}
-            query.variants = variants
+        if variants == false then
+            -- the query has left the tree of shapes (see prune_shapes)
+            return apply(copy_query(query), ...)
         end
-        local node: any = (variants :: any)[kind]
-        if node == nil then
-            node = {}
-            (variants :: any)[kind] = node
-        end
+        local node: any = if variants then variants[kind] else nil
         for i = 1, select("#", ...) do
             local id = select(i, ...)
             if not shareable(id) then
                 return apply(copy_query(query), ...)
             end
-            local child = node[id]
-            if child == nil then
-                child = {}
-                node[id] = child
+            if node ~= nil then
+                node = node[id]
             end
-            node = child
         end
-        local variant: QueryState? = node.query
+        local variant: QueryState? = if node ~= nil then node.query else nil
         if variant == nil then
-            if shape_count >= MAX_SHAPES then
-                return apply(copy_query(query), ...)
+            if variants == nil then
+                variants = {}
+                query.variants = variants
             end
-            shape_count += 1
-            local created = make_cached(apply(copy_query(query), ...))
-            created.shared = true
-            (node :: any).query = created
-            return created
+            return share_shape(variants, kind, apply(copy_query(query), ...), ...)
         end
         return variant
     end
@@ -7126,33 +7304,19 @@ local function world_new(debug: boolean?): World
     -- The state for the ids of world:query: shared by shape when possible.
     local function query_state(...: i53): QueryState
         local n = select("#", ...)
-        local node: any = shapes[n]
-        if node == nil then
-            node = {}
-            shapes[n] = node
-        end
+        local node: any = shapes.roots[n]
         for i = 1, n do
             local id = select(i, ...)
             if not shareable(id) then
                 return new_query({ ... })
             end
-            local child = node[id]
-            if child == nil then
-                child = {}
-                node[id] = child
+            if node ~= nil then
+                node = node[id]
             end
-            node = child
         end
-        local state: QueryState? = node.query
+        local state: QueryState? = if node ~= nil then node.query else nil
         if state == nil then
-            if shape_count >= MAX_SHAPES then
-                return new_query({ ... })
-            end
-            shape_count += 1
-            local created = make_cached(new_query({ ... }))
-            created.shared = true
-            (node :: any).query = created
-            return created
+            return share_shape(shapes.roots, n, new_query({ ... }), ...)
         end
         return state
     end

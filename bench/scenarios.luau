@@ -975,6 +975,44 @@ local function build(N: number): { Scenario }
         end,
     })
 
+    -- a pair with a concrete target: the query is not shared, it gets a new state every call
+    for _, matches in { 15, 0 } do
+        add({
+            group = "query",
+            name = `a concrete pair per call ({matches} of 1000)`,
+            ops = 10000,
+            unit = "query",
+            reuse = true,
+            requires = { "pairs" },
+            setup = function(impl)
+                local world = impl.ecs.world()
+                local a = impl.component(world)
+                local link = impl.ecs.pair(world:entity(), world:entity())
+                for i = 1, 1000 do
+                    local e = world:entity()
+                    world:set(e, a, i)
+                    if matches > 0 and i % 64 == 0 then
+                        world:add(e, link)
+                    end
+                end
+                return { world = world, a = a, link = link, visited = 0 }
+            end,
+            run = function(_, state)
+                local world, a, link = state.world, state.a, state.link
+                local n = 0
+                for _ = 1, 10000 do
+                    for _e, _a in world:query(a, link) do
+                        n += 1
+                    end
+                end
+                state.visited = n
+            end,
+            check = function(_, state)
+                return expect(state.visited, 10000 * matches)
+            end,
+        })
+    end
+
     add({
         group = "query",
         name = "iter 10 terms",
@@ -1321,6 +1359,30 @@ local function build(N: number): { Scenario }
                 for k = 1, 100 do
                     world:set(list[(i * 7 + k * 97) % 10000 + 1], id, k)
                 end
+            end
+        end,
+    })
+
+    -- an entity used as a query term, then deleted: what the queries on it keep
+    add({
+        group = "memory",
+        name = "4 inline queries on an entity, deleted",
+        ops = 20000,
+        unit = "entity",
+        memory = true,
+        setup = function(impl)
+            local world = impl.ecs.world()
+            return { world = world, events = components(impl, world, 4) }
+        end,
+        run = function(_, state)
+            local world, events = state.world, state.events
+            for _ = 1, 20000 do
+                local caster = world:entity()
+                for i = 1, 4 do
+                    for _ in world:query(events[i]):with(caster) do
+                    end
+                end
+                world:delete(caster)
             end
         end,
     })

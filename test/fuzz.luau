@@ -22,10 +22,13 @@
     patched match list of a cached query against a scan of its bitsets; "churn" adds and
     removes pairs with 400 targets on an entity outside the model after every operation, so
     that the pair records left empty (those of the model too) are freed in batches between
-    and inside the operations of the model):
+    and inside the operations of the model; "shapes" checks queries that have entities of the
+    model as terms after every batch (a shared query shape per entity, dropped when the entity
+    is deleted: a new shape of a live entity must always be shared) and keeps some of them
+    across the rounds, also after their entity is deleted):
         luau test/fuzz.luau
-        luau test/fuzz.luau -a 42 400 wide hooks churn
-        luau test/fuzz.luau -a 7 300 sparse pool verify hooks churn
+        luau test/fuzz.luau -a 42 400 wide hooks churn shapes
+        luau test/fuzz.luau -a 7 300 sparse pool verify hooks churn shapes
 ]]
 
 local ecs = require("../src")
@@ -39,6 +42,7 @@ local sparse = table.find(args, "sparse") ~= nil
 local pooled = table.find(args, "pool") ~= nil
 local verify = table.find(args, "verify") ~= nil
 local churn = table.find(args, "churn") ~= nil
+local shapes = table.find(args, "shapes") ~= nil
 
 local function next_int(low: number, high: number): number
     seed = seed * 16807 % 2147483647
@@ -769,6 +773,44 @@ local function check_stored()
     end
 end
 
+-- "shapes": queries with entities of the model as terms. No entity has another one as a tag,
+-- so without(t) excludes nothing and with(t) matches nothing, whether t is alive or not. The
+-- entities are taken in a fixed order (no random numbers: the operations of the model are the
+-- same with and without the flag). The shapes of the live entities are fewer than MAX_SHAPES,
+-- so every new one must be shared: a shape that is not dropped with its entity would use up
+-- the shared states. Some handles are kept across the rounds, after their entity is deleted
+-- too.
+local kept_shapes: { { any } } = {}
+
+local function c1_alive(m: EntityModel): boolean
+    return m.values[C1] ~= nil and not m.disabled
+end
+
+local function nothing(_: EntityModel): boolean
+    return false
+end
+
+local function check_shapes()
+    for k = 1, #list, math.max(1, #list // 8) do
+        local t = list[k]
+        local q = world:query(C1):without(t)
+        if (q :: any).state.shared ~= true then -- the internal state of the query
+            fail(`the shape of C1 without {t} is not shared`)
+        end
+        check_query(`C1 without {t}`, q, c1_alive)
+        check_query(`C1 with {t}`, world:query(C1):with(t), nothing)
+        if k == 1 then
+            table.insert(kept_shapes, { t, q })
+            if #kept_shapes > 16 then
+                table.remove(kept_shapes, 1)
+            end
+        end
+    end
+    for _, entry in kept_shapes do
+        check_query_once(`kept C1 without {entry[1]}`, entry[2], c1_alive)
+    end
+end
+
 local function check_queries()
     check_query("C1", world:query(C1), function(m)
         return m.values[C1] ~= nil and not m.disabled
@@ -892,6 +934,9 @@ for round = 1, rounds do
     check_tracking()
     check_entities()
     check_stored()
+    if shapes then
+        check_shapes()
+    end
     if round % 3 == 0 then
         check_queries()
     end

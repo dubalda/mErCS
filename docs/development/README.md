@@ -87,13 +87,16 @@ first failure with a non-zero exit code (a failed case of the test kit fails its
 over many value pages and every bitset level), `pool` creates half of the entities of the
 model from a slot pool, `verify` uses a debug world, which checks every patched match list
 of a cached query against a scan of its bitsets and, when a query takes its list as it is,
-that none of its records changed, and `churn` adds and removes pairs with 400 targets on an
+that none of its records changed, `churn` adds and removes pairs with 400 targets on an
 entity outside the model after every operation, so that the pair records left empty (those
-of the model too) are freed in batches between and inside the operations of the model:
+of the model too) are freed in batches between and inside the operations of the model, and
+`shapes` checks queries that have entities of the model as terms after every batch (a shared
+query shape per entity, dropped when the entity is deleted: a new shape of a live entity must
+be shared) and keeps some of them across the rounds, after their entity is deleted too:
 
 ```sh
-luau test/fuzz.luau -a 42 400 wide hooks
-luau test/fuzz.luau -a 7 400 sparse pool verify hooks wide churn
+luau test/fuzz.luau -a 42 400 wide hooks shapes
+luau test/fuzz.luau -a 7 400 sparse pool verify hooks wide churn shapes
 ```
 
 ## Checks
@@ -113,7 +116,7 @@ luau-lsp server of the installed VS Code extension (the version the editor uses)
 bash tools/previous.sh                                      # the previous release, once (optional)
 luau -O2 bench/run.luau -a reps=9                           # the matrix, interpreter
 luau -O2 --codegen bench/run.luau -a filter=query,pair      # native code, some groups
-luau -O2 --codegen bench/run.luau -a "filter=query cases,sparse" # the query shapes (bench/shapes.luau)
+luau -O2 --codegen bench/run.luau -a "filter=query cases,sparse,state tags" # the query shapes (bench/shapes.luau)
 luau -O2 --codegen bench/query_cases.luau                   # the query cases, with the test kit of jecs
 luau -O2 bench/frame.luau                                   # the synthetic frame
 luau -O2 bench/leak.luau                                    # a long session
@@ -132,10 +135,12 @@ The groups `query cases` and `sparse world` (`bench/shapes.luau`) time one pass 
 the changes a game makes before it: five cases where an archetype ECS is at its best (entity
 ids scattered by churn, a tag of the query toggled between loops, four values read per match,
 a `(*, T)` wildcard over changing pairs, a query that almost never matches), and creatures
-scattered among their children (skills), also created from a slot pool. A loop over matches is
-the for-in loop for jecs and `query:each` for this library (it replaces the for-in loop fully
-when the loop does not break). Their worlds have fixed sizes at `n = 131072` and shrink with a
-smaller `n`.
+scattered among their children (skills), also created from a slot pool. The group
+`state tags` times a frame of 1200 skills in 5 state tags: 10, 200 or 800 of them move to
+the next state, then 5 queries written inline pass over the skills of each state. A loop over
+matches is the for-in loop for jecs and `query:each` for this library (it replaces the for-in
+loop fully when the loop does not break). The worlds of the first two groups have fixed sizes
+at `n = 131072` and shrink with a smaller `n`.
 
 `bench/query_cases.luau` runs the same five cases with the test kit of jecs: one run per case,
 first loops included; the matrix takes the minimum of several runs.
@@ -145,7 +150,7 @@ first loops included; the matrix takes the minimum of several runs.
 `bench/visual/*.bench.luau` follow the format of the Benchmarker plugin (the same as
 `jecs/test/benches/visual`): `ParameterGenerator`, `BeforeAll` / `AfterAll` /
 `BeforeEach` / `AfterEach` and `Functions` with an entry for jecs and one for mErCS, named with
-their versions (`jecs 0.11.0`, `mErCS 0.2.0`: `libs.luau` reads the version of jecs from its
+their versions (`jecs 0.11.0`, `mErCS 0.2.1`: `libs.luau` reads the version of jecs from its
 Wally package and holds the version of mErCS). The parameters are generated before every call
 and give each function its own fresh world.
 
@@ -238,7 +243,7 @@ The workflows of `.github/workflows/` get the tools from `rokit.toml` (the
 
 | Workflow | When | What |
 |---|---|---|
-| `ci.yml` | every pull request and push to `main` | `tools/check.sh`; `tools/test.sh` in the interpreter and with native code, plus 3 fuzz runs of 400 rounds (`wide hooks`) and 2 with `sparse pool verify hooks wide churn`; the model `mercs.rbxm` and the Wally package as artifacts; the documentation site is built, not published |
+| `ci.yml` | every pull request and push to `main` | `tools/check.sh`; `tools/test.sh` in the interpreter and with native code, plus 3 fuzz runs of 400 rounds (`wide hooks`) and 2 with `sparse pool verify hooks wide churn shapes`; the model `mercs.rbxm` and the Wally package as artifacts; the documentation site is built, not published |
 | `release.yml` | a pushed tag `vX.Y.Z` | the tag must match `version` in `wally.toml`; checks and tests; `wally publish`; a GitHub release with `mercs.rbxm`, whose text is the section of the tag in `CHANGELOG.md` (generated notes when there is none) |
 | `docs.yml` | a push to `main` that changes `src/`, `docs/`, `README.md` or `moonwave.toml` | builds the documentation site and publishes it to GitHub Pages |
 
@@ -252,8 +257,8 @@ To release a version:
 3. Commit, wait for a green CI, then push the tag:
 
 ```sh
-git tag -a v0.2.0 -m "mErCS v0.2.0"
-git push origin v0.2.0
+git tag -a v0.2.1 -m "mErCS v0.2.1"
+git push origin v0.2.1
 ```
 
 Settings of the GitHub repository:
