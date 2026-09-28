@@ -101,7 +101,8 @@ Cells read "interpreter / native": `-O2` (the Roblox client) / `-O2 --codegen` (
 server). The ratio columns give the time of mErCS 0.2.0 divided by the time of jecs 0.11.0
 (lower is better). The timings vary by about ±10 % between runs of the same build.
 [Roblox Studio: Benchmarker](#roblox-studio-benchmarker) compares jecs 0.11.0 and mErCS 0.2.0
-inside Roblox Studio.
+inside Roblox Studio. mErCS 0.2.1, a patch release, changes what the notes marked **0.2.1**
+below say (the memory table has a column for it); the other numbers are those of 0.2.0.
 
 ### A synthetic game frame
 
@@ -121,6 +122,9 @@ of 3 runs); the queries are written inline in every frame, or created once and `
 mErCS 0.2.0 is 1–15 % slower than 0.1.2 here: several queries of the frame change by
 hundreds of entities every frame, and 0.2.0 updates or rebuilds their match lists where 0.1.2
 scanned the bitsets (see [Where mErCS is still slower](#where-mercs-is-still-slower)).
+**0.2.1** passes over the bitsets of a query whose list changed by more than a quarter since
+its previous loop, and is on par with 0.1.2 (medians of 3 runs of each: 0.93–0.98× of 0.1.2
+in the interpreter, 1.02–1.04× in native code).
 
 ### A long session
 
@@ -136,7 +140,9 @@ growth since the start and time per frame:
 
 The archetypes of dead targets stay in jecs (cleanup does not release them all); in mErCS
 nothing accumulates. The query of the frame changes by about 60 of its 250 entities every
-frame: 0.2.0 updates its match list, which takes longer than the scan of 0.1.2.
+frame: 0.2.0 updates its match list, which takes longer than the scan of 0.1.2. **0.2.1**:
+0.09–0.10 ms per frame (0.1.2: 0.09 ms, 0.2.0: 0.10–0.11 ms in the same runs), and +0.33 MB:
+the `(*, T)` records of the enemies, the targets of `(Targeting, enemy)`, stay small.
 
 ### Query cases
 
@@ -304,20 +310,26 @@ for-in loop over the same world.
 
 Bytes kept per unit, the same in both modes:
 
-| Kept per unit | jecs 0.11.0 | mErCS 0.1.2 | mErCS 0.2.0 |
-|---|---|---|---|
-| an empty entity | 240 B | 32 B | 32 B |
-| an entity with 4 components | 320 B | 131 B | 131 B |
-| an entity with 10 components and 5 tags | 417 B | 236 B | 236 B |
-| a `ChildOf` child (10 000 parents × 5) | 726 B | 457 B | 414 B |
-| an entity with a tag of its own | 1630 B | 946 B | 978 B |
-| a pair with a target of its own | 2264 B | 2033 B | 1809 B |
-| a component of 1000 on 100 entities each, per add | 398 B | 162 B | 162 B |
-| growth per hierarchy spawn / despawn cycle | 218 B | 0 B | 0 B |
+| Kept per unit | jecs 0.11.0 | mErCS 0.1.2 | mErCS 0.2.0 | mErCS 0.2.1 |
+|---|---|---|---|---|
+| an empty entity | 240 B | 32 B | 32 B | 32 B |
+| an entity with 4 components | 320 B | 131 B | 131 B | 131 B |
+| an entity with 10 components and 5 tags | 417 B | 236 B | 236 B | 236 B |
+| a `ChildOf` child (10 000 parents × 5) | 726 B | 457 B | 414 B | 344 B |
+| an entity with a tag of its own | 1630 B | 946 B | 978 B | 978 B |
+| a pair with a target of its own | 2264 B | 2033 B | 1809 B | 1457 B |
+| a component of 1000 on 100 entities each, per add | 398 B | 162 B | 162 B | 162 B |
+| growth per hierarchy spawn / despawn cycle | 218 B | 0 B | 0 B | 0 B |
+| an entity used in 4 inline queries, then deleted | 0 B | 632 B | 492 B | 0 B |
+
+In 0.2.1 the `(*, T)` record of a target is small until something reads it (a `ChildOf`
+parent, a target of its own), and the shared query shapes of an entity are dropped when it is
+deleted (0.1.2 and 0.2.0 kept them, and once 1024 shapes were used up no new shape was shared).
 
 Garbage per loop of a 2-component query over 200 entities: a query written inline
 (`for ... in world:query(A, B)`) allocates 922 bytes in jecs 0.11.0, 82 bytes in mErCS 0.1.2
-and 72 bytes in mErCS 0.2.0 (the handle); a stored query allocates nothing in all three.
+and 72 bytes in mErCS 0.2.0 and 0.2.1 (the handle); a stored query allocates nothing in all of
+them.
 
 ### Roblox Studio: Benchmarker
 
@@ -390,6 +402,18 @@ every loop updates its match list, which costs more than the scan of 0.1.2: the 
 takes 0.11 ms per frame against 0.09 ms, the synthetic frame 1–15 % longer. Deleting an entity
 costs 3–15 % more (the change journals).
 
+**0.2.1**: a query whose list changed by more than a quarter since its previous loop passes
+over its bitsets, as 0.1.2 did: the synthetic frame is on par with 0.1.2, the long session
+takes 0.09–0.10 ms per frame. Adding and removing a tag that a cached query observes still
+costs 5–10 % more than in 0.1.2 (the change journals, the third level of bits): 1200 skills
+whose state tags change by 200 or 800 between the loops of 5 inline queries (the group
+`state tags` of `bench/run.luau`) take 1.06–1.15× the time of 0.1.2, and 0.81–0.88× the time
+of 0.2.0. Against jecs 0.11.0, 0.2.1 is slower in two new rows of the matrix: a query of a
+concrete pair written inline (2.9× / 2.4× with 15 matches: the query builds a new state on
+every call; 0.2.0: 3.8× / 3.4×), and an entity used as a term in 4 inline queries and then
+deleted (3.9× / 5.5×: the shared states of its shapes are created and dropped; 0.2.0 kept them
+and used up the shared states).
+
 ## Migrating from jecs
 
 1. Point the jecs require at this module (`local jecs = require(path.to.mErCS)`) and
@@ -421,7 +445,10 @@ costs 3–15 % more (the change journals).
    hottest loops); hooks that use `oldarchetype` read the entity with `world:get` /
    `world:has`.
 3. Remove most `:cached()` calls: shared queries are cached already (see
-   [Coming from jecs](../guide/README.md#coming-from-jecs)). Replace the observer addon with signals,
+   [Coming from jecs](../guide/README.md#coming-from-jecs)). A query with an entity as a term
+   (`query:with(caster)`) shares a state per entity, up to 1024 shapes per world: for lookups
+   over many live entities, a pair and `world:each(ecs.pair(Event, caster))` need no query
+   state (see [Queries](../guide/README.md#queries)). Replace the observer addon with signals,
    hooks or `world:track` with the `:added` / `:changed` / `:removed` filters.
 4. Replace "collect the matches, then change them" loops with batch operations
    (`query:add_all`, `set_all`, `remove_all`, `delete_all`, `count`), and state flags stored

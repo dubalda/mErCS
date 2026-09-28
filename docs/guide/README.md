@@ -102,21 +102,31 @@ local ok = q:has(entity)                          -- the entity matches the quer
 
 - A query never goes stale: the ids in it may be created and deleted at any time.
 - `world:query(...)` inside a system is cheap. Queries of the same shape (returned ids,
-  `with` and `without` ids) share one internal state, so a query written inline allocates
-  only a small handle.
+  `with`, `without` and `any` ids) share one internal state, so a query written inline
+  allocates only a small handle.
+- A world shares the states of up to 1024 shapes. An entity used as a query term
+  (`world:query(Skill):with(caster)`) makes a shape of its own; its shapes are dropped when
+  the entity is deleted, so they take no memory and no room afterwards. Many such entities
+  alive at once can still use up the 1024 states: a query of a new shape then builds its own
+  state on every call (several times the cost of a shared query), and a debug world
+  (`ecs.world(true)`) warns once. For "the X of Y" lookups over many entities, prefer a pair
+  and `world:each(ecs.pair(X, Y))`, which needs no query state.
 - A cached query whose matches are scattered keeps a list of them (up to 65 536 entities),
   grouped by value page, and iterates that. Between two loops it notes the slots whose ids
   changed and updates only those in the list, so a tag toggled on a few entities costs a few
-  list edits, not a scan of the bitsets; many changes at once (batch operations, `remove_all`,
-  hundreds of edits) make it scan again. A query that matches nothing keeps an empty list.
+  list edits, not a scan of the bitsets. More changes between two loops (more than a quarter
+  of the list, batch operations, `remove_all`) make the loop pass over the bitsets instead,
+  and the list is built again at a loop after fewer changes. A query that matches nothing
+  keeps an empty list.
 - Before a loop, a query with a list checks whether its ids changed since its previous loop.
   When no id of any cached query changed anywhere in the world since then, it skips that check
   as well: a loop over an empty list then costs a comparison.
 - Queries with change filters or on pairs with a concrete target get their own state: call
-  `q:cached()` on such a query when it is stored and iterated many times. `q:cached()` also
-  prepares a query that has not been iterated yet (picks how it iterates and builds its list),
-  so that its first loop costs no more than the next ones. An iteration of a stored query
-  allocates nothing.
+  `q:cached()` on such a query when it is stored and iterated many times. Written inline, such
+  a query reuses the iterator of the world, so a call costs its state and its matches (under a
+  microsecond when nothing matches). `q:cached()` also prepares a query that has not been
+  iterated yet (picks how it iterates and builds its list), so that its first loop costs no
+  more than the next ones. An iteration of a stored query allocates nothing.
 - Changing the current entity inside the loop is allowed, deleting it too. Changes of other
   entities may or may not be seen by the running loop; an entity deleted ahead of the loop
   (for example by a `ChildOf` cascade) may still be returned once, as a dead id with nil
@@ -203,6 +213,11 @@ for entity in world:query(ecs.pair(Likes, ecs.Wildcard)) do end -- any target of
   time a query, `has`, `world:each` or `remove` reads it, and kept up to date from then on;
   until then the pairs of `T` cost nothing more. It returns the value of a pair only when a
   pair of `T` holds data.
+- Memory (the luau CLI): a pair takes about 1 KB for its record (1.2 KB when it holds data),
+  plus 85–115 B for each entity that has it; a target of pairs adds about 0.45 KB and a
+  relation about 1.6 KB. The number of different pairs matters more than the number of
+  entities that have them: 350 000 entities with one pair each keep about 18 MB with 700
+  different pairs, and 50–65 MB with 22 400 (32 relations × 700 targets).
 
 ## Hooks and signals
 

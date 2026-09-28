@@ -1,5 +1,82 @@
 # Changelog
 
+## v0.2.1 — 2026-09-28
+
+Fixes and memory for games that moved to 0.2.0: the shared query shapes of deleted entities,
+match lists that change by many entities between loops, queries that are not shared, and the
+`(*, T)` records of targets.
+
+### Fixed
+
+- The shared query shapes of entity ids were never freed. A query with an entity id as a term
+  (`world:query(Skill):with(caster)`) is shared by shape like any other, but its path in the
+  tree of shapes (created even when no state was cached) and its state stayed after the entity
+  was deleted, and such shapes used up the 1024 shared states: every new shape of the world,
+  of components too, then built a new state on every `world:query` call (~3 µs instead of
+  ~0.2 µs), with no warning. 20 000 deleted entities with 4 such queries each kept +8 MB. Now
+  the path of a shape is created with its state only, the shapes of an entity leave the tree
+  when it is deleted (also the ones that its own hooks make while it is deleted; a handle that
+  keeps one keeps a working query, whose modifiers return queries of their own), and a shape
+  with an entity id that is not alive is not shared. The problem was also in 0.1.2.
+
+### Queries
+
+- A cached query patches its match list only while the changes noted since its previous loop
+  are at most a quarter of the list (and at least 32, at most 1024). After more, the loop
+  passes over the bitsets, and the list is built again at a loop after fewer changes. 0.2.0
+  rebuilt the list on every such loop, which took longer than the scan of 0.1.2 (the long
+  session and the synthetic frame were slower than in 0.1.2). A journal no longer grows for
+  more changes than the query that reads it patches.
+- A query that is not shared (a pair with a concrete target, change filters, a shape beyond
+  the 1024 shared ones) reuses the iteration contexts of the world instead of building its
+  iterator on every call.
+
+### Relationships
+
+- A `(*, T)` record has 8 fields and no presence tables until a query, `has`, `world:each` or
+  `remove` reads it: a pair with a target of its own keeps 1457 B instead of 1809 B, a
+  `ChildOf` child (10 000 parents with 5 children) 344 B instead of 414 B.
+
+### Debug worlds
+
+- `ecs.world(true)` warns once (`warn` in Roblox, `print` in the luau CLI) when the 1024
+  shared query states of the world are in use and a new shape cannot be shared.
+
+### Tests and benchmarks
+
+- `test/lib.luau`: the shared shapes of deleted entities (memory, the count of the shared
+  states, kept handles, ids made alive again, a debug world at the limit), queries that are
+  not cached (nested loops, `break`, errors in callbacks), match lists after many changes,
+  and `(*, T)` records before their first read.
+- `test/fuzz.luau`: the flag `shapes` (queries with the entities of the model as terms, and
+  handles kept after their entity is deleted); CI runs it with the flags of the debug world.
+- `bench/shapes.luau`: the group `state tags` (1200 skills in 5 state tags; 10, 200 or 800 of
+  them change state between the loops of 5 inline queries). `bench/scenarios.luau`: a query
+  of a concrete pair per call, and the memory of inline queries on deleted entities.
+
+### Performance
+
+mErCS 0.2.0 and 0.2.1 in the luau 0.740 CLI (`bench/run.luau`, `bench/leak.luau`); cells read
+"interpreter / native", memory is what a unit keeps:
+
+| | mErCS 0.2.0 | mErCS 0.2.1 |
+|---|---|---|
+| 1200 skills, 200 change state between the loops of 5 inline queries, per frame | 208 / 124 µs | 171 / 100 µs |
+| the same, 800 change state | 430 / 266 µs | 363 / 233 µs |
+| a query of a concrete pair per call, 15 matches of 1000 | 5.45 / 4.16 µs | 4.16 / 2.92 µs |
+| the same, nothing matches | 1.86 / 1.71 µs | 612 / 510 ns |
+| an entity used in 4 inline queries, then deleted | 18.1 / 15.8 µs, 492 B | 9.66 / 9.58 µs, 0 B |
+| a pair with a target of its own | 3.56 / 3.24 µs, 1809 B | 3.21 / 2.84 µs, 1457 B |
+| a `ChildOf` child (10 000 parents × 5) | 820 / 657 ns, 414 B | 720 / 567 ns, 344 B |
+| the long session, per frame (interpreter) | 0.10–0.11 ms, +0.40 MB | 0.09–0.10 ms, +0.33 MB |
+
+The synthetic frame (`bench/frame.luau`) is on par with 0.1.2 again: 0.93–0.98× of 0.1.2 in
+the interpreter and 1.02–1.04× in native code, medians of 3 runs (0.2.0 was 1–15 % slower).
+The state tags with 200 or 800 changes per frame still take 1.06–1.15× the time of 0.1.2: the
+changes themselves cost more (the journals of the observed tags, the third level of bits),
+the queries take the time of 0.1.2 again. The other rows of the matrix are within the noise
+of the runs (±10 %).
+
 ## v0.2.0 — 2026-09-28
 
 Queries after small changes, empty queries and `(*, T)` wildcards (the query cases where an

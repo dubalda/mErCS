@@ -13,6 +13,10 @@
       n = 131072: the skills of NPCs), the queries of a game over them after the changes it
       makes between two frames; the rows marked "pool" create the creatures from a slot pool
       (world:pool) where the implementation has one.
+    - "state tags": 1200 skills of 80 creatures, each in one of 5 state tags; every frame
+      moves 10, 200 or 800 of them to the next state and passes over the skills of every
+      state with a query written inline (a match list that changes by a few, or by more than
+      a quarter of its entities between two loops).
 
     A loop over matches is the for-in loop of jecs, or query:each where the implementation has
     it (it replaces the for-in loop fully when the loop does not break early). Every row times
@@ -452,5 +456,64 @@ return function(add: (Scenario) -> (), n: number)
                     else nil,
             })
         end
+    end
+
+    ---------------------------------------------------------------------------
+    -- state tags: 1200 skills of 80 creatures (with 20 other entities after each creature)
+    ---------------------------------------------------------------------------
+    local STATES = 5
+
+    local function states_world(impl: Impl): any
+        local world = impl.ecs.world()
+        local s: any = { world = world, states = {}, skills = {}, state_of = {} }
+        s.Skill = impl.component(world)
+        s.Timer = impl.component(world)
+        for i = 1, STATES do
+            s.states[i] = world:entity()
+        end
+        for _ = 1, 80 do
+            world:set(world:entity(), s.Timer, 0)
+            for _ = 1, 15 do
+                local skill = world:entity()
+                world:set(skill, s.Skill, true)
+                world:set(skill, s.Timer, 0)
+                local state = #s.skills % STATES + 1
+                world:add(skill, s.states[state])
+                table.insert(s.skills, skill)
+                s.state_of[skill] = state
+            end
+            for _ = 1, 20 do
+                world:set(world:entity(), s.Timer, 0)
+            end
+        end
+        math.randomseed(11)
+        return s
+    end
+
+    for _, moves in { 10, 200, 800 } do
+        add({
+            group = "state tags",
+            name = `{moves} skills change state, 5 inline queries`,
+            ops = 100,
+            unit = "frame",
+            reuse = true,
+            setup = states_world,
+            run = function(impl, s)
+                local world, states, skills, state_of = s.world, s.states, s.skills, s.state_of
+                for _ = 1, 100 do
+                    for _ = 1, moves do
+                        local skill = skills[math.random(#skills)]
+                        local old = state_of[skill]
+                        local new = old % STATES + 1
+                        world:remove(skill, states[old])
+                        world:add(skill, states[new])
+                        state_of[skill] = new
+                    end
+                    for i = 1, STATES do
+                        pass(impl, world:query(s.Skill, s.Timer):with(states[i]))
+                    end
+                end
+            end,
+        })
     end
 end
