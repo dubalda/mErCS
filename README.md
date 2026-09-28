@@ -8,9 +8,9 @@ memory does not grow with the number of component combinations, and there is not
 up. The API follows [jecs](https://github.com/Ukendio/jecs); moving jecs code over takes a few
 mechanical changes (see [Migrating from jecs](docs/jecs-comparison/README.md#migrating-from-jecs)).
 
-Status: pre-release. Tested with the standalone `luau` 0.740 CLI (interpreter and native code
-generation) and in Roblox Studio with the Benchmarker plugin and the jabby debugger; the full
-Studio check (`studio/`) is pending.
+Tested with the standalone `luau` 0.740 CLI (interpreter and native code generation) and in
+Roblox Studio with the Benchmarker plugin and the jabby debugger; the full Studio check
+(`studio/`) is pending.
 
 ## Why
 
