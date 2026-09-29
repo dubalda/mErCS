@@ -36,3 +36,14 @@ Intentional differences (the expectation in the copy is changed and marked with 
 
 `modules/entity_visualiser.luau` is a stub that raises an error; `modules/testkit.luau` is a
 copy of `vendor/testkit.luau`.
+
+## The OB addon
+
+`ob.luau` is the test file of the jecs 0.11.0 addon `modules/OB` (`test/ob.luau`) run against
+the query monitors of mErCS: `modules/OB/module.luau` maps `OB.monitor(query)` onto
+`query:monitor()`, and the shim adds `jecs.w`, the short name of `Wildcard` that the file uses.
+All 42 monitor cases pass. The observer test is disabled (`TEST` -> `SKIP_TEST`): mErCS has
+no observer object (a signal with `query:has` does that, see the guide). The unused locals of
+the copy have an underscore, for the lints of the repository.
+
+    luau test/jecs_compat/ob.luau

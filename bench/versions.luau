@@ -11,5 +11,5 @@
 
 return {
     jecs = "jecs 0.11.0",
-    library = "mErCS 0.2.1",
+    library = "mErCS 0.2.2",
 }

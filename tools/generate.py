@@ -9,7 +9,8 @@ rewrites the code between the markers
     -- @generated <name> end
 
 in src/init.luau: the direct for-in iterators (bitset spans), the list iterators (the match
-list of a cached query, grouped by value page) and the matching each() loops. Run from the
+list of a cached query, grouped by value page), the buffer iterators (the matches of a small
+query that is not cached, gathered first) and the matching each() loops. Run from the
 repository root, then format:
 
     python tools/generate.py && stylua src
@@ -346,11 +347,90 @@ def direct_each_chain(indent_level: int) -> str:
     return chain(direct_each, indent_level, wide=True)
 
 
+def buffer_iterator(n: int, indent: str) -> list[str]:
+    """for-in over the buffer of a small query that is not cached (see scan.fill): -page before
+    the matches of each value page, then the entity and the index in the page of each match,
+    nil after the last. The position is kept in `pos`; the page references change at a mark."""
+    i = indent
+    vals = "".join(f", p{k}[li]" for k in range(1, n + 1))
+    lines = [
+        f"{i}step = function(): ...any",
+        f"{i}{T}local at = pos",
+        f"{i}{T}local x = buf[at]",
+        f"{i}{T}if x == nil then",
+        f"{i}{T}{T}ctx.busy = false",
+        f"{i}{T}{T}return nil",
+        f"{i}{T}end",
+        f"{i}{T}if x < 0 then",
+        f"{i}{T}{T}-- the matches of the next page",
+    ]
+    if n > 0:
+        lines.append(f"{i}{T}{T}local page = -x")
+        lines += [f"{i}{T}{T}p{k} = cp{k}[page] or EMPTY" for k in range(1, n + 1)]
+    lines += [
+        f"{i}{T}{T}at += 1",
+        f"{i}{T}{T}x = buf[at]",
+        f"{i}{T}end",
+        f"{i}{T}pos = at + 2",
+    ]
+    if n > 0:
+        lines.append(f"{i}{T}local li = buf[at + 1]")
+    lines += [
+        f"{i}{T}return x{vals}",
+        f"{i}end",
+    ]
+    return lines
+
+
+def buffer_each(n: int, indent: str) -> list[str]:
+    """Callback loop over the buffer of a small query that is not cached (see scan.fill)."""
+    i = indent
+    vals = "".join(f", p{k}[li]" for k in range(1, n + 1))
+    lines = []
+    if n > 0:
+        lines.append(f"{i}local {', '.join(f'p{k}' for k in range(1, n + 1))} = " + ", ".join("EMPTY" for _ in range(n)))
+    lines += [
+        f"{i}local at = 1",
+        f"{i}while true do",
+        f"{i}{T}local x = buf[at]",
+        f"{i}{T}if x == nil then",
+        f"{i}{T}{T}break",
+        f"{i}{T}end",
+        f"{i}{T}if x < 0 then",
+    ]
+    if n > 0:
+        lines.append(f"{i}{T}{T}local page = -x")
+        lines += [f"{i}{T}{T}p{k} = cp{k}[page] or EMPTY" for k in range(1, n + 1)]
+    lines += [
+        f"{i}{T}{T}at += 1",
+        f"{i}{T}{T}x = buf[at]",
+        f"{i}{T}end",
+    ]
+    if n > 0:
+        lines.append(f"{i}{T}local li = buf[at + 1]")
+    lines += [
+        f"{i}{T}at += 2",
+        f"{i}{T}callback(x{vals})",
+        f"{i}end",
+    ]
+    return lines
+
+
+def buffer_iterator_chain(indent_level: int) -> str:
+    return chain(buffer_iterator, indent_level)
+
+
+def buffer_each_chain(indent_level: int) -> str:
+    return chain(buffer_each, indent_level)
+
+
 SECTIONS = {
     "direct_iterators": lambda level: chain(direct_iterator, level, wide=True),
     "list_iterators": lambda level: chain(list_iterator, level),
     "direct_each": direct_each_chain,
     "list_each": list_each_chain,
+    "buffer_iterators": buffer_iterator_chain,
+    "buffer_each": buffer_each_chain,
 }
 
 

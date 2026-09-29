@@ -9,6 +9,7 @@
 		"bench": "./bench",
 		"test": "./test",
 		"jecs": "./DevPackages/_Index/ukendio_jecs@0.11.0/jecs/src/jecs",
+		"jecs_ob": "./DevPackages/_Index/ukendio_jecs@0.11.0/jecs/modules/OB/module",
 		"testkit": "./vendor/testkit"
 	}
 }

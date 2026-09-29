@@ -22,6 +22,7 @@ local world = ecs.world()
 - [Batch operations](#batch-operations)
 - [Relationships](#relationships)
 - [Hooks and signals](#hooks-and-signals)
+- [Query monitors](#query-monitors)
 - [Change tracking](#change-tracking)
 - [Disabled entities](#disabled-entities)
 - [Introspection and jabby](#introspection-and-jabby)
@@ -44,7 +45,8 @@ removes the ids and keeps the entity.
 
 `world:component()` makes an id that can hold data (an entity with the `Component` trait);
 the first 256 are the ids 1..256, then any entity id: there is no limit. Networked worlds can
-split the id space with `world:range(first, last)`.
+split the id space with `world:range(first, last)`: the new ids come after `first` (the first
+one is `first + 1`, as in jecs) and stay below `last`.
 
 ## Slot pools
 
@@ -86,6 +88,13 @@ world:remove(e, Frozen)
 - `get` and `has` take up to 8 ids; `get_list` and `has_all` take any number.
 - `world:each(id)` iterates the entities that have an id, and `world:remove_all(id)` removes
   it from all of them at once (about 20 ns per entity when the id has no `OnRemove` hook).
+  `world:each` and `world:children` walk the bitsets of the id in ascending slot order and
+  allocate only their iterator; an entity that loses the id or is deleted before the loop
+  reaches it is skipped, and an entity that gets the id during the loop is visited only when
+  its slot lies ahead of the loop and existed when the loop started (a loop that gives the id
+  to new entities ends). The members of an id that lie in at most two words of its bitset (up
+  to 64 entities, like the children of a parent created together) are collected into a list
+  first, whose loop returns the members of its start.
 
 ## Queries
 
@@ -102,29 +111,45 @@ local ok = q:has(entity)                          -- the entity matches the quer
 
 - A query never goes stale: the ids in it may be created and deleted at any time.
 - `world:query(...)` inside a system is cheap. Queries of the same shape (returned ids,
-  `with`, `without` and `any` ids) share one internal state, so a query written inline
-  allocates only a small handle.
-- A world shares the states of up to 1024 shapes. An entity used as a query term
-  (`world:query(Skill):with(caster)`) makes a shape of its own; its shapes are dropped when
-  the entity is deleted, so they take no memory and no room afterwards. Many such entities
-  alive at once can still use up the 1024 states: a query of a new shape then builds its own
-  state on every call (several times the cost of a shared query), and a debug world
-  (`ecs.world(true)`) warns once. For "the X of Y" lookups over many entities, prefer a pair
-  and `world:each(ecs.pair(X, Y))`, which needs no query state.
+  `with`, `without` and `any` ids) share one internal state from the second request of the
+  shape on, so a query written inline allocates only a small handle. The first request of a
+  shape gets a light state of its own and only marks the shape: a query requested once (an
+  entity used as a term once, a query built at startup) keeps no shared state. A query that is
+  kept and used again — iterated a second time, given a modifier or `:cached()` — takes the
+  place of the mark and is shared from then on.
+- A world shares the states of up to 1024 shapes. An entity used as a query term, directly or
+  as the target of a pair (`world:query(Skill):with(caster)`,
+  `world:query(Part, pair(ChildOf, model))`), makes a shape of its own (about 3 KB once it is
+  shared); its shapes and marks are dropped when the entity is deleted, so they take no memory
+  and no room afterwards. A pair with a target of a relation that is deleted keeps its shapes
+  until the target is deleted: an entity that takes the slot of the relation has the same
+  pairs. Many such entities alive at once can still use up the 1024 states: a query of a new
+  shape then builds its own state on every call (several times the cost of a shared query),
+  and a debug world (`ecs.world(true)`) warns once. For "the X of Y" lookups over many
+  entities, prefer a pair and `world:each(ecs.pair(X, Y))`, which needs no query state.
 - A cached query whose matches are scattered keeps a list of them (up to 65 536 entities),
   grouped by value page, and iterates that. Between two loops it notes the slots whose ids
   changed and updates only those in the list, so a tag toggled on a few entities costs a few
-  list edits, not a scan of the bitsets. More changes between two loops (more than a quarter
-  of the list, batch operations, `remove_all`) make the loop pass over the bitsets instead,
-  and the list is built again at a loop after fewer changes. A query that matches nothing
-  keeps an empty list.
+  list edits, not a scan of the bitsets. It re-checks the noted slots while that costs less than
+  a pass over the bitsets: up to a quarter of the list or half of the words of its smallest
+  term (at least 32, at most 1024 slots). A slot that a required id which did not change since
+  the previous loop does not have is dropped at once, so the changes of a large tag cost the
+  small queries that name it little; when that id has few words (a small tag), its words are
+  tested against the changed bits of each word, gathered once for all the queries, so such a
+  query costs a few word tests whatever the number of changes. More changes (and batch
+  operations, `remove_all`) make the
+  loop pass over the bitsets instead, and the list is built again at a loop after fewer
+  changes. A query that matches nothing keeps an empty list.
 - Before a loop, a query with a list checks whether its ids changed since its previous loop.
   When no id of any cached query changed anywhere in the world since then, it skips that check
   as well: a loop over an empty list then costs a comparison.
-- Queries with change filters or on pairs with a concrete target get their own state: call
-  `q:cached()` on such a query when it is stored and iterated many times. Written inline, such
-  a query reuses the iterator of the world, so a call costs its state and its matches (under a
-  microsecond when nothing matches). `q:cached()` also prepares a query that has not been
+- Queries with change filters get their own state, and so do the first request of a shape
+  and the shapes beyond the 1024: call `q:cached()` on such a query when it is stored and
+  iterated many times. Written inline, such a query reuses the iterator of the world, so a call
+  costs its state and its matches (under a
+  microsecond when nothing matches); when its smallest term has at most 64 words (2048 slots),
+  its matches are gathered in a loop over the words first, which costs far less than a pass
+  of the span generator per match. `q:cached()` also prepares a query that has not been
   iterated yet (picks how it iterates and builds its list), so that its first loop costs no
   more than the next ones. An iteration of a stored query allocates nothing.
 - Changing the current entity inside the loop is allowed, deleting it too. Changes of other
@@ -213,6 +238,13 @@ for entity in world:query(ecs.pair(Likes, ecs.Wildcard)) do end -- any target of
   time a query, `has`, `world:each` or `remove` reads it, and kept up to date from then on;
   until then the pairs of `T` cost nothing more. It returns the value of a pair only when a
   pair of `T` holds data.
+- A wildcard returns the value of one pair of each entity: `ecs.pair(R, ecs.Wildcard)` the value
+  of the pair with the lowest target slot, `ecs.pair(ecs.Wildcard, T)` the value of the pair
+  with the lowest relation slot (the order of the pair ids, as in jecs), also when that pair
+  holds no value. The first query that returns the values of a wildcard gives it a copy of
+  them in value pages of its own, kept up to date by every change of its pairs, so such a
+  query reads them like a component, and `get` does too; the copy takes about 17 B per member
+  and goes when no pair of the wildcard holds data any more.
 - Memory (the luau CLI): a pair takes about 1 KB for its record (1.2 KB when it holds data),
   plus 85–115 B for each entity that has it; a target of pairs adds about 0.45 KB and a
   relation about 1.6 KB. The number of different pairs matters more than the number of
@@ -248,6 +280,59 @@ disconnect()
   the cascades deeper than 100 levels queued afterwards or run the hooks of that entity
   again. Treat such an error as fatal for the world.
 
+## Query monitors
+
+```luau
+local monitor = world:query(Model):with(Visible):without(Hidden):monitor()
+monitor.added(function(entity) end) -- the entity started matching the query
+monitor.removed(function(entity) end) -- it stops matching: its ids are still there
+monitor.disconnect()
+```
+
+- A callback runs at the change that makes an entity enter or leave the query: an id of the
+  query added or removed, an excluded id removed or added, `Disabled`, `world:clear`,
+  `world:delete`, cleanup cascades and batch operations. There is one `added` per entry and one
+  `removed` per exit. The entities that match when the monitor is made are members already:
+  they get a `removed` when they leave.
+- `removed` runs before the removal, so the values of the entity can still be read, in a
+  delete too. `added` runs after the add; when the entity enters because an excluded id (or
+  `Disabled`) is removed, it runs before that removal completes.
+- An exclusive relation that replaces a pair (`ChildOf` moved to another parent) makes no exit
+  and no entry in a query with the relation and any target (`ecs.pair(ecs.ChildOf, ecs.Wildcard)`).
+- A monitor listens to the signals of the ids of its query (see [Hooks and signals](#hooks-and-signals)):
+  a change of these ids, or the delete of an entity that has them, costs a listener call and a
+  few bit tests; batch operations on them go entity by entity; changes of other ids cost
+  nothing.
+- The terms may be components, tags, pairs, `ecs.pair(R, ecs.Wildcard)`, OR terms and excluded
+  ids. A term `ecs.pair(ecs.Wildcard, T)` and change filters raise an error.
+- The monitor keeps the terms of the query as they are when it is made: `with`, `without` or
+  `any` called on the query afterwards do not change it (the jecs addon copies the query too).
+- A pair keeps the slots of its elements: when the relation of a pair term is deleted and
+  another entity takes its slot, the query matches the pairs of that entity, but the monitor
+  still listens to the deleted one. Make a new monitor after deleting a relation of its terms.
+- A monitor made inside an `OnRemove` hook or a `removed` callback takes the entity being
+  changed as it is before the removal: for the monitor it is a member that has left already.
+- `added` and `removed` set one callback each (a new one replaces it, `nil` clears it);
+  monitors of the same query are independent. The callbacks may change the world; an error in
+  one stops the change that ran it, like an error in a hook.
+- The functions are called with a dot, as in the jecs addon `modules/OB`: code that calls
+  `OB.monitor(query)` calls `query:monitor()`.
+
+The observer of `modules/OB` (a callback for every add or value change of an id of a query on
+an entity that matches it) is a signal with a check of the query; the entries of other ids are
+the `added` of a monitor:
+
+```luau
+local bars = world:query(Health):with(HealthBar)
+local function update_bar(entity, id, health)
+    if bars:has(entity) then
+        -- show the health
+    end
+end
+world:added(Health, update_bar)
+world:changed(Health, update_bar)
+```
+
 ## Change tracking
 
 Records additions, value changes and removals of an id per tick:
@@ -266,11 +351,13 @@ world:tick() -- once per frame: this frame's changes become visible
   id: added, its value set again (`world:set` of an existing value), or removed from an
   entity that stays alive.
 - Each query keeps the first tick it has not seen yet: a system that runs less often sees
-  the changes of every tick since its previous run, up to the last 8 ticks.
+  the changes of every tick since its previous run, up to the last 7 finished ticks (a ring
+  of 8 ticks, the current one included).
 - A deleted entity is gone from every filter, and a new entity that reuses its slot starts
   clean.
 - Untracked ids cost nothing. A tracked id costs a call per add, change or remove; deleting
-  an entity costs extra only when it changed during the last 8 ticks.
+  an entity costs extra only when it changed during the last 8 ticks (the current one
+  included).
 
 ## Disabled entities
 
@@ -330,7 +417,10 @@ that would do nothing here are not provided, and
 [Migrating from jecs](../jecs-comparison/README.md#migrating-from-jecs) lists what to write instead.
 What jabby reads from jecs internals lives in the [jabby adapter](#introspection-and-jabby).
 
-`world:query(...)` returns a state that is cached already for a shared query (without a
-concrete pair and without change filters); `query:cached()` on it only prepares it, like jecs
-matches its archetypes in `cached()`. Hooks do not receive the `oldarchetype` argument of jecs
-(there are no archetypes).
+`world:query(...)` returns a state that is cached already for a shared query (without change
+filters, from the second request of its shape, or kept and used again); `query:cached()` on it
+only prepares it, like jecs matches its archetypes in
+`cached()`. Hooks do not receive the `oldarchetype` argument of jecs
+(there are no archetypes). The monitors of the jecs addon `modules/OB` are
+[query monitors](#query-monitors) here (`query:monitor()` for `OB.monitor(query)`); its
+observers are signals with a check of the query.

@@ -8,6 +8,8 @@
     - mErCS has no bulk_insert / bulk_remove: they are written here as loops of
       world:set / world:remove (the replacement the migration guide gives), so the bulk cases
       of the suite keep checking set and remove.
+    - mErCS has no `w`, the short name of Wildcard that the tests of the OB addon (ob.luau)
+      use: it is added here.
 ]]
 local lib = require("../../src")
 local adapter = require("../../src/jabby")
@@ -41,10 +43,12 @@ end
 jecs.world = new_world
 jecs.bulk_insert = bulk_insert
 jecs.bulk_remove = bulk_remove
+jecs.w = lib.Wildcard
 
 return jecs :: typeof(lib) & {
     bulk_insert: typeof(bulk_insert),
     bulk_remove: typeof(bulk_remove),
+    w: typeof(lib.Wildcard),
     is_tag: (world: World, id: Id<any>) -> boolean,
     entity_index_try_get: (entity_index: any, entity: Id<any>) -> any,
 }

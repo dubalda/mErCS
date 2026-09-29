@@ -1,5 +1,199 @@
 # Changelog
 
+## v0.2.2 — 2026-09-29
+
+The strengths of jecs: ten cases where an archetype ECS is at its best and jecs 0.11.0 was far
+ahead of mErCS 0.2.1 (the group `jecs strengths` of the benchmarks). Wildcards that return
+values, queries over large terms that change and inline queries with a pair are now faster
+than in jecs, the other cases are closer; the rest of the benchmarks is on par with 0.2.1
+(see the table below and
+[the comparison](https://github.com/dubalda/mErCS/tree/main/docs/jecs-comparison#the-strengths-of-jecs)).
+New: query monitors, callbacks for the entities that enter and leave a query, in place of the
+monitors of the jecs addon `modules/OB`.
+
+### Fixed
+
+- `(*, T)` returned the value of a pair picked by the iteration order of a hash table when an
+  entity had several pairs of `T`, an order that changes with the pairs of other entities. It
+  is now the pair with the lowest relation slot, the order of jecs (the first pair in the type
+  of an archetype); `(R, *)` keeps the pair with the lowest target slot.
+- `world:each` and `world:children` returned the members of an id out of ascending slot order
+  when they lay in words of its bitset in different blocks of 1024 slots (the order of a hash
+  table); they are now in ascending slot order, like queries.
+- An id deleted inside its own `world:each` loop kept the loop returning all its members: a
+  freed record kept its bitsets. They are cleared now, as `remove_all` clears them.
+- `world:set` of a value on a tag (or on a tag pair) raises an error and leaves the tag added;
+  its `OnAdd` hook, the signals, the monitors and change tracking did not see that add. The
+  hooks run now (without the value) before the error.
+
+### Query monitors
+
+- `query:monitor()` returns `added(fn)`, `removed(fn)` and `disconnect()`: callbacks at the
+  change that makes an entity enter or leave the query (an id of the query added or removed, an
+  excluded id removed or added, `Disabled`, `clear`, `delete`, cleanup cascades, batch
+  operations), one `added` per entry and one `removed` per exit. `removed` runs before the ids
+  are removed, so the values of the entity can still be read. An exclusive relation that
+  replaces a pair (`ChildOf` moved to another parent) makes no exit and no entry in a query with
+  the relation and any target. A monitor listens to the signals of the ids of its query; a term
+  `(*, T)` and change filters raise an error. A monitor keeps the terms of the query as they are
+  when it is made (modifiers called on the query afterwards do not change it). It still listens
+  to a deleted relation of a pair term, whose slot another entity may take (the query then
+  matches the pairs of that entity): a new monitor is needed then.
+- The object has the shape of the monitors of the jecs addon `modules/OB`: `OB.monitor(query)`
+  becomes `query:monitor()`, and the 42 monitor cases of the tests of the addon pass
+  (`test/jecs_compat/ob.luau`). The observers of the addon are signals with `query:has` (see
+  [the guide](https://github.com/dubalda/mErCS/tree/main/docs/guide#query-monitors)).
+- A delete runs the listener of one required id of a monitor; the others are quiet then (the
+  delete of a member makes one check, not one per id).
+
+### Hooks
+
+- Deleting or clearing an entity whose ids have `OnRemove` hooks or signals costs less: the
+  entities whose hooks run are a short stack instead of a table keyed by the entity, the first
+  word of the signature with hooked ids is read once, the hooked records of the shared
+  signature tables are collected inline (a relation with one pair of the entity without a new
+  table), and the bit of each hooked id is tested inline. A delete of an entity with two
+  components, one of them hooked, takes 460–490 / 260–275 ns instead of 525 / 330 ns
+  (interpreter / native); with a hook on `ChildOf`, 625–670 / 400–420 ns instead of
+  710 / 500 ns.
+- A removal that runs an `OnRemove` hook tests the bit of the entity again without a call.
+
+### Queries
+
+- Queries with a pair of an entity target (`world:query(A, pair(ChildOf, parent))`,
+  `:with(pair(Likes, bob))`) are shared by shape like the other queries, from the second
+  request of the shape, and their shapes go when the target is deleted, as the shapes of an
+  entity used as a term (those of `(*, T)` too). A pair whose target is not alive is not
+  shared. 0.2.1 built a new state for such a query on every call. A query of a concrete pair
+  per call takes 1.01 µs / 895 ns instead of 4.37 / 3.15 µs (15 matches of 1000; jecs:
+  1.43 / 1.31 µs), 167 / 149 ns when nothing matches (0.2.1: 963 / 822 ns; jecs:
+  367 / 353 ns), and `query(A, pair(ChildOf, parent))` per parent 580 / 516 ns (0.2.1:
+  1.97 / 1.58 µs; jecs: 885 / 821 ns). A shared shape keeps about 3.2 KB while its target
+  lives, and the shapes of pairs share the 1024 shared states of a world with the others.
+- A query whose smallest required term has few words tests those words against the changed
+  bits of each word, gathered once for all the queries, instead of each changed slot against
+  its terms: small queries that share a large term which changes often pay a few word tests
+  whatever the number of changes. 20 small queries over a tag toggled on 30 entities per frame
+  take 22.0 / 14.7 µs (0.2.1: 120 / 61.4 µs; jecs: 19.3 / 15.9 µs).
+- A query shape is shared from its second request. The first request gets a light state of
+  its own and only marks the shape; kept and used again (a second loop, a modifier,
+  `cached()`), it becomes the shared state. A query requested once (an entity used as a term)
+  keeps no shared state: 2 inline queries per new caster keep 376 B instead of 3156 B, and
+  take less than half the time.
+- A cached query patches its match list while that costs less than a pass over the bitsets:
+  up to a quarter of the list or half of the words of its smallest term (at least 32, at most
+  1024 slots; 0.2.1: a quarter of the list). The noted slots of a record with more than 8
+  changes are dropped at once when one of the three smallest required terms, whose own
+  changes are re-checked, does not have them, and the queries that saw the same versions of a
+  record read its changes from the journal once.
+- A small query that is not cached (up to 4 required terms and 2 excluded ones, the smallest
+  term in at most 64 words of its bitset) gathers its matches in one loop over those words
+  before the loop of the caller: the first request of a shape, the inline queries of a new
+  entity.
+- The arrays of a match list have their exact size (30 % less memory per list), and the first
+  list of a query is built from the spans that the choice of its iteration mode found, without
+  a second pass over the bitsets.
+
+### Relationships
+
+- A wildcard whose values a query returns keeps a mirror: value pages with the value of one
+  pair of each member, updated by every change of its pairs, which the queries read like the
+  column of a component (and `get` too). 0.2.1 looked for the pair of every match on every
+  loop. A mirror takes about 17 B per member and goes when no pair of the wildcard holds data.
+- Deleting an entity clears the pairs of each of its relations in one inline loop.
+- An entity with many pairs of one relation: a new pair goes to the end of the list of the
+  pairs of the relation (ordered by target slot) when its target is the highest one, as when
+  targets are added in the order they were created, and any other one finds its place by a
+  binary search; a removal searches the same way beyond 16 pairs. 0.2.1 read the list from its
+  start. 1000 targets of one relation on one entity: 1.49 / 1.02 µs per add instead of
+  7.25 / 4.33 µs (in the order of creation), 0.97 / 0.67 µs per remove instead of
+  2.95 / 2.87 µs (in the reverse order).
+
+### Iteration
+
+- `world:each` and `world:children` walk the bitsets of the id instead of collecting its
+  members first, and allocate only their iterator. An entity that loses the id or is deleted
+  before the loop reaches it is skipped (0.2.1 returned it, a deleted one as a dead id); an
+  entity that gets the id during the loop is visited only when its slot lies ahead of the loop
+  and existed when the loop started. The members of an id in at most two words of its bitset
+  (up to 64, like the children of a parent created together) are still collected first.
+
+### Tests and benchmarks
+
+- `test/lib.luau`: wildcard values through mirrors (the transitions of a slot between one and
+  several pairs of a target), match lists that skip the changes outside their smallest term,
+  `world:each` and `world:children` over large records (changes during the loop, the order of
+  the members), the sharing of query shapes from their second request, queries that are not
+  cached and gather their matches first, queries that share a changing tag, and query monitors
+  (every kind of term, exclusive relations, an exclusive replacement whose new pair is not
+  added, clear, delete, cascades, batch operations, disconnect, callbacks that change the
+  world, the terms that are refused).
+- `test/jecs_compat/ob.luau`: the tests of the jecs addon `modules/OB` against the monitors
+  (`tools/test.sh` runs them).
+- `test/monitors_fuzz.luau`: random queries and changes of the world; the members that each
+  monitor reports must be the matches of its query (`tools/test.sh` runs five seeds).
+- `test/queries_fuzz.luau`: random queries (wildcard values, OR terms, pairs, `Disabled`,
+  cached and inline, loops left early and nested) against brute force after bursts of changes;
+  `test/loops_fuzz.luau`: loops that change the world (no entity twice, the untouched ones once).
+- The documentation of change tracking says 7 finished ticks (it said 8: the ring of 8 ticks
+  holds the current one), and `world:range(first, last)` gives `first + 1` first, as in jecs.
+- `test/fuzz.luau`: pairs of a third relation with the anchor as the target (slots with
+  several pairs of one target), stored queries of `(R3, *)` and `(*, anchor)`, the values of
+  `(*, t)` checked against the model, every query shape requested twice, and the flag
+  `monitors` (monitors of the stored queries and of an exclusive relation, `ChildOf` and
+  `Disabled`, checked against the model; CI runs it with the flags of the debug world).
+- `test/lib.luau`: queries with a pair shared by shape and dropped with its target (the room
+  of the shared states, a target made anew in the slot of a deleted one, the pair of a slot
+  that no entity had), many targets of a relation added and removed in any order, and small
+  queries that share a large term changed many times between loops (a debug world). The tests
+  that need a query that is not shared give it a dead id among its excluded ids.
+- `test/fuzz.luau`: the flag `shapes` also checks queries with a pair whose target is an entity
+  of the model. `test/monitors_fuzz.luau`: every third query is not shared (a dead id), so
+  that a modifier after its monitor changes its state in place.
+- `bench/strengths.luau`: the group `jecs strengths` of `bench/run.luau`.
+- `bench/monitors.luau`: the group `query monitors`, against jecs with its addon `modules/OB`
+  (the `jecs_ob` alias of `.luaurc`).
+
+### Performance
+
+The group `jecs strengths` in the luau 0.740 CLI, cells read "interpreter / native", the
+median of 5 runs of the minimum of 3; memory is what a unit keeps:
+
+| | jecs 0.11.0 | mErCS 0.2.1 | mErCS 0.2.2 |
+|---|---|---|---|
+| `(*, T)` values, 32 data relations, a pass over 20 000 | 722 / 601 µs | 16.0 / 7.46 ms | 539 / 310 µs |
+| `(R, *)` values, 8 targets, a pass over 20 000 | 722 / 590 µs | 4.19 / 3.20 ms | 530 / 305 µs |
+| 15 cached queries over scattered entities, per query | 280 / 238 µs, 5.7 KB | 843 / 584 µs, 374 KB | 714 / 335 µs, 263 KB |
+| a query that is usually empty, 20 swaps per pass | 16.4 / 16.5 µs | 224 / 80.9 µs | 14.5 / 8.74 µs |
+| 5 queries with 100 matches each, 40 toggles per frame | 46.8 / 44.3 µs | 968 / 328 µs | 30.6 / 17.7 µs |
+| 20 small queries, a shared tag toggled on 30 per frame | 19.3 / 15.9 µs | 120 / 61.4 µs | 22.0 / 14.7 µs |
+| `query(A, pair(ChildOf, parent))` per parent | 885 / 821 ns | 1.97 / 1.58 µs | 580 / 516 ns |
+| 2 inline queries per new caster | 2.32 / 2.24 µs, 0 B | 10.7 / 9.50 µs, 3156 B | 4.67 / 4.25 µs, 377 B |
+| `world:each` over 100 000, per entity | 27.7 / 24.7 ns | 61.5 / 36.2 ns | 38.6 / 31.5 ns |
+| `world:children`, 1000 children, per child | 28.1 / 25.0 ns | 57.3 / 32.6 ns | 39.3 / 32.5 ns |
+| 8 kinds created in turn, a pass over one, for-in, per match | 41.3 / 33.0 ns | 119 / 106 ns | 114 / 103 ns |
+| the same, `each` | 41.9 / 33.3 ns | 90.8 / 78.1 ns | 63.1 / 47.1 ns |
+| the same, `each`, the kind from a slot pool | 40.2 / 32.7 ns | 35.9 / 20.1 ns | 36.1 / 20.4 ns |
+| delete entities with 100 targets, per pair | 29.2 / 29.4 ns | 83.5 / 52.3 ns | 62.2 / 44.1 ns |
+| 8 components on 1 entity in 64, per entity | 2.85 / 2.26 µs, 170 B | 2.53 / 1.73 µs, 660 B | 2.50 / 1.71 µs, 660 B |
+
+Query monitors (the group `query monitors`), jecs 0.11.0 with its addon `modules/OB` against
+`query:monitor()`, 10 000 entities, medians of 5 runs:
+
+| | jecs 0.11.0 + OB | mErCS 0.2.2 |
+|---|---|---|
+| a tag of the query added and removed, per cycle | 658 / 602 ns | 739 / 509 ns |
+| members of the query deleted, per entity | 526 / 534 ns | 595 / 344 ns |
+| children moved to another parent, `(ChildOf, *)` monitored, per move | 517 / 449 ns | 649 / 427 ns |
+
+Three rows of the matrix gain: a query of a concrete pair per call takes 1.01 µs / 895 ns
+with 15 matches of 1000 (0.2.1: 4.37 / 3.15 µs, jecs: 1.43 / 1.31 µs) and 167 / 149 ns when
+nothing matches (0.2.1: 963 / 822 ns, jecs: 367 / 353 ns), an entity used in 4 inline queries
+and then deleted 5.61 / 5.04 µs (0.2.1: 10.6 / 10.6 µs, jecs: 2.22 / 1.97 µs). The
+other rows of the matrix, the synthetic frame (`bench/frame.luau`) and the long session
+(`bench/leak.luau`: 0.08–0.09 ms per frame, +0.33 MB) are within the noise of the runs (±10 %)
+of 0.2.1.
+
 ## v0.2.1 — 2026-09-28
 
 Fixes and memory for games that moved to 0.2.0: the shared query shapes of deleted entities,
