@@ -47,6 +47,7 @@ tools/generate.py      regenerates the iterator sections: python tools/generate.
 tools/check.sh         formatting, lints and types, checked like the editor does
 tools/test.sh          every test, the example and a fuzz run (--codegen: with native code)
 tools/previous.sh      the previous release from its git tag into tmp/previous, for the benchmarks
+tools/workload.sh      the performance suite of the reference workload, interpreter and native code
 test/core.luau         core semantics, run against jecs and this library
 test/lib.luau          library features, the model tests
 test/types.luau        typed API usage (must type-check)
@@ -56,11 +57,13 @@ test/jecs_compat/      the jecs test suite run against this library (125/125 app
 test/monitors_fuzz.luau random queries and changes of the world against query monitors
 test/queries_fuzz.luau random queries and changes of the world against brute force
 test/loops_fuzz.luau   loops that change the world (no entity twice, untouched ones once)
+test/workload_cases.luau the behavior cases of the reference workload
 examples/basics.luau   a runnable tour of the API
 bench/run.luau         the benchmark matrix (harness.luau, scenarios.luau, shapes.luau, strengths.luau, monitors.luau, impls.luau, impl_defs.luau)
 bench/query_cases.luau query cases where an archetype ECS is at its best: jecs for-in against query:each
 bench/frame.luau       a synthetic game frame (frame_scene.luau)
 bench/leak.luau        a long session with changing relationship targets (memory growth)
+bench/workload.luau    the performance suite of the reference workload, P1–P9 (workload_model.luau: the model of the world)
 bench/gc.luau          garbage collector access that works in the luau CLI and in Roblox
 bench/versions.luau    the versions of jecs and the library in the output of the benchmarks
 bench/previous.luau    the previous release (tmp/previous) when tools/previous.sh has extracted it
@@ -82,9 +85,14 @@ bash tools/test.sh --codegen   # native code
 
 `tools/test.sh` runs `test/core.luau`, `test/lib.luau`, `test/types.luau`, `test/fuzz.luau`,
 `test/jabby.luau`, `test/jecs_compat/tests.luau`, `test/jecs_compat/ob.luau`,
-`test/monitors_fuzz.luau`, `test/queries_fuzz.luau`, `test/loops_fuzz.luau` and
-`examples/basics.luau`, and stops at the first failure with a non-zero exit code (a failed case
-of the test kit fails its file).
+`test/monitors_fuzz.luau`, `test/queries_fuzz.luau`, `test/loops_fuzz.luau`,
+`test/workload_cases.luau` and `examples/basics.luau`, and stops at the first failure with a
+non-zero exit code (a failed case of the test kit fails its file).
+
+`test/workload_cases.luau` holds the behavior cases of the reference workload (the next
+section), one case per line of the requirements: ids and liveness, hooks and signals,
+relations, loops, debugging aids. A release passes all of them; a change of one is a changed
+behavior of the release notes.
 
 `test/monitors_fuzz.luau` builds random queries (tags, components, pairs, relations with any
 target, an exclusive relation, `ChildOf`, `Disabled`, excluded ids and OR terms, sometimes a
@@ -141,6 +149,49 @@ workspace: the new type solver, the Roblox platform and the Roblox type definiti
 luau-lsp server of the installed VS Code extension (the version the editor uses), or
 `luau-lsp` from `rokit.toml` without it. The Wally packages are not checked.
 
+## The reference workload
+
+The priority of the library is the workload of a game that uses it, described in its release
+requirements by the kinds of its entities, their numbers, rates and access patterns, at a small
+scale (the test places) and a target scale (about 700 agents with 500 owned entities each,
+350 000 entities, a heap of about 140 MB). Every release runs the performance suite of that
+workload against the previous release and against itself, in the interpreter and in native
+code, and passes its gates: no test worse than on the previous release beyond the noise (first
+at the target scale in native code), the heap of the target world not larger, and the behavior
+cases passed. Its release notes list the changed behavior, the results of the suite and the
+memory of the target world.
+
+```sh
+bash tools/previous.sh                                     # the previous release, once
+bash tools/workload.sh                                     # both modes, 5 runs: tmp/workload-report.md
+luau -O2 --codegen bench/workload.luau -a runs=3 tests=P1,P7 scales=target
+```
+
+`bench/workload.luau` runs the tests P1–P9 for the previous release, the library and the
+library again (the two columns of one build give the noise); each run builds its worlds anew,
+with one seed for all columns, in another order of the columns; the report is a table of the
+medians and the ranges of the runs, and the ratio to the previous release:
+
+| Test | What is measured |
+|---|---|
+| P1 | `world:each` over a tag whose members are spread evenly among 350 000 entities (16, 256, 2 048, 16 384 members), in runs of 8, and the dense case (100 000 of 100 000) |
+| P2 | 10 walks per frame over state tags with the members of a system tag, with the state transitions of a frame between: `world:each` with a check, and one stored query per system tag |
+| P3 | `world:each` over the holders of `(Trigger_k, agent)`: about 60 at the target scale, 2 at the small one |
+| P4 | the 25 stored queries at their periods (1 to 60 frames) while agents change and owned entities change state |
+| P5 | the messages of a frame handled (the walks of P3 and of `(Extra, agent)`, 3 values read per holder) and deleted, new ones made, the deferred ones visited |
+| P6 | the end of the activity of an agent, the removal of a retained agent (the cascade over its 500 owned entities, with removal listeners), a new agent with its owned entities; the median of the events of a run |
+| P7 | the frames of the model with the lifecycle events at their rate: µs per frame and ms of ECS work per second of server time |
+| P8 | the heap of the world after it is built, after 100 lifecycle rounds and after 3 000 more frames; bytes per distinct pair and per holder |
+| P9 | bytes allocated by a frame, and by a loop over a stored query and over `world:each` (their iterator) |
+
+`bench/workload_model.luau` is the model of the world and of a frame: agents from a slot pool,
+owned entities created in one burst after their agent, groups and anchors in `ChildOf` trees,
+8 trigger relations and an ownership relation that deletes the owned entities with their agent,
+7 states (a value and a mirror tag moved by hooks), 10 system tags, messages, timed effects,
+modifiers, expiry data pairs removed with `remove_all`, about 85 components and 115 tags. Its
+header lists the choices that the requirements leave open. The heap it reports includes the
+lists of the model (the same for every column).
+
 ## Benchmarks in the luau CLI
 
 ```sh
@@ -162,22 +213,26 @@ argument) into `tmp/previous`; without it the benchmarks compare jecs and the cu
 `lib`), `reps`, `n`. Time is the minimum over the runs divided by the operations; memory is the
 heap growth kept after the run and a full collection.
 
-The group `jecs strengths` (`bench/strengths.luau`) holds ten cases where jecs 0.11.0 was far
-ahead of mErCS 0.2.1 in time or in memory, the strengths of an archetype ECS: `(*, T)` and
-`(R, *)` wildcards that return values, the memory of cached queries over scattered entities,
-queries over two large terms after more than a few changes of a term, twenty small queries
-that share a tag toggled on thirty entities, inline queries built per call (a concrete pair
-per parent, two queries per new caster with the caster as a term), `world:each` and
-`world:children` over many entities, entities of eight kinds created in turn (with a slot pool
-too), deleting entities that have 100 targets of a relation, and the memory of sparse
-components in a large world. The results are in
+In one process the implementations run in turn, and the ones that run first change the timings
+of the later ones: by up to 30 % in some rows. The numbers of
+[the comparison](../jecs-comparison/README.md#performance) run each implementation in a process
+of its own (`impls=jecs`, `impls=previous`, `impls=lib`), 5 times in each mode, and take the
+medians.
+
+The group `jecs strengths` (`bench/strengths.luau`) holds ten cases where an archetype ECS is at
+its best, in time or in memory: `(*, T)` and `(R, *)` wildcards that return values, the memory
+of cached queries over scattered entities, queries over two large terms after more than a few
+changes of a term, twenty small queries that share a tag toggled on thirty entities, inline
+queries built per call (a concrete pair per parent, two queries per new caster with the caster
+as a term), `world:each` and `world:children` over many entities, entities of eight kinds
+created in turn (with a slot pool too), deleting entities that have 100 targets of a relation,
+and the memory of sparse components in a large world. The results are in
 [the comparison](../jecs-comparison/README.md#the-strengths-of-jecs).
 
 The group `query monitors` (`bench/monitors.luau`) times the changes that a query monitor
 watches, against jecs 0.11.0 with its addon `modules/OB` (the `jecs_ob` alias of `.luaurc`;
 `Impl.monitor` in `bench/impl_defs.luau`): a tag of the query added and removed, members
-deleted, and children moved between parents under a monitor of `ChildOf` with any target. The
-releases without monitors show `n/a`.
+deleted, and children moved between parents under a monitor of `ChildOf` with any target.
 
 The groups `query cases` and `sparse world` (`bench/shapes.luau`) time one pass of a query with
 the changes a game makes before it: five cases where an archetype ECS is at its best (entity
@@ -198,7 +253,7 @@ first loops included; the matrix takes the minimum of several runs.
 `bench/visual/*.bench.luau` follow the format of the Benchmarker plugin (the same as
 `jecs/test/benches/visual`): `ParameterGenerator`, `BeforeAll` / `AfterAll` /
 `BeforeEach` / `AfterEach` and `Functions` with an entry for jecs and one for mErCS, named with
-their versions (`jecs 0.11.0`, `mErCS 0.2.1`: `libs.luau` reads the version of jecs from its
+their versions (`jecs 0.11.0`, `mErCS 0.2.3`: `libs.luau` reads the version of jecs from its
 Wally package and holds the version of mErCS). The parameters are generated before every call
 and give each function its own fresh world.
 
@@ -307,8 +362,8 @@ To release a version:
 3. Commit, wait for a green CI, then push the tag:
 
 ```sh
-git tag -a v0.2.1 -m "mErCS v0.2.1"
-git push origin v0.2.1
+git tag -a v0.2.3 -m "mErCS v0.2.3"
+git push origin v0.2.3
 ```
 
 Settings of the GitHub repository:

@@ -1050,6 +1050,157 @@ TEST("signals", function()
     world:set(y, B, 4)
     CHECK(late == 11)
     CHECK(world:get(B, ecs.OnChange) ~= nil)
+
+    CASE("the last listener that disconnects leaves the hooks of the id as they are")
+    local C = world:component()
+    local hook_log: { string } = {}
+    world:set(C, ecs.OnAdd, function()
+        table.insert(hook_log, "h1")
+    end)
+    local off1 = world:added(C, function()
+        table.insert(hook_log, "l1")
+    end)
+    local off2 = world:added(C, function()
+        table.insert(hook_log, "l2")
+    end)
+    local z = world:entity()
+    world:set(z, C, 1)
+    off1()
+    world:remove(z, C)
+    world:set(z, C, 1) -- one listener is left
+    -- a hook set while a listener is connected, then the last listener goes: the new hook runs
+    world:set(C, ecs.OnAdd, function()
+        table.insert(hook_log, "h2")
+    end)
+    off2()
+    world:remove(z, C)
+    world:set(z, C, 1)
+    world:remove(C, ecs.OnAdd)
+    world:remove(z, C)
+    world:set(z, C, 1) -- no hook, no listener
+    CHECK(table.concat(hook_log, ",") == "h1,l1,l2,h1,l2,h2")
+    -- a new listener after that
+    local off3 = world:added(C, function()
+        table.insert(hook_log, "l3")
+    end)
+    world:remove(z, C)
+    world:set(z, C, 1)
+    off3()
+    CHECK(table.concat(hook_log, ",") == "h1,l1,l2,h1,l2,h2,l3")
+
+    CASE("the pairs of a relation keep its hooks after the last listener disconnects")
+    local Linked = world:entity()
+    local targets = { world:entity(), world:entity() }
+    local pair_log: { string } = {}
+    local off_rel = world:added(Linked, function()
+        table.insert(pair_log, "l")
+    end)
+    local holder = world:entity()
+    world:add(holder, pair(Linked, targets[1]))
+    world:set(Linked, ecs.OnAdd, function()
+        table.insert(pair_log, "h")
+    end)
+    off_rel()
+    world:remove(holder, pair(Linked, targets[1]))
+    world:add(holder, pair(Linked, targets[1])) -- a pair record made while the listener was there
+    world:add(holder, pair(Linked, targets[2])) -- a pair record made after
+    CHECK(table.concat(pair_log, ",") == "l,h,h")
+
+    CASE("OnRemove and deletes after the last removed listener disconnects")
+    local D = world:component()
+    local removed_log: { string } = {}
+    local off_removed = world:removed(D, function()
+        table.insert(removed_log, "l")
+    end)
+    local gone1, gone2 = world:entity(), world:entity()
+    world:set(gone1, D, 1)
+    world:set(gone2, D, 2)
+    world:delete(gone1)
+    off_removed()
+    world:delete(gone2) -- nothing runs
+    world:set(D, ecs.OnRemove, function()
+        table.insert(removed_log, "h")
+    end)
+    local gone3 = world:entity()
+    world:set(gone3, D, 3)
+    world:delete(gone3)
+    CHECK(table.concat(removed_log, ",") == "l,h")
+    CHECK(not world:contains(gone2) and not world:contains(gone3))
+
+    CASE("change tracking goes on when a signal of its id disconnects")
+    local E = world:component()
+    world:track(E)
+    local off_e = world:added(E, function() end)
+    off_e()
+    world:tick()
+    local added = world:query(E):added(E):cached()
+    count(added)
+    local e1 = world:entity()
+    world:set(e1, E, 1)
+    world:tick()
+    CHECK(count(added) == 1)
+
+    CASE("an id with an internal hook keeps it after the last listener disconnects")
+    local off_x = world:added(ecs.Exclusive, function() end)
+    off_x()
+    local Excl = world:entity()
+    world:add(Excl, ecs.Exclusive) -- the internal hook makes the relation exclusive
+    local switched = world:entity()
+    local xt1, xt2 = world:entity(), world:entity()
+    world:add(switched, pair(Excl, xt1))
+    world:add(switched, pair(Excl, xt2))
+    CHECK(world:has(switched, pair(Excl, xt2)) and not world:has(switched, pair(Excl, xt1)))
+
+    CASE("a listener of a relation disconnected after the relation is deleted")
+    local Old = world:entity()
+    local old_calls, new_calls = 0, 0
+    world:set(Old, ecs.OnAdd, function()
+        old_calls += 1
+    end)
+    local off_old = world:added(Old, function() end)
+    world:delete(Old)
+    local New = world:entity() -- takes the slot of the deleted relation: its pairs have the same ids
+    CHECK(ecs.ECS_ID(New) == ecs.ECS_ID(Old))
+    world:set(New, ecs.OnAdd, function()
+        new_calls += 1
+    end)
+    local owner = world:entity()
+    local nt = world:entity()
+    world:add(owner, pair(New, nt))
+    off_old()
+    world:add(world:entity(), pair(New, nt)) -- the pairs of the new relation keep its hook
+    CHECK(old_calls == 0 and new_calls == 2)
+
+    CASE("a listener connected to a deleted relation does not hear the one that took its slot")
+    local Gone = world:entity()
+    world:delete(Gone)
+    local Taker = world:entity()
+    CHECK(ecs.ECS_ID(Taker) == ecs.ECS_ID(Gone))
+    local taker_calls, heard = 0, 0
+    world:set(Taker, ecs.OnAdd, function()
+        taker_calls += 1
+    end)
+    local taker_target = world:entity()
+    world:add(world:entity(), pair(Taker, taker_target)) -- the records of the pairs of Taker exist
+    local off_gone_added = world:added(Gone, function()
+        heard += 1
+    end)
+    local off_gone_removed = world:removed(Gone, function()
+        heard += 1
+    end)
+    local taker_holder = world:entity()
+    world:add(taker_holder, pair(Taker, taker_target))
+    world:remove(taker_holder, pair(Taker, taker_target))
+    world:add(taker_holder, pair(Taker, world:entity())) -- a new pair record of Taker
+    world:delete(taker_holder)
+    CHECK(heard == 0 and taker_calls == 3)
+    -- the id made alive again (the entity in its slot goes): its listeners hear it, and the
+    -- hook of the entity that had the slot is not its hook
+    CHECK(world:entity(Gone) == Gone and not world:contains(Taker))
+    world:add(world:entity(), Gone)
+    CHECK(heard == 1 and taker_calls == 3)
+    off_gone_added()
+    off_gone_removed()
 end)
 
 TEST("spans fast path", function()
@@ -2821,7 +2972,7 @@ TEST("pair records left without members are freed in batches", function()
             world:remove(e, pair(Likes, targets[i]))
         end
         gc.full()
-        -- 0.2.0 before this change kept every record until its target was deleted: 33 MB
+        -- a world that kept every record until its target was deleted would grow by 33 MB
         CHECK(gc.kb() - before < 4096)
         CHECK(world:target(e, Likes) == nil and count(world:query(pair(Likes, ecs.Wildcard))) == 0)
     end
@@ -3034,8 +3185,8 @@ TEST("shared query shapes of deleted entities", function()
         local before = gc.kb()
         casters(20000)
         gc.full()
-        -- 0.2.0 kept a node and four child nodes per entity (+8 MB here) and the first 1024
-        -- states, and shared no new shape after them
+        -- a world that kept a node and four child nodes per entity would grow by 8 MB, and one
+        -- that kept the first 1024 states would share no new shape after them
         CHECK(gc.kb() - before < 64)
         local fresh = world:component()
         CHECK(shared_shape(function()
@@ -3898,7 +4049,7 @@ TEST("match lists that skip the changes outside their smallest term", function()
     CHECK(all_ok)
 end)
 
-TEST("world:each and world:children walk the bitsets of large records", function()
+TEST("world:each and world:children over large records: the members at the start of the loop", function()
     local world = ecs.world()
     local Tag = world:entity()
     local list: { any } = {}
@@ -3921,14 +4072,16 @@ TEST("world:each and world:children walk the bitsets of large records", function
     end
     CHECK(ordered)
 
-    CASE("members that leave or are deleted ahead of the loop are skipped")
-    local skipped = { [list[10]] = true, [list[40]] = true, [list[300]] = true }
-    local visited = 0
-    local wrong = false
+    CASE("members that leave or are deleted ahead of the loop are returned (a deleted one as a dead id)")
+    local left = { [list[10]] = true, [list[40]] = true, [list[300]] = true }
+    local visited, seen_left, dead = 0, 0, 0
     for e in world:each(Tag) do
         visited += 1
-        if skipped[e] then
-            wrong = true
+        if left[e] then
+            seen_left += 1
+            if not world:contains(e) then
+                dead += 1
+            end
         end
         if e == list[5] then
             world:remove(list[10], Tag) -- the same word
@@ -3936,7 +4089,19 @@ TEST("world:each and world:children walk the bitsets of large records", function
             world:remove(list[300], Tag)
         end
     end
-    CHECK(not wrong and visited == #list - 3)
+    CHECK(visited == #list and seen_left == 3 and dead == 1)
+    -- the next loop has them no more
+    visited = 0
+    for e in world:each(Tag) do
+        visited += 1
+        CHECK(not left[e])
+    end
+    CHECK(visited == #list - 3)
+    for i = #list, 1, -1 do
+        if left[list[i]] then
+            table.remove(list, i)
+        end
+    end
 
     CASE("the current entity may be deleted, entities created in the loop are not visited")
     local count_before = 0
@@ -3973,22 +4138,89 @@ TEST("world:each and world:children walk the bitsets of large records", function
     end
     CHECK(n == 200 and count(world:children(parent)) == 0)
 
-    CASE("the id deleted inside its own loop: its members are not returned after that")
+    CASE("the id deleted inside its own loop: the loop returns the members of its start")
     local Gone = world:entity()
     for _ = 1, 3000 do
         world:add(world:entity(), Gone)
     end
-    local after = 0
-    local started = false
-    for _ in world:each(Gone) do
-        if started then
-            after += 1
-        else
-            started = true
+    local returned, with_id = 0, 0
+    for e in world:each(Gone) do
+        returned += 1
+        if returned == 1 then
             world:delete(Gone) -- every member loses the id
         end
+        if world:has(e, Gone) then
+            with_id += 1
+        end
     end
-    CHECK(started and after == 0)
+    CHECK(returned == 3000 and with_id == 0 and count(world:each(Gone)) == 0)
+
+    CASE("the buffers of the loops: nested loops, break, an iterator called after its end, a buffer reused")
+    do
+        local w2 = ecs.world()
+        local Big, Small, Other = w2:entity(), w2:entity(), w2:entity()
+        local big: { any } = {}
+        for i = 1, 3000 do
+            local e = w2:entity()
+            if i % 3 == 0 then
+                w2:add(e, Big)
+                table.insert(big, e)
+            end
+            if i == 100 or i == 1000 or i == 2000 then
+                w2:add(e, Small)
+            end
+            if i % 7 == 0 then
+                w2:add(e, Other)
+            end
+        end
+        local function same(loop: () -> any, expected: { any }): boolean
+            local k = 0
+            for e in loop do
+                k += 1
+                if e ~= expected[k] then
+                    return false
+                end
+            end
+            return k == #expected
+        end
+        local small: { any } = {}
+        for e in w2:each(Small) do
+            table.insert(small, e)
+        end
+        local buffers_ok = #small == 3
+        -- nested loops over one id: each loop has a buffer of its own
+        local outer = 0
+        for _ in w2:each(Big) do
+            outer += 1
+            if outer <= 3 then
+                buffers_ok = buffers_ok and same(w2:each(Big), big) and same(w2:each(Small), small)
+            end
+        end
+        buffers_ok = buffers_ok and outer == #big
+        -- loops left with break leave their buffers: the next loops are whole
+        for _ = 1, 40 do
+            for _ in w2:each(Big) do
+                break
+            end
+        end
+        buffers_ok = buffers_ok and same(w2:each(Big), big) and same(w2:each(Small), small)
+        -- an iterator called after its end gives nil and does not give its buffer back twice
+        local iterator = w2:each(Big)
+        while iterator() do
+        end
+        local after_end = iterator()
+        local once_more = iterator()
+        buffers_ok = buffers_ok and after_end == nil and once_more == nil
+        local a, b = w2:each(Small), w2:each(Other)
+        local first_small, first_other = a(), b()
+        buffers_ok = buffers_ok and first_small == small[1] and w2:has(first_other, Other)
+        buffers_ok = buffers_ok and same(a, { small[2], small[3] })
+        -- a buffer of a large loop reused by a smaller one returns the smaller members only
+        for _ in w2:each(Big) do
+        end
+        buffers_ok = buffers_ok and same(w2:each(Small), small)
+        CHECK(buffers_ok)
+    end
 
     CASE("a (*, T) record read the first time by world:each")
     local T = world:entity()

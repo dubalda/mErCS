@@ -978,7 +978,7 @@ local function build(N: number): { Scenario }
     })
 
     -- a pair with a concrete target, written inline: the query is shared by shape from its
-    -- second call (0.2.1 built a new state on every call)
+    -- second call
     for _, matches in { 15, 0 } do
         add({
             group = "query",

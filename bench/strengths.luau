@@ -3,8 +3,8 @@
 --!optimize 2
 --[[
     The strengths of an archetype ECS (bench/scenarios.luau adds them as the group
-    "jecs strengths"): ten cases where jecs 0.11.0 was far ahead of mErCS 0.2.1, in time or in
-    memory. An archetype keeps the entities of one set of ids together, a query caches the
+    "jecs strengths"): ten cases where an archetype ECS is at its best, in time or in memory.
+    An archetype keeps the entities of one set of ids together, a query caches the
     archetypes it matches, and a wildcard pair is resolved per archetype, so these cases cost
     jecs little, while a bitset ECS pays per entity, per changed slot or per page:
 

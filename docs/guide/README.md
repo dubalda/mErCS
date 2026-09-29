@@ -88,13 +88,13 @@ world:remove(e, Frozen)
 - `get` and `has` take up to 8 ids; `get_list` and `has_all` take any number.
 - `world:each(id)` iterates the entities that have an id, and `world:remove_all(id)` removes
   it from all of them at once (about 20 ns per entity when the id has no `OnRemove` hook).
-  `world:each` and `world:children` walk the bitsets of the id in ascending slot order and
-  allocate only their iterator; an entity that loses the id or is deleted before the loop
-  reaches it is skipped, and an entity that gets the id during the loop is visited only when
-  its slot lies ahead of the loop and existed when the loop started (a loop that gives the id
-  to new entities ends). The members of an id that lie in at most two words of its bitset (up
-  to 64 entities, like the children of a parent created together) are collected into a list
-  first, whose loop returns the members of its start.
+  `world:each` and `world:children` return the members of the id when the loop starts, in
+  ascending slot order, whatever their number and their layout; they are collected into a
+  buffer that the world reuses, so a loop allocates only its iterator. Nothing that changes
+  during the loop changes what it returns: an entity that gets the id is not visited (the
+  messages that a loop over messages makes wait for the next loop), one that loses it is
+  visited, and one deleted before the loop reaches it is returned as a dead id: a loop that
+  deletes other entities checks `world:contains`.
 
 ## Queries
 
@@ -272,6 +272,10 @@ disconnect()
   or a wildcard pair) raises an error.
 - A listener may connect or disconnect listeners, itself included, while it runs: the change
   applies from the next event.
+- Once the last listener of an id disconnects (the listeners of a monitor too), the changes of
+  the id cost what they cost before the first one connected.
+- A listener of a deleted id hears nothing, not even the pairs of the relation that takes its
+  slot, until the id is made alive again (`world:entity(id)`).
 - `OnRemove` runs before anything is removed, so the other values of the entity can still be
   read; `deleting` is true when the entity itself is being deleted. When a hook removes
   another id of the entity, the `OnRemove` of that id runs once, from the removal.
