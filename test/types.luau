@@ -102,6 +102,20 @@ local _npc_slot: number = ecs.ECS_ID(npc)
 local _npc_health: number? = world:get(npc, Health)
 world:delete(npc)
 
+-- query monitors: callbacks with the entity, set and cleared with a dot
+local entered = 0
+local monitor: ecs.Monitor = world:query(Position):with(Health):monitor()
+monitor.added(function(entity: ecs.Entity)
+    local _position: Vec? = world:get(entity, Position)
+    entered += 1
+end)
+monitor.removed(nil)
+local walker = world:entity()
+world:set(walker, Position, { x = 0, y = 0 })
+world:set(walker, Health, 5)
+assert(entered == 1, "entered once")
+monitor.disconnect()
+
 world:delete(e)
 assert(not world:contains(e), "deleted")
 print("types: ok")

@@ -26,6 +26,9 @@ export type Impl = {
     component: (world: any) -> any,
     -- Fastest idiomatic iteration over a prepared 4-component query; returns visited count.
     fast4: (world: any, query: any, a: any, b: any, c: any, d: any) -> number,
+    -- A monitor of a query (added, removed, disconnect), where the implementation has one
+    -- (jecs: its addon modules/OB); features.monitor tells.
+    monitor: ((query: any) -> any)?,
 }
 
 export type Scenario = {

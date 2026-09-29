@@ -8,8 +8,9 @@
     once). After every
     batch of operations all observable state is compared: has/get, targets and their order,
     parents, world:ids, change filters, and queries (for-in, each, has) with and without
-    terms, wildcards, relationship terms and data pair values, including cached queries kept
-    across all rounds.
+    terms, wildcards, relationship terms and data pair values (also the values of (R, *) and
+    (*, T), whose queries read mirrors of them), including cached queries kept across all
+    rounds.
 
     Run from the repository root (seed, number of rounds and the flags are optional; "wide"
     creates 300 other ids first, so that the relation records get signature indices beyond
@@ -23,12 +24,16 @@
     removes pairs with 400 targets on an entity outside the model after every operation, so
     that the pair records left empty (those of the model too) are freed in batches between
     and inside the operations of the model; "shapes" checks queries that have entities of the
-    model as terms after every batch (a shared query shape per entity, dropped when the entity
-    is deleted: a new shape of a live entity must always be shared) and keeps some of them
-    across the rounds, also after their entity is deleted):
+    model as terms, directly or as the target of a pair, after every batch (a shared query
+    shape per entity, dropped when the entity is deleted: a new shape of a live entity must
+    always be shared) and keeps some of them across the rounds, also after their entity is
+    deleted; "monitors" gives the stored queries
+    and a few more (the exclusive relation and ChildOf with any target, Disabled named) query
+    monitors, whose members (the matches when the monitor was made, plus the entities that
+    entered, less those that left) must be the matches of the model after every batch):
         luau test/fuzz.luau
         luau test/fuzz.luau -a 42 400 wide hooks churn shapes
-        luau test/fuzz.luau -a 7 300 sparse pool verify hooks churn shapes
+        luau test/fuzz.luau -a 7 300 sparse pool verify hooks churn shapes monitors
 ]]
 
 local ecs = require("../src")
@@ -43,6 +48,7 @@ local pooled = table.find(args, "pool") ~= nil
 local verify = table.find(args, "verify") ~= nil
 local churn = table.find(args, "churn") ~= nil
 local shapes = table.find(args, "shapes") ~= nil
+local monitors = table.find(args, "monitors") ~= nil
 
 local function next_int(low: number, high: number): number
     seed = seed * 16807 % 2147483647
@@ -484,7 +490,7 @@ local function mutate()
             m.r1[t] = true
         end
     elseif roll <= 60 then
-        local t = pick()
+        local t = if next_int(1, 4) == 1 then anchor else pick()
         if t then
             local value = next_int(1, 1000)
             world:set(e, pair(R3, t), value)
@@ -699,11 +705,60 @@ local function check_query(label: string, q: any, expected: (m: EntityModel) -> 
     end
 end
 
+-- "monitors": a monitor of a query and the members it reports; made again with the stored
+-- queries (the old ones are disconnected).
+type Watch = { label: string, monitor: any, members: { [any]: boolean }, expected: (m: EntityModel) -> boolean }
+local watches: { Watch } = {}
+
+local function watch(label: string, q: any, expected: (m: EntityModel) -> boolean)
+    local members: { [any]: boolean } = {}
+    for e in q do
+        members[e] = true -- the monitor starts with the same matches
+    end
+    local monitor = q:monitor()
+    monitor.added(function(e: any)
+        if members[e] then
+            fail(`{label}: {e} entered twice`)
+        end
+        members[e] = true
+    end)
+    monitor.removed(function(e: any)
+        if not members[e] then
+            fail(`{label}: {e} left without entering`)
+        end
+        if not world:contains(e) then
+            fail(`{label}: {e} left after its delete`)
+        end
+        members[e] = nil
+    end)
+    table.insert(watches, { label = label, monitor = monitor, members = members, expected = expected })
+end
+
+local function check_monitors()
+    for _, w in watches do
+        for e, m in model do
+            if w.expected(m) and not w.members[e] then
+                fail(`{w.label}: {e} did not enter`)
+            end
+        end
+        for e in w.members do
+            local m = model[e]
+            if m == nil or not w.expected(m) then
+                fail(`{w.label}: {e} did not leave`)
+            end
+        end
+    end
+end
+
 -- Cached queries kept across all rounds (created again when C2 or R1 is replaced).
 local stored: { { any } } = {}
+-- queries that return the values of wildcard pairs, kept across the rounds (their mirrors)
+local stored_r3: any, stored_anchor: any = nil, nil
 local stored_c2: any = nil
 function make_stored()
     stored_c2 = world:query(C2):cached()
+    stored_r3 = world:query(pair(R3, W)):cached()
+    stored_anchor = world:query(C1, pair(W, anchor)):cached()
     stored = {
         {
             "stored C1 with (R1, anchor)",
@@ -727,6 +782,34 @@ function make_stored()
             end,
         },
     }
+    if monitors then
+        for _, w in watches do
+            w.monitor.disconnect()
+        end
+        table.clear(watches)
+        for _, entry in stored do
+            watch(entry[1] :: string, entry[2], entry[3] :: (m: EntityModel) -> boolean)
+        end
+        watch("stored C2", stored_c2, function(m: EntityModel): boolean
+            return m.values[C2] ~= nil and not m.disabled
+        end)
+        watch("stored (R3, *)", stored_r3, function(m: EntityModel): boolean
+            return next(m.r3) ~= nil and not m.disabled
+        end)
+        watch("C1 with (R2, *)", world:query(C1):with(pair(R2, W)), function(m: EntityModel): boolean
+            return m.values[C1] ~= nil and m.r2 ~= nil and not m.disabled
+        end)
+        watch(
+            "C2 with (ChildOf, *) without T1",
+            world:query(C2):with(pair(ChildOf, W)):without(T1),
+            function(m: EntityModel): boolean
+                return m.values[C2] ~= nil and m.parent ~= nil and m.values[T1] == nil and not m.disabled
+            end
+        )
+        watch("T2 with Disabled", world:query(T2):with(ecs.Disabled), function(m: EntityModel): boolean
+            return m.values[T2] ~= nil and m.disabled == true
+        end)
+    end
 end
 make_stored()
 
@@ -771,16 +854,65 @@ local function check_stored()
     if wrong > 0 then
         fail(`values of stored C2: {wrong} wrong`)
     end
+    -- (R3, *) gives the value of the first target; R3 has the lowest relation slot (a component
+    -- id), so (*, anchor) gives the value of (R3, anchor), nil for an entity with (R1, anchor)
+    -- only
+    for _ = 1, 2 do
+        for e, value in stored_r3 do
+            local m = model[e]
+            local first: any = nil
+            for target in (if m then m.r3 else {}) :: { [any]: number } do
+                if first == nil or slot_order(target, first) then
+                    first = target
+                end
+            end
+            if m == nil or first == nil or m.r3[first] ~= value or world:get(e, pair(R3, W)) ~= value then
+                wrong += 1
+            end
+        end
+        local n_anchor = 0
+        stored_anchor:each(function(e: any, c1: any, value: any)
+            n_anchor += 1
+            local m = model[e]
+            local c1_expected = if m then m.values[C1] else nil
+            if c1_expected == NO_VALUE then
+                c1_expected = nil
+            end
+            if
+                m == nil
+                or (m.r3[anchor] == nil and not m.r1[anchor])
+                or m.r3[anchor] ~= value
+                or c1 ~= c1_expected
+                or world:get(e, pair(W, anchor)) ~= value
+            then
+                wrong += 1
+            end
+        end)
+        local n_want = 0
+        for _, m in model do
+            if m.values[C1] ~= nil and (m.r3[anchor] ~= nil or m.r1[anchor]) and not m.disabled then
+                n_want += 1
+            end
+        end
+        if n_anchor ~= n_want then
+            wrong += 1
+        end
+    end
+    if wrong > 0 then
+        fail(`values of stored wildcard queries: {wrong} wrong`)
+    end
 end
 
--- "shapes": queries with entities of the model as terms. No entity has another one as a tag,
--- so without(t) excludes nothing and with(t) matches nothing, whether t is alive or not. The
--- entities are taken in a fixed order (no random numbers: the operations of the model are the
--- same with and without the flag). The shapes of the live entities are fewer than MAX_SHAPES,
--- so every new one must be shared: a shape that is not dropped with its entity would use up
--- the shared states. Some handles are kept across the rounds, after their entity is deleted
--- too.
+-- "shapes": queries with entities of the model as terms, directly or as the target of a pair
+-- of a relation outside the model. No entity has another one as a tag, nor a pair of that
+-- relation, so without(t) excludes nothing and with(t) matches nothing, whether t is alive or
+-- not, and the same for the pair. The entities are taken in a fixed order (no random numbers:
+-- the operations of the model are the same with and without the flag). The shapes of the live
+-- entities are fewer than MAX_SHAPES, so every new one must be shared from its second request
+-- (the first one marks it): a shape that is not dropped with its entity would use up the
+-- shared states. Some handles are kept across the rounds, after their entity is deleted too.
 local kept_shapes: { { any } } = {}
+local shape_relation: any = if shapes then world:entity() else nil
 
 local function c1_alive(m: EntityModel): boolean
     return m.values[C1] ~= nil and not m.disabled
@@ -793,21 +925,32 @@ end
 local function check_shapes()
     for k = 1, #list, math.max(1, #list // 8) do
         local t = list[k]
+        world:query(C1):without(t) -- a new shape is marked by its first request
         local q = world:query(C1):without(t)
         if (q :: any).state.shared ~= true then -- the internal state of the query
             fail(`the shape of C1 without {t} is not shared`)
         end
         check_query(`C1 without {t}`, q, c1_alive)
         check_query(`C1 with {t}`, world:query(C1):with(t), nothing)
+        local p = pair(shape_relation, t)
+        world:query(C1):without(p)
+        local qp = world:query(C1):without(p)
+        if (qp :: any).state.shared ~= true then
+            fail(`the shape of C1 without (R, {t}) is not shared`)
+        end
+        check_query(`C1 without (R, {t})`, qp, c1_alive)
+        check_query(`C1 (R, {t})`, world:query(C1, p), nothing)
         if k == 1 then
-            table.insert(kept_shapes, { t, q })
+            table.insert(kept_shapes, { `C1 without {t}`, q })
+            table.insert(kept_shapes, { `C1 without (R, {t})`, qp })
             if #kept_shapes > 16 then
+                table.remove(kept_shapes, 1)
                 table.remove(kept_shapes, 1)
             end
         end
     end
     for _, entry in kept_shapes do
-        check_query_once(`kept C1 without {entry[1]}`, entry[2], c1_alive)
+        check_query_once(`kept {entry[1]}`, entry[2], c1_alive)
     end
 end
 
@@ -864,6 +1007,13 @@ local function check_queries()
                 end
             end
             if m == nil or first == nil or m.r3[first] ~= value then
+                wrong += 1
+            end
+        end
+        -- (*, t): the value of the pair with the lowest relation slot, which is R3 (a component id)
+        for e, value in world:query(pair(W, t)) do
+            local m = model[e]
+            if m == nil or m.r3[t] ~= value or world:get(e, pair(W, t)) ~= value then
                 wrong += 1
             end
         end
@@ -934,6 +1084,7 @@ for round = 1, rounds do
     check_tracking()
     check_entities()
     check_stored()
+    check_monitors()
     if shapes then
         check_shapes()
     end

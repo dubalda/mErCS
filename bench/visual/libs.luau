@@ -18,7 +18,7 @@
         -- Functions = { [libs.jecs_label] = ..., [libs.lib_label] = ... }
 ]]
 
-local LIBRARY_VERSION = "0.2.1"
+local LIBRARY_VERSION = "0.2.2"
 
 -- "jecs <version>" from the Wally index next to this folder (mErCSCheck.DevPackages._Index)
 local function jecs_label(): string

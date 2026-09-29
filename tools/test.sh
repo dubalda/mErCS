@@ -16,7 +16,8 @@ if [ "${1:-}" = "--codegen" ]; then
 fi
 
 for file in test/core.luau test/lib.luau test/types.luau test/fuzz.luau test/jabby.luau \
-    test/jecs_compat/tests.luau examples/basics.luau; do
+    test/jecs_compat/tests.luau test/jecs_compat/ob.luau test/monitors_fuzz.luau test/queries_fuzz.luau \
+    test/loops_fuzz.luau examples/basics.luau; do
     echo "== $file"
     luau "${flags[@]}" "$file"
 done

@@ -30,14 +30,15 @@ code. The [comparison](docs/jecs-comparison/README.md#performance) has all the n
 mErCS 0.1.2 beside them, and the results of the Benchmarker plugin in Roblox Studio.
 
 Beyond jecs: `query:each` (the fastest loop), OR terms, batch operations on query matches,
-change tracking by ticks, disabled entities, hierarchies of any depth, slot pools.
+change tracking by ticks, disabled entities, hierarchies of any depth, slot pools. Query
+monitors (`query:monitor()`) take the place of the monitors of the jecs addon `modules/OB`.
 
 ## Installation
 
 Copy `src/init.luau` into your project as a ModuleScript (for example
 `ReplicatedStorage.mErCS`; `src/jabby.luau` is an optional child module for the jabby
 debugger), or sync the repository with Rojo (`default.project.json`), or depend on it through
-Wally (`mercs = "dubalda/mercs@0.2.1"`). The module has no dependencies; `--!native` is enabled
+Wally (`mercs = "dubalda/mercs@0.2.2"`). The module has no dependencies; `--!native` is enabled
 at the top of the file.
 
 ## Quick start
@@ -82,7 +83,7 @@ The [documentation site](https://dubalda.github.io/mErCS/) holds the API referen
 from the doc comments of `src/`) and these pages:
 
 - [Guide](docs/guide/README.md) — worlds, components, queries, batch operations, relationships,
-  hooks, change tracking, the jabby adapter, types.
+  hooks, query monitors, change tracking, the jabby adapter, types.
 - [Comparison with jecs](docs/jecs-comparison/README.md) — design, differences, benchmarks,
   migrating from jecs.
 - [Development](docs/development/README.md) — layout, tests, checks, benchmarks, Roblox Studio,

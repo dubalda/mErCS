@@ -4,10 +4,12 @@
     Benchmark entries for jecs and for modules with the library API (the library and its
     snapshots), shared by bench/impls.luau and the Roblox Studio check (studio/runner.luau).
 
-    Each entry provides the module with the jecs-compatible API plus two helpers:
+    Each entry provides the module with the jecs-compatible API plus these helpers:
     - component(world): creates a component id without hitting implementation limits;
     - fast4(world, query, a, b, c, d): the fastest idiomatic loop over a prepared
-      4-component query that reads all four values; returns the number of visited entities.
+      4-component query that reads all four values; returns the number of visited entities;
+    - monitor(query): a query monitor (added, removed, disconnect), when the implementation
+      has one (features.monitor): jecs with its addon modules/OB, the library from 0.2.2.
 ]]
 
 local harness = require("./harness")
@@ -20,12 +22,18 @@ local countrz = bit32.countrz
 
 local JECS_COMPONENT_LIMIT = 256
 
-local function jecs_impl(jecs: any, label: string?): Impl
+-- `ob` is the addon modules/OB of jecs (its monitors), when it can be loaded.
+local function jecs_impl(jecs: any, label: string?, ob: any?): Impl
     return {
         name = "jecs",
         label = label,
         ecs = jecs,
-        features = { pairs = true },
+        features = { pairs = true, monitor = ob ~= nil },
+        monitor = if ob
+            then function(query: any): any
+                return ob.monitor(query)
+            end
+            else nil,
         component = function(world: any): any
             -- jecs allows 256 world:component() ids; beyond that entities marked as components are used.
             if world.max_component_id < JECS_COMPONENT_LIMIT then
@@ -52,11 +60,18 @@ end
 
 -- Implementation entry for a module with the library API (the library and its releases).
 local function library_impl(name: string, module: any, label: string?): Impl
+    -- query:monitor exists from 0.2.2 on
+    local has_monitor = module.world():query().monitor ~= nil
     return {
         name = name,
         label = label,
         ecs = module,
-        features = { many_ids = true, pairs = true, each = true },
+        features = { many_ids = true, pairs = true, each = true, monitor = has_monitor },
+        monitor = if has_monitor
+            then function(query: any): any
+                return query:monitor()
+            end
+            else nil,
         component = function(world: any): any
             return world:component()
         end,

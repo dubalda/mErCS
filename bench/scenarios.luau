@@ -16,6 +16,8 @@
 
 local harness = require("./harness")
 local shapes = require("./shapes")
+local strengths = require("./strengths")
+local monitors = require("./monitors")
 
 type Impl = harness.Impl
 type Scenario = harness.Scenario
@@ -975,7 +977,8 @@ local function build(N: number): { Scenario }
         end,
     })
 
-    -- a pair with a concrete target: the query is not shared, it gets a new state every call
+    -- a pair with a concrete target, written inline: the query is shared by shape from its
+    -- second call (0.2.1 built a new state on every call)
     for _, matches in { 15, 0 } do
         add({
             group = "query",
@@ -1391,6 +1394,16 @@ local function build(N: number): { Scenario }
     -- query shapes: query cases and a sparse world (bench/shapes.luau)
     ---------------------------------------------------------------------------
     shapes(add, N)
+
+    ---------------------------------------------------------------------------
+    -- the strengths of an archetype ECS (bench/strengths.luau)
+    ---------------------------------------------------------------------------
+    strengths(add, N)
+
+    ---------------------------------------------------------------------------
+    -- query monitors (bench/monitors.luau)
+    ---------------------------------------------------------------------------
+    monitors(add, N)
 
     return list
 end

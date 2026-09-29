@@ -1,8 +1,8 @@
 # mErCS and jecs
 
 How mErCS 0.2.0 differs from [jecs](https://github.com/Ukendio/jecs) 0.11.0: the design,
-the behaviour, the numbers (with mErCS 0.1.2, the previous release, beside them), and how to
-move code over.
+the behaviour, when jecs is the better choice, the numbers (with mErCS 0.1.2, the previous
+release, beside them), and how to move code over.
 
 ## Contents
 
@@ -10,6 +10,7 @@ move code over.
 - [Compatibility](#compatibility)
 - [Differences in behaviour](#differences-in-behaviour)
 - [Beyond jecs](#beyond-jecs)
+- [When jecs is the better choice](#when-jecs-is-the-better-choice)
 - [Performance](#performance)
 - [Migrating from jecs](#migrating-from-jecs)
 
@@ -61,8 +62,12 @@ visualiser) are not applicable and are listed in `test/jecs_compat/README.md`.
 - The iteration order is ascending by entity slot, not by archetype.
 - Builtin ids after `Name` have other numbers: `Exclusive` is 268 (jecs: 270), `Disabled`
   (not in jecs) 269, `Rest` 270 (jecs: 271).
-- The jecs observer addon (`modules/OB`) depends on archetypes and does not work; use hooks,
-  signals or change tracking.
+- The jecs addon `modules/OB` reads archetypes and does not work here. Its monitors are
+  `query:monitor()`, which returns the same `added` / `removed` / `disconnect` (the 42 monitor
+  cases of the tests of the addon pass, `test/jecs_compat/ob.luau`), and its observers are
+  signals with a check of the query (see the [guide](../guide/README.md#query-monitors)). A
+  monitor of mErCS does not make an entity leave and enter a query with an exclusive relation
+  and any target when the relation replaces a pair; it takes no term `(*, T)`.
 - Setting a hook after connecting signals keeps the signals (in jecs the hook replaces them),
   and `world:get(id, ecs.OnAdd)` returns the hook, not the signal dispatcher.
 - A signal listener that disconnects itself while it runs does not make the next listener
@@ -74,9 +79,23 @@ visualiser) are not applicable and are listed in `test/jecs_compat/README.md`.
   deleted ahead of the loop may be returned once as a dead id with nil values.
 - `query:cached()` on a query that has not been iterated yet prepares it (picks how it
   iterates and builds its match list), as jecs matches its archetypes there; on a shared query
-  (`world:query(...)` without a concrete pair) it does nothing else: such a query is cached
-  already.
+  (`world:query(...)` without change filters) it does nothing else: such a query is cached
+  already. A query shape is shared from its second request; the first request gets a state of
+  its own, which becomes the shared one when it is used again (a second loop, a modifier,
+  `cached()`).
+- A wildcard returns the value of one pair of each entity: `(R, *)` the pair with the lowest
+  target slot, `(*, T)` the pair with the lowest relation slot (jecs: the first such pair in
+  the type of the archetype, which is sorted by id).
+- `world:each` and `world:children` return the entities in ascending slot order and skip those
+  that lose the id or are deleted before the loop reaches them; an entity that gets the id
+  during the loop is visited only when its slot lies ahead of the loop and existed when the
+  loop started (jecs walks the rows of its archetypes backwards).
 - `world:exists(e)` is also true for a slot reserved by a slot pool and not handed out yet.
+- `world:remove(e, ecs.pair(R, ecs.Wildcard))` removes every pair `(R, *)` of the entity, and
+  `ecs.pair(ecs.Wildcard, T)` every pair with the target `T`; `add` and `set` raise an error for
+  a wildcard pair. jecs forbids a wildcard pair in all three: `jecs.world(true)` raises an
+  error, and a world without the check leaves the pairs in place and breaks the row of the
+  entity in its archetype.
 
 ## Beyond jecs
 
@@ -93,6 +112,80 @@ visualiser) are not applicable and are listed in `test/jecs_compat/README.md`.
 - `world:ids(e)`, a debug world (`ecs.world(true)`, which also checks the match lists of
   cached queries against their bitsets), `query:spans()` with `world:column(id)`.
 
+## When jecs is the better choice
+
+jecs keeps the entities of one set of ids together, in the rows of an archetype; mErCS keeps a
+bitset per id and the values in pages indexed by the entity slot. Each layout has cases that
+the other cannot match. The numbers compare jecs 0.11.0 and mErCS 0.2.2: the time or memory of
+mErCS divided by that of jecs, "interpreter / native" (see [Performance](#performance)).
+
+### What only jecs has
+
+- roblox-ts: jecs has TypeScript declarations (`@rbxts/jecs`); mErCS is a Luau module only.
+- An observer object: the observer of the addon `modules/OB` calls back for every add or value
+  change of an id of a query on an entity that matches it. In mErCS a signal with
+  `query:has` does that; the monitors of the addon are `query:monitor()`.
+- Archetypes as an API: `query:archetypes()` with the columns of each archetype, the ids
+  `ArchetypeCreate` / `ArchetypeDelete`, and the tools that read them (the entity visualiser
+  of jecs, for one). mErCS gives the value pages of a query through `query:spans()` and
+  `world:column(id)`.
+- The original of the API: the documentation and examples of jecs, and the tools made for it,
+  apply to it as they are. mErCS follows the API, runs the jecs test suite and adapts jabby,
+  with the differences listed in [Differences in behaviour](#differences-in-behaviour).
+
+### Where jecs is always stronger
+
+These cases follow from the layouts: a bitset ECS can narrow them, not close them (a slot pool
+avoids the third one where the code can use one).
+
+| Case | jecs | mErCS | mErCS / jecs |
+|---|---|---|---|
+| The memory of a cached query over scattered entities | a list of the archetypes it matches | a list of its matches, two numbers each | 46× (263 KB against 5.7 KB per query) |
+| The memory of sparse components in a large world | a row of an archetype per entity | per entity and component, a word of the bitset and a quarter of a value page of 256 slots | 3.9× (660 B against 170 B per entity: 8 components on 1 entity in 64) |
+| Entities of several kinds created in turn, without a slot pool | each kind lies in archetypes of its own | the layout follows the order of creation, so the entities of a kind are scattered | for-in 2.8× / 2.9–3.1×, `each` 1.4–1.5× / 1.4× (from a slot pool: 0.90× / 0.62×) |
+| A loop over the entities of one id (`world:each`, `world:children`) | the rows of its archetypes | a walk over a bitset | 1.3–1.4× / 1.3× |
+| Deleting entities with many pairs of one relation | one row of one archetype | one bit in the record of each pair | 100 targets: 2.1–3.0× / 1.5× |
+
+### Where jecs is faster in mErCS 0.2.2
+
+These depend on the implementation rather than on the layout (the benchmark matrix and
+[The strengths of jecs](#the-strengths-of-jecs)):
+
+- Queries built on every call with a new entity as a term: jecs looks up the archetypes of
+  the ids, mErCS builds a query state for the new shape. Two queries per new caster:
+  2.0× / 1.9×, and 377 B kept per caster (jecs: 0 B); an entity used in 4 inline queries and
+  then deleted: 2.5× / 2.6×. A shape requested again (an entity or a pair used as a term in
+  every frame) is shared and faster than in jecs: a concrete pair per call 0.71× / 0.68×,
+  `query(A, pair(ChildOf, parent))` per parent 0.66× / 0.63×.
+- Twenty small cached queries over a tag toggled on 30 entities per frame: 1.1–1.2× in the
+  interpreter (0.8–0.9× in native code): each query tests the words of its smallest term
+  against the changed bits, jecs moves the entities once.
+- A cached query over scattered entities, built and passed once: 2.4–2.6× / 1.1–1.4×.
+- A for-in over a sparse match (1 % of the entities): 1.7× / 2.0× (`each` is on par).
+- A for-in with `without`: 1.17× / 1.13×; a for-in reading 1 value of 4: 1.05× / 1.13×.
+- Adding the first component to an entity: 1.4× / 1.15×.
+- In the interpreter only (the Roblox client): `has` with 4 ids (1.3×), a `ChildOf` cascade
+  (1.3×), a for-in over dense data (up to 1.2×), deleting an entity with 4 components (1.14×),
+  and in [a sparse world](#a-sparse-world) without a slot pool, a change of one creature before
+  a pass (1.3–1.4×).
+
+### When to choose jecs
+
+- A roblox-ts project.
+- Code built on `query:archetypes()` or on tools that read archetypes.
+- Dozens of cached queries over entities whose composition rarely changes, with a tight memory
+  budget: the query caches of jecs stay small whatever the number of entities.
+- Many kinds of entities created together (a creature with its skills and items) when a slot
+  pool per kind does not fit the code, and the systems loop with for-in.
+- Components on a small share of the entities of a very large world, when memory matters more
+  than the cost of adding and removing them.
+- Queries built on every call with new entities as terms (a query per new entity), when they
+  take a large part of the frame.
+
+In the other cases (components and tags added and removed every frame, relationships with many
+targets, long sessions, memory per entity, deep hierarchies) mErCS is faster and smaller: see
+[Design](#design), [Beyond jecs](#beyond-jecs) and [Performance](#performance).
+
 ## Performance
 
 Benchmarks in `bench/` with `luau` 0.740: jecs 0.11.0 (the Wally dev packages), mErCS 0.1.2
@@ -103,6 +196,9 @@ server). The ratio columns give the time of mErCS 0.2.0 divided by the time of j
 [Roblox Studio: Benchmarker](#roblox-studio-benchmarker) compares jecs 0.11.0 and mErCS 0.2.0
 inside Roblox Studio. mErCS 0.2.1, a patch release, changes what the notes marked **0.2.1**
 below say (the memory table has a column for it); the other numbers are those of 0.2.0.
+mErCS 0.2.2 is measured in [The strengths of jecs](#the-strengths-of-jecs), the cases where
+jecs 0.11.0 was far ahead of 0.2.1; in the other rows of the matrix, the synthetic frame and
+the long session it is on par with 0.2.1.
 
 ### A synthetic game frame
 
@@ -201,6 +297,116 @@ Without a pool, a change of one creature before a pass (`Run` toggled, a tag add
 removed) costs a list edit: the creature is a group of its own in the match list of the query,
 and the group is inserted or removed. jecs moves the creature to another archetype, and its
 pass costs nothing more.
+
+### The strengths of jecs
+
+Ten cases where an archetype ECS is at its best and jecs 0.11.0 was far ahead of mErCS 0.2.1,
+in time or in memory (the group `jecs strengths` of `bench/run.luau`, `bench/strengths.luau`).
+An archetype keeps the entities of one set of ids together, a query caches the archetypes it
+matches, and a wildcard pair is resolved per archetype, while a bitset ECS pays per entity, per
+changed slot or per value page. Time of one pass or per unit, the median of 5 runs of the
+minimum of 3; memory is what a unit keeps:
+
+| # | Case | jecs 0.11.0 | mErCS 0.2.1 | mErCS 0.2.2 | 0.2.1 / jecs | 0.2.2 / jecs |
+|---|---|---|---|---|---|---|
+| 1 | `(*, T)` values, 32 data relations, a pass over 20 000 | 722 / 601 µs | 16.0 / 7.46 ms | 539 / 310 µs | 22.2× / 12.4× | 0.75× / 0.52× |
+| 2 | `(R, *)` values, 8 targets, a pass over 20 000 | 722 / 590 µs | 4.19 / 3.20 ms | 530 / 305 µs | 5.80× / 5.43× | 0.73× / 0.52× |
+| 3 | 15 cached queries over scattered entities, per query | 280 / 238 µs | 843 / 584 µs | 714 / 335 µs | 3.01× / 2.45× | 2.55× / 1.41× |
+| | the same, memory per query | 5.7 KB | 374 KB | 263 KB | 66× | 46× |
+| 4 | usually empty, 20 swaps per pass (100 000 entities) | 16.4 / 16.5 µs | 224 / 80.9 µs | 14.5 / 8.74 µs | 13.7× / 4.89× | 0.88× / 0.53× |
+| | 5 queries, 100 matches each, 40 toggles per frame | 46.8 / 44.3 µs | 968 / 328 µs | 30.6 / 17.7 µs | 20.7× / 7.40× | 0.65× / 0.40× |
+| 5 | 20 small queries, a shared tag toggled on 30 per frame | 19.3 / 15.9 µs | 120 / 61.4 µs | 22.0 / 14.7 µs | 6.22× / 3.86× | 1.14× / 0.93× |
+| 6 | `query(A, pair(ChildOf, parent))` per parent (1000 × 5) | 885 / 821 ns | 1.97 / 1.58 µs | 580 / 516 ns | 2.23× / 1.92× | 0.66× / 0.63× |
+| | 2 inline queries per new caster | 2.32 / 2.24 µs | 10.7 / 9.50 µs | 4.67 / 4.25 µs | 4.61× / 4.24× | 2.01× / 1.90× |
+| | the same, memory per caster | 0 B | 3156 B | 376 B | — | — |
+| 7 | `world:each` over 100 000, per entity | 27.7 / 24.7 ns | 61.5 / 36.2 ns | 38.6 / 31.5 ns | 2.22× / 1.47× | 1.39× / 1.28× |
+| | `world:children`, 1000 children, per child | 28.1 / 25.0 ns | 57.3 / 32.6 ns | 39.3 / 32.5 ns | 2.04× / 1.30× | 1.40× / 1.30× |
+| 8 | 8 kinds in turn, 3 values, for-in, per match | 41.3 / 33.0 ns | 119 / 106 ns | 114 / 103 ns | 2.89× / 3.22× | 2.75× / 3.12× |
+| | the same, `each` | 41.9 / 33.3 ns | 90.8 / 78.1 ns | 63.1 / 47.1 ns | 2.17× / 2.35× | 1.51× / 1.41× |
+| | the same, `each`, the kind from a slot pool | 40.2 / 32.7 ns | 35.9 / 20.1 ns | 36.1 / 20.4 ns | 0.89× / 0.61× | 0.90× / 0.62× |
+| 9 | delete entities with 100 targets, per pair | 29.2 / 29.4 ns | 83.5 / 52.3 ns | 62.2 / 44.1 ns | 2.86× / 1.78× | 2.13× / 1.50× |
+| 10 | 8 components on 1 entity in 64 of 131 072, memory per entity | 170 B | 660 B | 660 B | 3.9× | 3.9× |
+| | the same, time per entity | 2.85 / 2.26 µs | 2.53 / 1.73 µs | 2.50 / 1.71 µs | 0.89× / 0.77× | 0.88× / 0.76× |
+
+1. `(*, T)` values. jecs reads the column of the first pair of `T` in each archetype; 0.2.1 read
+   the value through a generic iterator that looked at the pairs of `T` of every match. In
+   0.2.2 a wildcard whose values a query returns keeps a mirror: value pages with the value of
+   one pair of each entity (the lowest relation slot for `(*, T)`, the lowest target slot for
+   `(R, *)`), updated by every change of its pairs; the query reads it like the column of a
+   component. A mirror keeps about 17 B per member (a `(*, T)` mirror also notes the pair that
+   gives the value of a slot with several pairs of `T`): the world of this case with its query
+   takes 254 B per entity (0.2.1: 237 B, jecs: 314 B).
+2. `(R, *)` values: the same mirror (0.2.1: the generic iterator, a lookup of the pair of each
+   match); the world with its query takes 157 B per entity (0.2.1: 140 B, jecs: 311 B).
+3. The memory of cached queries. A query of an archetype ECS keeps a list of archetypes; a
+   cached query of mErCS over scattered matches keeps a list of its matches (the entity and its
+   index in the value page), which keeps its loops fast over scattered matches. 0.2.2
+   gives the arrays of the list their exact size (an array grown one match at a time kept up to
+   twice the room): 30 % less memory; the first list of a query is built from the spans that
+   the choice of its iteration mode found, without a second pass over the bitsets. A list of
+   words or of one number per match takes 2–30× less memory, but its loops are 20–250 % slower;
+   the speed was kept.
+4. Queries over two large terms after more than a few changes of a term: 0.2.1 passed over the
+   bitsets once more than 32 slots (or a quarter of the list) changed. 0.2.2 re-checks the
+   noted slots while that costs less than a pass, up to half of the words of the smallest
+   term, and drops at once a slot that an unchanged required term does not have.
+5. Twenty small queries that share a changing tag: every query re-checks the changes of the tag
+   (jecs moves the entity between archetypes once, at the change). In 0.2.2 the queries that
+   saw the same versions of a record read its changes from the journal once, and each drops the
+   slots that an unchanged required term does not have; a query whose smallest term has few
+   words tests those words against the changed bits of each word, gathered once for all the
+   queries, so that its cost does not grow with the number of changes.
+6. Inline queries built per call. 0.2.2 shares a query shape from its second request: the
+   first request gets a light state of its own and only marks the shape, so a query requested
+   once (an entity used as a term) keeps no shared state. A query that is not cached and whose
+   smallest term lies in at most 64 words gathers its matches in one loop over those words
+   before the loop of the caller, instead of a call of the span generator per match. The
+   queries with a pair of an entity target are shared by shape as well (0.2.1 built a new
+   state for them on every call) and go with the target; the queries of a new caster stay
+   slower, as their shape is new on every call.
+7. `world:each` and `world:children`: 0.2.1 collected all members into a list first; 0.2.2
+   walks the bitsets. The members of an id that lie in at most two words (64 slots) are still
+   collected: the state of a walk costs more than a list of a few members.
+8. Entities of several kinds created in turn: a kind lies in one slot of eight, so its values
+   sit in the hash parts of their pages and its queries keep match lists; jecs stores each kind
+   in an archetype of its own. A slot pool (`world:pool()`) keeps a kind dense and makes it
+   faster than jecs. Without a pool, `each` reads the list 30–40 % faster in 0.2.2 and the
+   for-in loop is where it was.
+9. Deleting entities with many pairs of one relation: every pair record clears its bit (jecs
+   removes the row of the entity from one archetype). 0.2.2 clears the pairs of a relation in
+   one inline loop.
+10. Sparse components in a large world: a component on one entity in 64 keeps, per entity, a
+    word of its bitset and a quarter of a value page of 256 slots, where jecs keeps a row of an
+    archetype. This is the cost of the page layout that `world:column` exposes; 0.2.2 does not
+    change it (adding the components is faster than in jecs).
+
+The other rows of the matrix, the synthetic frame and the long session are on par with 0.2.1
+(within the ±10 % of the runs). Three rows of the matrix gain: a query of a concrete pair
+written inline (15 matches of 1000: 3.06× → 0.71× / 2.40× → 0.68× of jecs; nothing matches:
+2.62× → 0.45× / 2.33× → 0.42×), and an entity used as a term in 4 inline queries and then
+deleted (4.78× → 2.53× / 5.38× → 2.56×).
+
+### Query monitors
+
+The group `query monitors` of `bench/run.luau` (`bench/monitors.luau`): jecs 0.11.0 with the
+monitors of its addon `modules/OB` against `query:monitor()` of mErCS 0.2.2, 10 000 entities,
+the median of 5 runs of the minimum of 3:
+
+| Case | jecs 0.11.0 + OB | mErCS 0.2.2 | 0.2.2 / jecs |
+|---|---|---|---|
+| a tag of the query added and removed, per cycle (an entry and an exit) | 658 / 602 ns | 739 / 509 ns | 1.12× / 0.85× |
+| members of the query deleted, per entity | 526 / 534 ns | 595 / 344 ns | 1.13× / 0.64× |
+| children moved to another parent, `(ChildOf, *)` monitored, per move | 517 / 449 ns | 649 / 427 ns | 1.26× / 0.95× |
+
+The monitor itself costs about what the monitor of the addon costs on top of the signals of
+the ids; in the interpreter the difference comes from the operations under it. Deleting an
+entity whose ids have `OnRemove` hooks or signals runs its hooks before any id goes, which
+jecs does in its loop over the columns: one hook adds about 170 ns per delete in the
+interpreter and 95 ns in native code (0.2.1: 225 ns and 160 ns; in jecs the hook costs
+nothing measurable). A delete runs the listener of one required id of a
+monitor, the others are quiet then. Moving an entity to another exclusive target costs
+1.2–1.9× the time of jecs without any monitor. In native code mErCS is faster than jecs in all
+three cases.
 
 ### Single operations
 
@@ -343,42 +549,42 @@ midpoint of the minimum and the maximum, not the mean.
 
 | File | What |
 |---|---|
-| `spawn.bench.luau` | 1000 entities with 4 components |
-| `insertion.bench.luau` | 8 components into 500 existing entities |
-| `despawn.bench.luau` | delete 1000 entities with 4 components and a tag |
-| `remove.bench.luau` | remove one of 5 components from 1000 entities |
-| `pairs.bench.luau` | 100 parents with 10 `ChildOf` children that also target a parent through a relation, then the parents are deleted |
 | `batch.bench.luau` | add and remove a tag on 1000 of 2000 entities: batch operations against a jecs collect-and-change loop |
+| `despawn.bench.luau` | delete 1000 entities with 4 components and a tag |
+| `insertion.bench.luau` | 8 components into 500 existing entities |
+| `pairs.bench.luau` | 100 parents with 10 `ChildOf` children that also target a parent through a relation, then the parents are deleted |
 | `query.bench.luau` | 10 passes of a 4-component query over 4096 entities: for-in, and `query:each` for mErCS |
-| `query_scattered.bench.luau` | a query case: a 4-component query over 50 000 entities scattered by churn |
 | `query_churn.bench.luau` | a query case: a tag of the query toggled on 1 or 100 entities before each pass |
-| `query_read4.bench.luau` | a query case: 4 values read per match (80 000 entities) |
-| `query_wildcard.bench.luau` | a query case: `(*, T)` with a pair toggled before each pass |
 | `query_empty.bench.luau` | a query case: 100 passes of a query that never matches |
-
-![Benchmarker: spawn](benchmarker-spawn.PNG)
-
-![Benchmarker: insertion](benchmarker-insertion.PNG)
-
-![Benchmarker: despawn](benchmarker-despawn.PNG)
-
-![Benchmarker: remove](benchmarker-remove.PNG)
-
-![Benchmarker: pairs](benchmarker-pairs.PNG)
+| `query_read4.bench.luau` | a query case: 4 values read per match (80 000 entities) |
+| `query_scattered.bench.luau` | a query case: a 4-component query over 50 000 entities scattered by churn |
+| `query_wildcard.bench.luau` | a query case: `(*, T)` with a pair toggled before each pass |
+| `remove.bench.luau` | remove one of 5 components from 1000 entities |
+| `spawn.bench.luau` | 1000 entities with 4 components |
 
 ![Benchmarker: batch](benchmarker-batch.PNG)
 
-![Benchmarker: query](benchmarker-query.PNG)
+![Benchmarker: despawn](benchmarker-despawn.PNG)
 
-![Benchmarker: query_scattered](benchmarker-query-scattered.PNG)
+![Benchmarker: insertion](benchmarker-insertion.PNG)
+
+![Benchmarker: pairs](benchmarker-pairs.PNG)
+
+![Benchmarker: query](benchmarker-query.PNG)
 
 ![Benchmarker: query_churn](benchmarker-query-churn.PNG)
 
+![Benchmarker: query_empty](benchmarker-query-empty.PNG)
+
 ![Benchmarker: query_read4](benchmarker-query-read4.PNG)
+
+![Benchmarker: query_scattered](benchmarker-query-scattered.PNG)
 
 ![Benchmarker: query_wildcard](benchmarker-query-wildcard.PNG)
 
-![Benchmarker: query_empty](benchmarker-query-empty.PNG)
+![Benchmarker: remove](benchmarker-remove.PNG)
+
+![Benchmarker: spawn](benchmarker-spawn.PNG)
 
 ### Where mErCS is still slower
 
@@ -414,6 +620,19 @@ every call; 0.2.0: 3.8× / 3.4×), and an entity used as a term in 4 inline quer
 deleted (3.9× / 5.5×: the shared states of its shapes are created and dropped; 0.2.0 kept them
 and used up the shared states).
 
+**0.2.2** (summed up in [When jecs is the better choice](#when-jecs-is-the-better-choice)): query
+monitors in the interpreter (1.1–1.3×, [Query monitors](#query-monitors); native code is
+faster than jecs); of
+[the strengths of jecs](#the-strengths-of-jecs), wildcards that return values, queries
+over large terms that change and inline queries with a pair are faster than in jecs, twenty
+small queries that share a changing tag are on par (1.1× / 0.9×), and the memory of the match
+lists is 30 % smaller. Still slower than jecs: inline queries with a new entity as a term
+(2.0–2.6×), `world:each` and `world:children`
+(1.3–1.4×), entities of eight kinds created in turn without a slot pool (the for-in loop
+2.8× / 3.1×, `each` 1.5× / 1.4×), deleting entities with many pairs of one relation
+(2.1× / 1.5×), cached queries over scattered entities (2.6× / 1.4×, and 46× the memory) and
+the memory of sparse components (3.9×).
+
 ## Migrating from jecs
 
 1. Point the jecs require at this module (`local jecs = require(path.to.mErCS)`) and
@@ -445,11 +664,14 @@ and used up the shared states).
    hottest loops); hooks that use `oldarchetype` read the entity with `world:get` /
    `world:has`.
 3. Remove most `:cached()` calls: shared queries are cached already (see
-   [Coming from jecs](../guide/README.md#coming-from-jecs)). A query with an entity as a term
-   (`query:with(caster)`) shares a state per entity, up to 1024 shapes per world: for lookups
+   [Coming from jecs](../guide/README.md#coming-from-jecs)). A query with an entity as a term,
+   directly or as the target of a pair (`query:with(caster)`, `query(A, pair(ChildOf, parent))`),
+   shares a state per entity, up to 1024 shapes per world: for lookups
    over many live entities, a pair and `world:each(ecs.pair(Event, caster))` need no query
-   state (see [Queries](../guide/README.md#queries)). Replace the observer addon with signals,
-   hooks or `world:track` with the `:added` / `:changed` / `:removed` filters.
+   state (see [Queries](../guide/README.md#queries)). Replace `OB.monitor(query)` of the addon
+   `modules/OB` with `query:monitor()`, and its observers with signals and a check of the
+   query ([Query monitors](../guide/README.md#query-monitors)) or with `world:track` and the
+   `:added` / `:changed` / `:removed` filters.
 4. Replace "collect the matches, then change them" loops with batch operations
    (`query:add_all`, `set_all`, `remove_all`, `delete_all`, `count`), and state flags stored
    as components with tags (`Disabled` hides entities from queries without removing

@@ -50,11 +50,14 @@ tools/previous.sh      the previous release from its git tag into tmp/previous, 
 test/core.luau         core semantics, run against jecs and this library
 test/lib.luau          library features, the model tests
 test/types.luau        typed API usage (must type-check)
-test/fuzz.luau         random operations against a model (flags: wide, hooks, sparse, pool, verify, churn)
+test/fuzz.luau         random operations against a model (flags: wide, hooks, sparse, pool, verify, churn, shapes, monitors)
 test/jabby.luau        the jabby adapter: what jabby reads from its jecs module and a world
-test/jecs_compat/      the jecs test suite run against this library (125/125 applicable)
+test/jecs_compat/      the jecs test suite run against this library (125/125 applicable), and the tests of its addon modules/OB against the query monitors (ob.luau, 42/42 monitor cases)
+test/monitors_fuzz.luau random queries and changes of the world against query monitors
+test/queries_fuzz.luau random queries and changes of the world against brute force
+test/loops_fuzz.luau   loops that change the world (no entity twice, untouched ones once)
 examples/basics.luau   a runnable tour of the API
-bench/run.luau         the benchmark matrix (harness.luau, scenarios.luau, shapes.luau, impls.luau, impl_defs.luau)
+bench/run.luau         the benchmark matrix (harness.luau, scenarios.luau, shapes.luau, strengths.luau, monitors.luau, impls.luau, impl_defs.luau)
 bench/query_cases.luau query cases where an archetype ECS is at its best: jecs for-in against query:each
 bench/frame.luau       a synthetic game frame (frame_scene.luau)
 bench/leak.luau        a long session with changing relationship targets (memory growth)
@@ -78,8 +81,30 @@ bash tools/test.sh --codegen   # native code
 ```
 
 `tools/test.sh` runs `test/core.luau`, `test/lib.luau`, `test/types.luau`, `test/fuzz.luau`,
-`test/jabby.luau`, `test/jecs_compat/tests.luau` and `examples/basics.luau`, and stops at the
-first failure with a non-zero exit code (a failed case of the test kit fails its file).
+`test/jabby.luau`, `test/jecs_compat/tests.luau`, `test/jecs_compat/ob.luau`,
+`test/monitors_fuzz.luau`, `test/queries_fuzz.luau`, `test/loops_fuzz.luau` and
+`examples/basics.luau`, and stops at the first failure with a non-zero exit code (a failed case
+of the test kit fails its file).
+
+`test/monitors_fuzz.luau` builds random queries (tags, components, pairs, relations with any
+target, an exclusive relation, `ChildOf`, `Disabled`, excluded ids and OR terms, sometimes a
+modifier of the query after its monitor; every third query has a dead id among its excluded
+ones, which keeps it from being shared, so that the modifier changes its state in place) and
+changes the world at random; after every change
+the members that each monitor reported must be the matches of its query (`query:has`). It takes
+a seed and a number of steps; without them it runs five seeds, two of which reproduced bugs
+of the first monitors (`luau test/monitors_fuzz.luau -a 42 5000`).
+
+`test/queries_fuzz.luau` checks queries against brute force over `world:has` / `world:get`:
+random shapes (returned ids, `with`, `without`, OR terms, pairs, `(R, *)`, `(*, T)`, an
+exclusive relation, `ChildOf`, `Disabled`, wildcard values), cached and inline, looped with
+for-in, `each`, `break` and nested loops, after bursts of few or many changes (match lists
+patched, filtered and built again), batch operations and deleted targets, over dense runs,
+scattered entities and a slot pool; the matches, their order, their values, `count` and `has`
+must agree (`luau test/queries_fuzz.luau -a 42 300 debug` with a debug world).
+`test/loops_fuzz.luau` changes the world inside loops (the current entity, others, new ones,
+nested loops): no entity may come twice, and the entities that matched at the start and that
+nothing touched must come once (`luau test/loops_fuzz.luau -a 42 1000`).
 
 `test/fuzz.luau` takes a seed, a number of rounds and flags: `wide` creates 300 ids first
 (records beyond the shared signature tables), `hooks` adds hooks that change the entity,
@@ -90,13 +115,19 @@ of a cached query against a scan of its bitsets and, when a query takes its list
 that none of its records changed, `churn` adds and removes pairs with 400 targets on an
 entity outside the model after every operation, so that the pair records left empty (those
 of the model too) are freed in batches between and inside the operations of the model, and
-`shapes` checks queries that have entities of the model as terms after every batch (a shared
-query shape per entity, dropped when the entity is deleted: a new shape of a live entity must
-be shared) and keeps some of them across the rounds, after their entity is deleted too:
+`shapes` checks queries that have entities of the model as terms, directly or as the target
+of a pair, after every batch (a shared query shape per entity, dropped when the entity is
+deleted: a new shape of a live entity must be shared) and keeps some of them across the
+rounds, after their entity is deleted too, and
+`monitors` gives the stored queries and a few more (an exclusive relation and `ChildOf` with
+any target, `Disabled` named) query monitors: the members they report (the matches when the
+monitor was made, plus the entries, less the exits) must be the matches of the model after
+every batch, an entity must not enter twice or leave without entering, and it must be alive
+when it leaves:
 
 ```sh
 luau test/fuzz.luau -a 42 400 wide hooks shapes
-luau test/fuzz.luau -a 7 400 sparse pool verify hooks wide churn shapes
+luau test/fuzz.luau -a 7 400 sparse pool verify hooks wide churn shapes monitors
 ```
 
 ## Checks
@@ -130,6 +161,23 @@ argument) into `tmp/previous`; without it the benchmarks compare jecs and the cu
 `bench/run.luau` arguments: `filter` (substrings of "group.name"), `impls` (`jecs`, `previous`,
 `lib`), `reps`, `n`. Time is the minimum over the runs divided by the operations; memory is the
 heap growth kept after the run and a full collection.
+
+The group `jecs strengths` (`bench/strengths.luau`) holds ten cases where jecs 0.11.0 was far
+ahead of mErCS 0.2.1 in time or in memory, the strengths of an archetype ECS: `(*, T)` and
+`(R, *)` wildcards that return values, the memory of cached queries over scattered entities,
+queries over two large terms after more than a few changes of a term, twenty small queries
+that share a tag toggled on thirty entities, inline queries built per call (a concrete pair
+per parent, two queries per new caster with the caster as a term), `world:each` and
+`world:children` over many entities, entities of eight kinds created in turn (with a slot pool
+too), deleting entities that have 100 targets of a relation, and the memory of sparse
+components in a large world. The results are in
+[the comparison](../jecs-comparison/README.md#the-strengths-of-jecs).
+
+The group `query monitors` (`bench/monitors.luau`) times the changes that a query monitor
+watches, against jecs 0.11.0 with its addon `modules/OB` (the `jecs_ob` alias of `.luaurc`;
+`Impl.monitor` in `bench/impl_defs.luau`): a tag of the query added and removed, members
+deleted, and children moved between parents under a monitor of `ChildOf` with any target. The
+releases without monitors show `n/a`.
 
 The groups `query cases` and `sparse world` (`bench/shapes.luau`) time one pass of a query with
 the changes a game makes before it: five cases where an archetype ECS is at its best (entity
@@ -230,7 +278,9 @@ mErCS.rbxm`.
 ## Generated code
 
 The specialized query iterators (0–8 returned values) are generated by `tools/generate.py`
-between the `-- @generated <name> begin` / `end` markers of `src/init.luau`:
+between the `-- @generated <name> begin` / `end` markers of `src/init.luau`: the direct for-in
+iterators and loops over bitset spans, the iterators and loops over the match list of a cached
+query, and the ones over the buffer of a small query that is not cached:
 
 ```sh
 python tools/generate.py && stylua src

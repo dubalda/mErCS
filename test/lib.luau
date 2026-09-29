@@ -8,7 +8,10 @@
     first read), slot pools, large worlds, cleanup without leftovers, signals, hooks of ids
     beyond the shared signature tables, cascades deeper than 100 levels, hooks and signals on
     builtin ids, pair records freed in batches, the shared query shapes of deleted entities,
-    and the iteration contexts that queries which are not cached reuse.
+    the iteration contexts that queries which are not cached reuse, the values of wildcard
+    pairs (their mirrors), world:each and world:children over large records, query shapes
+    shared from their second request, the buffered loops of small queries that are not cached,
+    match lists that skip the changes outside their unchanged terms, and query monitors.
 
     Run from the repository root:
         luau test/lib.luau
@@ -35,6 +38,17 @@ end
 -- The internal state of a query handle: white-box checks of shared shapes and match lists.
 local function internal(q: any): any
     return q.state
+end
+
+-- Whether a query shape is shared once it is requested again: a shape is shared from its second
+-- request, and a variant (with, without, any) from its second request after its base is shared.
+local function shared_shape(make: () -> any): boolean
+    for _ = 1, 3 do
+        if internal(make()).shared == true then
+            return true
+        end
+    end
+    return false
 end
 
 TEST("query:each", function()
@@ -204,7 +218,11 @@ TEST("changing a cached query after iterating it", function()
         end
         list[i] = e
     end
-    local q = world:query(pair(Likes, bob)):cached() -- a concrete pair: changed in place
+    -- an id that is not alive keeps the shape from being shared: :cached() keeps a state of its
+    -- own, which the modifiers change in place (it excludes nothing: no entity has the id)
+    local gone = world:entity()
+    world:delete(gone)
+    local q = world:query(pair(Likes, bob)):without(gone):cached()
     local function counts(times: number): string
         local seen: { string } = {}
         for i = 1, times do -- repeated iterations of an unchanged world use the match list
@@ -690,6 +708,40 @@ TEST("hooks that change the entity being deleted", function()
     end
     CHECK(q_calls == 2)
 
+    CASE("a hook that clears its own entity does not run the hooks again")
+    local Once = world:component()
+    local once_calls = 0
+    world:set(Once, ecs.OnRemove, function(entity: any)
+        once_calls += 1
+        world:clear(entity)
+    end)
+    local o = world:entity()
+    world:set(o, Once, 1)
+    world:set(o, A, 1)
+    world:delete(o)
+    CHECK(once_calls == 1 and not world:contains(o))
+
+    CASE("an entity that takes the slot inside a hook runs its own hooks")
+    local Reuse = world:component()
+    local reuse_calls: { any } = {}
+    local fresh: any = nil
+    world:set(Reuse, ecs.OnRemove, function(entity: any)
+        table.insert(reuse_calls, entity)
+        if fresh == nil then
+            fresh = false
+            world:delete(entity) -- the entity goes inside its own hook
+            local taker = world:entity() -- takes its slot
+            fresh = taker
+            world:set(taker, Reuse, 2)
+            world:delete(taker)
+        end
+    end)
+    local r = world:entity()
+    world:set(r, Reuse, 1)
+    world:delete(r)
+    CHECK(#reuse_calls == 2 and reuse_calls[1] == r and reuse_calls[2] == fresh)
+    CHECK(ecs.ECS_ID(fresh) == ecs.ECS_ID(r) and not world:contains(fresh))
+
     CASE("ids written into a parent by the hooks of its cascade do not stay in the world")
     local Mark = world:entity()
     local Counter = world:component()
@@ -819,6 +871,73 @@ TEST("relation and target cleanup", function()
     world:remove(z, pair(R2, ecs.Wildcard))
     CHECK(world:target(z, R2) == nil)
     CHECK(count(world:query(pair(ecs.Wildcard, t3))) == 0)
+
+    CASE("many targets of a relation on one entity, added and removed in any order, stay sorted")
+    local Holds = world:component()
+    local holder = world:entity()
+    local items: { any } = {}
+    for i = 1, 120 do
+        items[i] = world:entity()
+    end
+    local seed = 77
+    local function shuffled(): { any }
+        local list = table.clone(items)
+        for i = #list, 2, -1 do
+            seed = seed * 16807 % 2147483647
+            local j = seed % i + 1
+            list[i], list[j] = list[j], list[i]
+        end
+        return list
+    end
+    local held: { [any]: boolean } = {}
+    -- the targets by world:targets and world:target, the value of (Holds, *) (the lowest target)
+    -- and a query over the pairs, against the set of held items
+    local function sorted_ok(): boolean
+        local want: { any } = {}
+        for _, item in items do
+            if held[item] then
+                table.insert(want, item)
+            end
+        end
+        local i = 0
+        for t in world:targets(holder, Holds) do
+            i += 1
+            if t ~= want[i] or world:target(holder, Holds, i - 1) ~= t then
+                return false
+            end
+        end
+        if i ~= #want or world:target(holder, Holds, i) ~= nil then
+            return false
+        end
+        local lowest: any = nil
+        for _, value in world:query(pair(Holds, ecs.Wildcard)) do
+            lowest = value
+        end
+        return lowest == (if want[1] then world:get(holder, pair(Holds, want[1])) else nil)
+    end
+    for i, item in shuffled() do
+        world:set(holder, pair(Holds, item), i)
+        held[item] = true
+    end
+    CHECK(sorted_ok())
+    for i, item in shuffled() do
+        if i % 3 ~= 0 then
+            world:remove(holder, pair(Holds, item))
+            held[item] = nil
+        end
+    end
+    CHECK(sorted_ok())
+    for i, item in items do
+        if i % 2 == 0 and not held[item] then
+            world:set(holder, pair(Holds, item), -i)
+            held[item] = true
+        end
+    end
+    CHECK(sorted_ok())
+    world:delete(items[1])
+    held[items[1]] = nil
+    table.remove(items, 1)
+    CHECK(sorted_ok())
 end)
 
 TEST("no leftovers", function()
@@ -2647,6 +2766,36 @@ TEST("values on tag pairs, queries without terms", function()
     w:set(e, pair(R, T), nil) -- nil is no value
     CHECK(world:has(e, pair(R, T)))
 
+    CASE("a tag that stays added by a rejected value runs OnAdd, signals, monitors and tracking")
+    local Tag = world:entity()
+    local R2, T2 = world:entity(), world:entity()
+    local hook_calls, signal_calls, entered = 0, 0, 0
+    world:set(Tag, ecs.OnAdd, function(_: any, _: any, value: any)
+        if value == nil then
+            hook_calls += 1
+        end
+    end)
+    world:added(R2, function()
+        signal_calls += 1
+    end)
+    world:track(Tag)
+    local monitor = world:query(Tag):monitor()
+    monitor.added(function()
+        entered += 1
+    end)
+    local f = world:entity()
+    CHECK_EXPECT_ERR(function()
+        w:set(f, Tag, 5)
+    end)
+    CHECK_EXPECT_ERR(function()
+        w:set(f, pair(R2, T2), 5)
+    end)
+    world:tick()
+    CHECK(world:has(f, Tag) and world:has(f, pair(R2, T2)))
+    CHECK(hook_calls == 1 and signal_calls == 1 and entered == 1)
+    CHECK(count(world:query(Tag):added(Tag)) == 1)
+    monitor.disconnect()
+
     CASE("a query without terms matches nothing, has() included")
     local q = world:query()
     CHECK(count(q) == 0 and q:count() == 0 and not q:has(e))
@@ -2888,8 +3037,87 @@ TEST("shared query shapes of deleted entities", function()
         -- 0.2.0 kept a node and four child nodes per entity (+8 MB here) and the first 1024
         -- states, and shared no new shape after them
         CHECK(gc.kb() - before < 64)
-        CHECK(internal(world:query(world:component())).shared == true)
-        CHECK(internal(world:query(events[1]):without(events[2])).shared == true)
+        local fresh = world:component()
+        CHECK(shared_shape(function()
+            return world:query(fresh)
+        end))
+        CHECK(shared_shape(function()
+            return world:query(events[1]):without(events[2])
+        end))
+    end
+
+    CASE("queries with a pair are shared by shape, and go with the target of the pair")
+    do
+        local world = ecs.world()
+        local A, B = world:component(), world:component()
+        local R = world:entity()
+        local t = world:entity()
+        local e = world:entity()
+        world:set(e, A, 1)
+        world:add(e, pair(R, t))
+        CHECK(shared_shape(function()
+            return world:query(A, pair(R, t))
+        end))
+        CHECK(shared_shape(function()
+            return world:query(A):with(pair(R, t)):without(B)
+        end))
+        CHECK(shared_shape(function()
+            return world:query(A):with(pair(ecs.Wildcard, t))
+        end))
+        local kept = world:query(A, pair(R, t))
+        CHECK(internal(kept).shared == true and count(kept) == 1)
+        world:delete(t)
+        CHECK(count(kept) == 0)
+        -- a pair whose target is not alive matches nothing: not shared
+        CHECK(internal(world:query(A, pair(R, t))).shared ~= true)
+        CHECK(internal(world:query(A, pair(R, t))).shared ~= true)
+        -- an entity that takes the slot of the target has the same pairs: a new shape of them
+        local heir = world:entity()
+        CHECK(ecs.ECS_ID(heir) == ecs.ECS_ID(t))
+        world:add(e, pair(R, heir))
+        CHECK(shared_shape(function()
+            return world:query(A, pair(R, heir))
+        end))
+        CHECK(internal(world:query(A, pair(R, heir))) ~= internal(kept))
+        CHECK(count(kept) == 1) -- the kept query still reads the pair of the slot
+        -- the pair of a slot that no entity ever had
+        local never: any = 1000000
+        CHECK(internal(world:query(A, pair(R, never))).shared ~= true)
+        CHECK(internal(world:query(A, pair(R, never))).shared ~= true)
+    end
+
+    CASE("the shapes of pairs, and of their target as a term, leave no room taken")
+    do
+        local world = ecs.world()
+        local A, B = world:component(), world:component()
+        local R = world:entity()
+        CHECK(shared_shape(function() -- the one shared state that stays
+            return world:query(A)
+        end))
+        for _ = 1, 3000 do
+            local x = world:entity()
+            local holder = world:entity()
+            world:set(holder, A, 1)
+            world:add(holder, pair(R, x))
+            for _ = 1, 2 do
+                count(world:query(A, pair(R, x)))
+                count(world:query(A, x)) -- the target as a term under the same node
+                count(world:query(A):with(pair(R, x)):without(B)) -- a variant of a variant
+                count(world:query(A):any(pair(R, x), pair(ecs.Wildcard, x)))
+                count(world:query(A):without(pair(ecs.Wildcard, x)))
+            end
+            world:delete(x)
+            world:delete(holder)
+        end
+        local shared = 0
+        for _ = 1, MAX_SHAPES + 10 do
+            local e = world:entity()
+            world:query(A, pair(R, e)) -- the first request marks the shape
+            if internal(world:query(A, pair(R, e))).shared == true then
+                shared += 1
+            end
+        end
+        CHECK(shared == MAX_SHAPES - 1)
     end
 
     CASE("a kept query works after its entity is deleted and made alive again")
@@ -2900,6 +3128,9 @@ TEST("shared query shapes of deleted entities", function()
         local e = world:entity()
         world:set(e, A, 1)
         world:add(e, x)
+        CHECK(shared_shape(function()
+            return world:query(A):with(x)
+        end))
         local q = world:query(A):with(x)
         local kept = internal(q)
         CHECK(kept.shared == true and count(q) == 1)
@@ -2908,6 +3139,7 @@ TEST("shared query shapes of deleted entities", function()
         CHECK(internal(world:query(A):with(x)).shared ~= true) -- a dead id is not shared
         CHECK(world:entity(x) == x)
         world:add(e, x)
+        world:query(A):with(x) -- the first request of the shape of the entity made alive again
         local again = world:query(A):with(x)
         CHECK(internal(again).shared == true and internal(again) ~= kept)
         CHECK(count(again) == 1 and count(q) == 1)
@@ -2920,7 +3152,9 @@ TEST("shared query shapes of deleted entities", function()
     do
         local world = ecs.world()
         local A, B = world:component(), world:component()
-        CHECK(internal(world:query(A)).shared == true) -- the one shared state that stays
+        CHECK(shared_shape(function() -- the one shared state that stays
+            return world:query(A)
+        end))
         for _ = 1, 3000 do
             local x = world:entity()
             local kept = world:query(A):with(x)
@@ -2934,7 +3168,9 @@ TEST("shared query shapes of deleted entities", function()
         end
         local shared = 0
         for _ = 1, MAX_SHAPES + 10 do
-            if internal(world:query(world:entity())).shared == true then
+            local e = world:entity()
+            world:query(e) -- the first request marks the shape
+            if internal(world:query(e)).shared == true then
                 shared += 1
             end
         end
@@ -2946,7 +3182,11 @@ TEST("shared query shapes of deleted entities", function()
         local world = ecs.world()
         local A, B = world:component(), world:component()
         world:set(A, ecs.OnRemove, function(entity: any)
-            count(world:query(B):with(entity)) -- the entity is still alive in its hook
+            -- the entity is still alive in its hook; the shape of B is shared, its variant with the
+            -- entity too (requested again)
+            count(world:query(B):with(entity))
+            count(world:query(B):with(entity))
+            count(world:query(B):with(entity))
         end)
         for _ = 1, 3000 do
             local e = world:entity() -- not an id of anything: world:delete takes its short path
@@ -2959,7 +3199,9 @@ TEST("shared query shapes of deleted entities", function()
         world:delete(x)
         local shared = 0
         for _ = 1, MAX_SHAPES + 10 do
-            if internal(world:query(world:entity())).shared == true then
+            local e = world:entity()
+            world:query(e) -- the first request marks the shape
+            if internal(world:query(e)).shared == true then
                 shared += 1
             end
         end
@@ -2975,6 +3217,7 @@ TEST("shared query shapes of deleted entities", function()
         end
         local shared, matched = 0, 0
         for i = 1, MAX_SHAPES + 5 do
+            world:query(ids[i]) -- the first request marks the shape
             local q = world:query(ids[i])
             if internal(q).shared == true then
                 shared += 1
@@ -2984,7 +3227,9 @@ TEST("shared query shapes of deleted entities", function()
         CHECK(shared == MAX_SHAPES and matched == 0)
         -- the states of a deleted entity make room for new shapes
         world:delete(ids[1])
-        CHECK(internal(world:query(world:entity())).shared == true)
+        local fresh = world:entity()
+        world:query(fresh)
+        CHECK(internal(world:query(fresh)).shared == true)
     end
 end)
 
@@ -3005,14 +3250,17 @@ TEST("queries that are not cached reuse their iteration contexts", function()
             n2 += 1
         end
     end
-    -- a concrete pair: a new query state on every call
+    -- an id that is not alive keeps the shape from being shared: a new query state on every call
+    -- (it excludes nothing: no entity has the id)
+    local gone = world:entity()
+    world:delete(gone)
     local function q1(): any
-        return world:query(A):with(pair(R, T1))
+        return world:query(A):with(pair(R, T1)):without(gone)
     end
     local function q2(): any
-        return world:query(A):with(pair(R, T2))
+        return world:query(A):with(pair(R, T2)):without(gone)
     end
-    CHECK(internal(q1()).shared ~= true)
+    CHECK(internal(q1()).shared ~= true and internal(q1()).first_use == nil)
 
     CASE("values, loop after loop")
     local ok = true
@@ -3118,31 +3366,135 @@ TEST("a match list after many changes between loops", function()
         end
         return ok
     end
-    local q = world:query(A):with(states[1])
 
     CASE("a few changes patch the list")
     CHECK(check())
+    CHECK(check()) -- a shape is shared from its second request (a variant after its base)
+    local q = world:query(A):with(states[1])
+    CHECK(internal(q).shared == true)
     CHECK(check() and internal(q).mode == 2)
-    move(5, 1, 2) -- the list of q: 195
+    move(3, 1, 2) -- the list of q: 197
     count(q)
     CHECK(internal(q).mode == 2 and check())
 
     CASE("changes up to a quarter of the list patch it")
-    -- more changes than the journal of the tag holds (16): a pass over the bitsets, and the
-    -- journal grows for the next loops
+    -- more changes than the journal of the tag holds (4 at first): a pass over the bitsets, and
+    -- the journal grows for the next loops
     move(40, 2, 1)
     count(q)
-    CHECK(internal(q).mode == 0 and check()) -- the list is built again: 235
+    CHECK(internal(q).mode == 0 and check()) -- the list is built again: 237
     move(40, 1, 3)
     count(q)
-    CHECK(internal(q).mode == 2 and check()) -- patched: 195
+    CHECK(internal(q).mode == 2 and check()) -- patched: 197
 
     CASE("more than a quarter of the list: a pass over the bitsets, the list after fewer")
-    move(60, 1, 3) -- the journal holds them, but 60 > 195 // 4
+    move(60, 1, 3) -- the journal holds them, but 60 > 197 // 4 (and more than half of the words of the tag)
     count(q)
     CHECK(internal(q).mode == 0)
     count(q) -- no change since: the list is built again
     CHECK(internal(q).mode == 2 and check())
+end)
+
+TEST("small queries that share a large term changed many times between loops", function()
+    local world = ecs.world(true) -- checks every patched list against a scan of the bitsets
+    local Position = world:component() :: ecs.Component<number>
+    local Moving = world:entity()
+    local kinds: { any } = {}
+    for k = 1, 6 do
+        kinds[k] = world:entity()
+    end
+    local list: { any } = {}
+    local kind_of: { [any]: number } = {}
+    local page_firsts: { any } = {}
+    for i = 1, 3000 do
+        local e = world:entity()
+        world:set(e, Position, i)
+        if i % 2 == 0 then
+            world:add(e, Moving)
+        end
+        -- each kind has a few members in two words, one of them on the first slot of a page
+        local k = i // 400
+        if k >= 1 and k <= 6 and i % 400 < 40 and i % 4 == 0 then
+            world:add(e, kinds[k])
+            kind_of[e] = k
+        end
+        if ecs.ECS_ID(e) % 256 == 0 then
+            table.insert(page_firsts, e)
+            if k >= 1 and k <= 6 then
+                world:add(e, kinds[k])
+                kind_of[e] = k
+            end
+        end
+        list[i] = e
+    end
+    local queries: { any } = {}
+    for k = 1, 6 do
+        queries[k] = world:query(Position):with(Moving, kinds[k]):cached()
+    end
+    local function check(): boolean
+        for k, q in queries do
+            local want = 0
+            for _, e in list do
+                if kind_of[e] == k and world:has(e, Moving) then
+                    want += 1
+                end
+            end
+            local got = 0
+            for e in q do
+                if kind_of[e] ~= k or not world:has(e, Moving) then
+                    return false
+                end
+                got += 1
+            end
+            if got ~= want then
+                return false
+            end
+        end
+        return true
+    end
+    CHECK(check() and internal(queries[1]).mode == 2)
+    local seed = 5
+    local function rand(n: number): number
+        seed = seed * 16807 % 2147483647
+        return seed % n + 1
+    end
+    local function toggle(e: any)
+        if world:has(e, Moving) then
+            world:remove(e, Moving)
+        else
+            world:add(e, Moving)
+        end
+    end
+    local ok = true
+    for round = 1, 80 do
+        -- 9 to 30 changes of Moving between two loops (the journal holds them): members of
+        -- the kinds among them, the first slot of a page, a slot changed twice
+        for _ = 1, 8 + rand(22) do
+            local e = if rand(4) == 1 then list[(rand(6) * 400) + 4 * rand(10) - 4] else list[rand(#list)]
+            toggle(e)
+            if rand(8) == 1 then
+                toggle(page_firsts[rand(#page_firsts)])
+            end
+            if rand(10) == 1 then
+                toggle(e)
+            end
+        end
+        if round % 8 == 0 then
+            -- a member of a kind goes, another one comes: the small term changes too
+            local e = list[(rand(6) * 400) + 4 * rand(10) - 4]
+            local k = kind_of[e]
+            if k then
+                world:remove(e, kinds[k])
+                kind_of[e] = nil
+            else
+                k = rand(6)
+                world:add(e, kinds[k])
+                kind_of[e] = k
+            end
+        end
+        ok = ok and check()
+    end
+    CHECK(ok)
 end)
 
 TEST("a (*, T) record before its first read", function()
@@ -3198,6 +3550,1030 @@ TEST("a (*, T) record before its first read", function()
     end
     world:add(holder, pair(R2, X))
     CHECK(world:has(holder, pair(W, X)) and count(world:query(pair(W, X))) == 1)
+end)
+
+TEST("wildcard values: (R, *) and (*, T) read through their mirrors", function()
+    local W = ecs.Wildcard
+
+    -- the value a query returns for an entity (nil when it does not match), and whether get agrees
+    local function value_in(world: any, query: any, e: any, id: any): (any, boolean)
+        local found, value = false, nil
+        query:each(function(entity: any, v: any)
+            if entity == e then
+                found, value = true, v
+            end
+        end)
+        local through_for = nil
+        for entity, v in query do
+            if entity == e then
+                through_for = v
+            end
+        end
+        return value, (not found or world:get(e, id) == value) and through_for == value
+    end
+
+    CASE("(R, *): the value of the lowest target, kept up to date")
+    local world = ecs.world(true)
+    local Owns = world:component()
+    local t1, t2, t3 = world:entity(), world:entity(), world:entity()
+    local e = world:entity()
+    world:set(e, pair(Owns, t2), "b")
+    local q = world:query(pair(Owns, W)):cached()
+    local owns = pair(Owns, W)
+    local v, ok = value_in(world, q, e, owns)
+    CHECK(v == "b" and ok)
+    world:set(e, pair(Owns, t1), "a") -- a lower target comes first
+    v, ok = value_in(world, q, e, owns)
+    CHECK(v == "a" and ok)
+    world:set(e, pair(Owns, t1), "A") -- the value of the first pair changes in place
+    v, ok = value_in(world, q, e, owns)
+    CHECK(v == "A" and ok)
+    world:set(e, pair(Owns, t2), "B") -- not the first pair
+    v, ok = value_in(world, q, e, owns)
+    CHECK(v == "A" and ok)
+    world:remove(e, pair(Owns, t1))
+    v, ok = value_in(world, q, e, owns)
+    CHECK(v == "B" and ok)
+    world:add(e, pair(Owns, t3)) -- a higher target without a value
+    world:remove(e, pair(Owns, t2))
+    v, ok = value_in(world, q, e, owns)
+    CHECK(v == nil and ok and q:has(e))
+    world:set(e, pair(Owns, t3), "c")
+    v, ok = value_in(world, q, e, owns)
+    CHECK(v == "c" and ok)
+    world:delete(t3)
+    CHECK(not q:has(e) and world:get(e, owns) == nil)
+
+    CASE("(*, T): the value of the lowest relation")
+    world = ecs.world(true)
+    -- the relations in the order of their slots (world:component() would take ids 1..256)
+    local Early = world:entity() -- a tag relation with a lower slot than the data relations
+    -- data relations: A has the lower slot
+    local A: ecs.Component<number>, B: ecs.Component<number> = world:entity() :: any, world:entity() :: any
+    world:add(A, ecs.Component)
+    world:add(B, ecs.Component)
+    local Late = world:entity() -- a tag relation with a higher slot
+    local T = world:entity()
+    e = world:entity()
+    local target = pair(W, T)
+    world:set(e, pair(B, T), 2)
+    q = world:query(target):cached()
+    v, ok = value_in(world, q, e, target)
+    CHECK(v == 2 and ok)
+    world:set(e, pair(A, T), 1)
+    v, ok = value_in(world, q, e, target)
+    CHECK(v == 1 and ok)
+    world:set(e, pair(B, T), 20) -- not the first pair
+    world:set(e, pair(A, T), 10) -- the first pair
+    v, ok = value_in(world, q, e, target)
+    CHECK(v == 10 and ok)
+    world:add(e, pair(Late, T))
+    v, ok = value_in(world, q, e, target)
+    CHECK(v == 10 and ok)
+    world:remove(e, pair(A, T))
+    v, ok = value_in(world, q, e, target)
+    CHECK(v == 20 and ok)
+    world:add(e, pair(Early, T)) -- a tag pair comes first: no value
+    v, ok = value_in(world, q, e, target)
+    CHECK(v == nil and ok and q:has(e))
+    world:remove(e, pair(Early, T))
+    v, ok = value_in(world, q, e, target)
+    CHECK(v == 20 and ok)
+    world:delete(B) -- the relation goes with its pairs
+    v, ok = value_in(world, q, e, target)
+    CHECK(v == nil and ok and q:has(e)) -- (Late, T) is left
+
+    CASE("(*, T): a slot back to one pair, and to none")
+    world = ecs.world(true)
+    -- three data relations in the order of their slots
+    local R1: ecs.Component<number>, R2: ecs.Component<number>, R3: ecs.Component<number> =
+        world:entity() :: any, world:entity() :: any, world:entity() :: any
+    for _, relation in { R1, R2, R3 } do
+        world:add(relation, ecs.Component)
+    end
+    T = world:entity()
+    target = pair(W, T)
+    e = world:entity()
+    world:set(e, pair(R1, T), 1)
+    world:set(e, pair(R3, T), 3)
+    q = world:query(target):cached()
+    v, ok = value_in(world, q, e, target)
+    CHECK(v == 1 and ok)
+    world:remove(e, pair(R3, T)) -- not the pair that gives the value
+    world:set(e, pair(R1, T), 10) -- the only pair now
+    v, ok = value_in(world, q, e, target)
+    CHECK(v == 10 and ok)
+    world:set(e, pair(R3, T), 30)
+    world:remove(e, pair(R1, T)) -- the pair that gives the value
+    v, ok = value_in(world, q, e, target)
+    CHECK(v == 30 and ok)
+    world:set(e, pair(R2, T), 20) -- a lower relation than the one left
+    v, ok = value_in(world, q, e, target)
+    CHECK(v == 20 and ok)
+    world:remove(e, pair(R2, T))
+    world:remove(e, pair(R3, T))
+    CHECK(not q:has(e) and world:get(e, target) == nil)
+    world:set(e, pair(R3, T), 300)
+    v, ok = value_in(world, q, e, target)
+    CHECK(v == 300 and ok)
+
+    CASE("get before any query reads the same pair")
+    world = ecs.world()
+    A, B = world:component() :: any, world:component() :: any
+    T = world:entity()
+    e = world:entity()
+    world:set(e, pair(B, T), "b")
+    world:set(e, pair(A, T), "a")
+    CHECK(world:get(e, pair(W, T)) == "a")
+    world:remove(e, pair(A, T))
+    CHECK(world:get(e, pair(W, T)) == "b")
+
+    CASE("clear, delete and remove_all leave no values in the mirrors")
+    world = ecs.world(true)
+    Owns = world:component()
+    local R = world:component()
+    t1, t2 = world:entity(), world:entity()
+    local a, b, c = world:entity(), world:entity(), world:entity()
+    for _, x in { a, b, c } do
+        world:set(x, pair(Owns, t1), x)
+        world:set(x, pair(R, t2), x)
+    end
+    local by_relation = world:query(pair(Owns, W)):cached()
+    local by_target = world:query(pair(W, t2)):cached()
+    CHECK(count(by_relation) == 3 and count(by_target) == 3)
+    world:clear(a)
+    world:delete(b)
+    CHECK(count(by_relation) == 1 and count(by_target) == 1)
+    CHECK(world:get(c, pair(Owns, W)) == c and world:get(c, pair(W, t2)) == c)
+    local fresh = world:entity() -- may reuse the slot of b: nothing of b is left
+    CHECK(world:get(fresh, pair(Owns, W)) == nil and world:get(fresh, pair(W, t2)) == nil)
+    world:set(fresh, pair(Owns, t1), "fresh")
+    local seen = {}
+    by_relation:each(function(x: any, value: any)
+        seen[x] = value
+    end)
+    CHECK(seen[fresh] == "fresh" and seen[c] == c)
+    world:remove_all(pair(R, t2))
+    CHECK(count(by_target) == 0 and world:get(c, pair(W, t2)) == nil)
+
+    CASE("a mirror goes with the last pair that holds values, and comes back")
+    world = ecs.world(true)
+    Owns = world:component()
+    e = world:entity()
+    local targets = {}
+    for i = 1, 3 do
+        targets[i] = world:entity()
+        world:set(e, pair(Owns, targets[i]), i)
+    end
+    q = world:query(pair(Owns, W)):cached()
+    CHECK(world:get(e, pair(Owns, W)) == 1 and count(q) == 1)
+    for _, t in targets do
+        world:delete(t) -- the pair records go with their targets
+    end
+    CHECK(count(q) == 0 and world:get(e, pair(Owns, W)) == nil)
+    local t = world:entity()
+    world:set(e, pair(Owns, t), "again")
+    v, ok = value_in(world, q, e, pair(Owns, W))
+    CHECK(v == "again" and ok)
+
+    CASE("match lists with mirrored values follow changes")
+    world = ecs.world(true) -- checks every patched list against its bitsets
+    local Health = world:component()
+    local Damage = world:component()
+    local Mark = world:entity()
+    local hit = {}
+    for i = 1, 4 do
+        hit[i] = world:entity()
+    end
+    local list = {}
+    local model: { [any]: { [number]: number } } = {}
+    for i = 1, 3000 do
+        local x = world:entity()
+        world:set(x, Health, i)
+        if i % 7 == 0 then
+            world:add(x, Mark)
+            local targets_of = {}
+            world:set(x, pair(Damage, hit[i % 4 + 1]), i)
+            targets_of[i % 4 + 1] = i
+            model[x] = targets_of
+            table.insert(list, x)
+        end
+        for _ = 1, 20 do
+            world:entity() -- spread the entities over many pages
+        end
+    end
+    local damaged = world:query(Health, pair(Damage, W)):with(Mark):cached()
+    local seed = 5
+    local function random(n: number): number
+        seed = seed * 16807 % 2147483647
+        return seed % n + 1
+    end
+    local all_ok = true
+    for _ = 1, 60 do
+        for _ = 1, 6 do
+            local x = list[random(#list)]
+            local k = random(4)
+            local targets_of = model[x]
+            if targets_of[k] and random(2) == 1 then
+                world:remove(x, pair(Damage, hit[k]))
+                targets_of[k] = nil
+            else
+                local value = random(1000)
+                world:set(x, pair(Damage, hit[k]), value)
+                targets_of[k] = value
+            end
+        end
+        local expected = {}
+        for x, targets_of in model do
+            for k = 1, 4 do -- the targets were created in this order: the lowest slot first
+                if targets_of[k] then
+                    expected[x] = targets_of[k]
+                    break
+                end
+            end
+        end
+        local visited = 0
+        damaged:each(function(x: any, _: any, value: any)
+            visited += 1
+            all_ok = all_ok and expected[x] == value
+        end)
+        local expected_count = 0
+        for _ in expected do
+            expected_count += 1
+        end
+        all_ok = all_ok and visited == expected_count
+    end
+    CHECK(all_ok)
+end)
+
+TEST("match lists that skip the changes outside their smallest term", function()
+    CASE("a new value page of a returned component is seen")
+    -- a debug world checks the page references of every patched list, too
+    local world = ecs.world(true)
+    local A = world:component()
+    local Rare, Common = world:entity(), world:entity()
+    for _ = 1, 600 do -- A and Common on many entities: Rare is the smallest term
+        local x = world:entity()
+        world:set(x, A, 0)
+        world:add(x, Common)
+    end
+    for _ = 1, 600 do
+        world:entity() -- the next entities start a page where A has no values
+    end
+    local others = {}
+    for i = 1, 40 do
+        others[i] = world:entity()
+    end
+    local e = world:entity() -- not the first slot of its page
+    world:add(e, Rare)
+    world:add(e, Common)
+    world:add(e, A) -- A without a value: no value page yet
+    local q = world:query(A):with(Rare, Common):cached()
+    local function value_of_e(): any
+        local found = "missing"
+        q:each(function(entity: any, a: any)
+            if entity == e then
+                found = a
+            end
+        end)
+        return found
+    end
+    CHECK(value_of_e() == nil)
+    world:add(others[1], Common) -- a change outside Rare: the list is patched and up to date
+    CHECK(value_of_e() == nil)
+    world:add(others[2], Common)
+    world:set(e, A, 42) -- the first value of the page: a new page, noted at its first slot
+    CHECK(value_of_e() == 42)
+    local through_for = nil
+    for entity, a in q do
+        if entity == e then
+            through_for = a
+        end
+    end
+    CHECK(through_for == 42)
+
+    CASE("changes outside the smallest term leave the list as it is")
+    world = ecs.world(true)
+    local Moving = world:entity()
+    local Kind = world:entity()
+    local Position = world:component()
+    local list = {}
+    local members = {}
+    for i = 1, 3000 do
+        local x = world:entity()
+        world:set(x, Position, i)
+        world:add(x, Moving)
+        if i % 300 == 0 then
+            world:add(x, Kind)
+            members[x] = true
+        end
+        list[i] = x
+    end
+    q = world:query(Position):with(Moving, Kind):cached()
+    local seed = 3
+    local all_ok = true
+    for _ = 1, 30 do
+        for _ = 1, 20 do
+            seed = seed * 16807 % 2147483647
+            local x = list[seed % #list + 1]
+            if world:has(x, Moving) then
+                world:remove(x, Moving)
+            else
+                world:add(x, Moving)
+            end
+        end
+        local seen = 0
+        q:each(function(x: any)
+            seen += 1
+            all_ok = all_ok and members[x] == true and world:has(x, Moving)
+        end)
+        local want = 0
+        for x in members do
+            if world:has(x, Moving) then
+                want += 1
+            end
+        end
+        all_ok = all_ok and seen == want
+    end
+    CHECK(all_ok)
+end)
+
+TEST("world:each and world:children walk the bitsets of large records", function()
+    local world = ecs.world()
+    local Tag = world:entity()
+    local list: { any } = {}
+    for i = 1, 500 do
+        local e = world:entity()
+        if i % 3 ~= 0 then -- words that are full and words that are not
+            world:add(e, Tag)
+            table.insert(list, e)
+        end
+    end
+
+    CASE("every member once, in ascending order")
+    local seen: { any } = {}
+    for e in world:each(Tag) do
+        table.insert(seen, e)
+    end
+    local ordered = #seen == #list
+    for i, e in seen do
+        ordered = ordered and e == list[i]
+    end
+    CHECK(ordered)
+
+    CASE("members that leave or are deleted ahead of the loop are skipped")
+    local skipped = { [list[10]] = true, [list[40]] = true, [list[300]] = true }
+    local visited = 0
+    local wrong = false
+    for e in world:each(Tag) do
+        visited += 1
+        if skipped[e] then
+            wrong = true
+        end
+        if e == list[5] then
+            world:remove(list[10], Tag) -- the same word
+            world:delete(list[40]) -- a later word
+            world:remove(list[300], Tag)
+        end
+    end
+    CHECK(not wrong and visited == #list - 3)
+
+    CASE("the current entity may be deleted, entities created in the loop are not visited")
+    local count_before = 0
+    for _ in world:each(Tag) do
+        count_before += 1
+    end
+    visited = 0
+    for e in world:each(Tag) do
+        visited += 1
+        world:delete(e)
+        world:add(world:entity(), Tag) -- new entities with the tag: the loop still ends
+    end
+    CHECK(visited == count_before and count(world:each(Tag)) == count_before)
+
+    CASE("the children of a parent with many children")
+    local parent = world:entity()
+    local children: { [any]: boolean } = {}
+    for _ = 1, 200 do
+        local child = world:entity()
+        world:add(child, pair(ecs.ChildOf, parent))
+        children[child] = true
+    end
+    local n, ok = 0, true
+    for child in world:children(parent) do
+        n += 1
+        ok = ok and children[child] == true
+    end
+    CHECK(ok and n == 200)
+    -- deleting the children in the loop (each child is visited once)
+    n = 0
+    for child in world:children(parent) do
+        n += 1
+        world:delete(child)
+    end
+    CHECK(n == 200 and count(world:children(parent)) == 0)
+
+    CASE("the id deleted inside its own loop: its members are not returned after that")
+    local Gone = world:entity()
+    for _ = 1, 3000 do
+        world:add(world:entity(), Gone)
+    end
+    local after = 0
+    local started = false
+    for _ in world:each(Gone) do
+        if started then
+            after += 1
+        else
+            started = true
+            world:delete(Gone) -- every member loses the id
+        end
+    end
+    CHECK(started and after == 0)
+
+    CASE("a (*, T) record read the first time by world:each")
+    local T = world:entity()
+    local R1, R2 = world:entity(), world:entity()
+    for i = 1, 150 do
+        local e = world:entity()
+        world:add(e, pair(if i % 2 == 0 then R1 else R2, T))
+    end
+    CHECK(count(world:each(pair(ecs.Wildcard, T))) == 150)
+
+    CASE("two members far apart come in ascending order (the words of a small record)")
+    local far: { any } = {}
+    for i = 1, 20000 do
+        far[i] = world:entity()
+    end
+    local ascending = true
+    for a = 1, 30 do
+        for gap = 1, 12 do
+            local Mark = world:entity()
+            local low, high = far[a * 37], far[a * 37 + gap * 1500]
+            world:add(high, Mark) -- the later slot first
+            world:add(low, Mark)
+            local order: { any } = {}
+            for e in world:each(Mark) do
+                table.insert(order, e)
+            end
+            ascending = ascending and #order == 2 and order[1] == low and order[2] == high
+        end
+    end
+    CHECK(ascending)
+end)
+
+TEST("query shapes are shared from their second request", function()
+    local world = ecs.world()
+    local A, B, C = world:component(), world:component(), world:component()
+    for i = 1, 100 do
+        local e = world:entity()
+        world:set(e, A, i)
+        if i % 2 == 0 then
+            world:set(e, B, i)
+        end
+    end
+
+    CASE("the first request is a query of its own, the second one shares its state")
+    local first = world:query(A, C)
+    CHECK(internal(first).shared ~= true)
+    local second = world:query(A, C)
+    CHECK(internal(second).shared == true and internal(world:query(A, C)) == internal(second))
+
+    CASE("a query kept and iterated again becomes the shared state of its shape")
+    local kept = world:query(B)
+    CHECK(internal(kept).shared ~= true)
+    CHECK(count(kept) == 50)
+    CHECK(count(kept) == 50) -- the second loop: kept by the caller
+    CHECK(internal(kept).shared == true and internal(world:query(B)) == internal(kept))
+
+    CASE(":cached() on a first request shares it")
+    local D = world:component()
+    local cached = world:query(D):cached()
+    CHECK(internal(cached).shared == true and internal(world:query(D)) == internal(cached))
+
+    CASE("a modifier shares the base: identical queries with a modifier share one state")
+    local E = world:component()
+    local states: { any } = {}
+    for i = 1, 5 do
+        states[i] = internal(world:query(E):with(A):cached())
+    end
+    local same = states[1].shared == true
+    for i = 2, 5 do
+        same = same and states[i] == states[1]
+    end
+    CHECK(same)
+
+    CASE("a query requested once keeps nothing after its entity is deleted")
+    local x = world:entity()
+    world:set(world:entity(), A, 0)
+    CHECK(count(world:query(A):with(x)) == 0) -- the first request marks the shape
+    world:delete(x)
+    CHECK(count(world:query(A):with(x)) == 0) -- a dead id: not shared
+    CHECK(internal(world:query(A):with(x)).shared ~= true)
+end)
+
+TEST("queries that are not cached gather small results first", function()
+    local world = ecs.world()
+    local A, B = world:component(), world:component()
+    local Link, Other = world:entity(), world:entity()
+    local link = pair(Link, Other)
+    local marked: { [any]: number } = {}
+    for i = 1, 3000 do
+        local e = world:entity()
+        world:set(e, A, i)
+        world:set(e, B, -i)
+        if i % 37 == 0 then
+            world:add(e, link)
+            marked[e] = i
+        end
+    end
+    local n_marked = 0
+    for _ in marked do
+        n_marked += 1
+    end
+
+    CASE("for-in and each return every match with its values")
+    local ok, n = true, 0
+    for e, a: any, b: any in world:query(A, B, link) do
+        n += 1
+        ok = ok and marked[e] == a and b == -a
+    end
+    CHECK(ok and n == n_marked)
+    n = 0
+    world:query(A, B, link):each(function(e: any, a: any, b: any)
+        n += 1
+        ok = ok and marked[e] == a and b == -a
+    end)
+    CHECK(ok and n == n_marked)
+
+    CASE("nested loops over queries that are not cached")
+    local pairs_seen = 0
+    for _ in world:query(A, link) do
+        for _ in world:query(B, link) do
+            pairs_seen += 1
+        end
+    end
+    CHECK(pairs_seen == n_marked * n_marked)
+
+    CASE("a loop left early, then a new one")
+    for _ in world:query(A, link) do
+        break
+    end
+    CHECK(count(world:query(A, link)) == n_marked)
+
+    CASE("an error in a callback, then a new loop")
+    local failed = not pcall(function()
+        world:query(A, link):each(function()
+            error("stop")
+        end)
+    end)
+    CHECK(failed and count(world:query(A, link)) == n_marked)
+
+    CASE("the entity of the loop deleted, and one ahead of it")
+    local deleted = 0
+    for e in world:query(A, link) do
+        if world:contains(e) then
+            world:delete(e)
+            deleted += 1
+        end
+    end
+    CHECK(deleted == n_marked and count(world:query(A, link)) == 0)
+end)
+
+TEST("queries that share a changing tag re-check its changes", function()
+    local world = ecs.world(true) -- checks every patched list against a scan of the bitsets
+    local Moving = world:entity()
+    local Position = world:component()
+    local kinds: { any } = {}
+    for k = 1, 6 do
+        kinds[k] = world:entity()
+    end
+    local list: { any } = {}
+    local kind_of: { [any]: number } = {}
+    for i = 1, 6000 do
+        local e = world:entity()
+        world:set(e, Position, i)
+        world:add(e, Moving)
+        if i % 100 == 0 then
+            local k = (i // 100) % 6 + 1
+            world:add(e, kinds[k])
+            kind_of[e] = k
+        end
+        list[i] = e
+    end
+    local queries: { any } = {}
+    for k = 1, 6 do
+        queries[k] = world:query(Position):with(Moving, kinds[k]):cached()
+    end
+    local seed = 17
+    local function random(n: number): number
+        seed = seed * 16807 % 2147483647
+        return seed % n + 1
+    end
+
+    CASE("few and many changes of a large term between the loops")
+    local all_ok = true
+    for frame = 1, 40 do
+        -- a few changes, and many (more than the list sizes, fewer than the words of the terms)
+        for _ = 1, if frame % 4 == 0 then 120 else 10 do
+            local e = list[random(#list)]
+            if world:has(e, Moving) then
+                world:remove(e, Moving)
+            else
+                world:add(e, Moving)
+            end
+        end
+        for k, q in queries do
+            local want: { [any]: boolean } = {}
+            for e, kind in kind_of do
+                if kind == k and world:has(e, Moving) then
+                    want[e] = true
+                end
+            end
+            all_ok = all_ok and same_matches(q, want)
+        end
+    end
+    CHECK(all_ok)
+    -- many changes of a large term patch small lists instead of passing over the bitsets
+    CHECK(internal(queries[1]).mode == 2)
+end)
+
+-- The monitor of a query and a function that returns its events since the previous call:
+-- "+name" for an entity that started matching, "-name" for one that stopped.
+local function monitored(q: any, names: { [any]: string }): (any, () -> string)
+    local log: { string } = {}
+    local monitor = q:monitor()
+    monitor.added(function(e: any)
+        table.insert(log, "+" .. (names[e] or "?"))
+    end)
+    monitor.removed(function(e: any)
+        table.insert(log, "-" .. (names[e] or "?"))
+    end)
+    return monitor,
+        function(): string
+            local text = table.concat(log, " ")
+            table.clear(log)
+            return text
+        end
+end
+
+TEST("query monitors", function()
+    CASE("an entity enters and leaves with the ids of the query")
+    local world = ecs.world()
+    -- the cases give A and B new components: plain ids for the type checker
+    local A: any, B: any = world:component(), world:component()
+    local e = world:entity()
+    local _, take = monitored(world:query(A):with(B), { [e] = "e" })
+    world:set(e, A, 1)
+    CHECK(take() == "")
+    world:set(e, B, 2)
+    CHECK(take() == "+e")
+    world:set(e, A, 3) -- a value changes: nothing
+    world:add(e, B)
+    CHECK(take() == "")
+    world:remove(e, B)
+    CHECK(take() == "-e")
+    world:remove(e, B)
+    CHECK(take() == "")
+    world:set(e, B, 4)
+    CHECK(take() == "+e")
+
+    CASE("added runs after the add, removed before the removal: the values can be read")
+    local seen_added, seen_removed = nil, nil
+    local reader = world:query(A):with(B):monitor()
+    reader.added(function(x: any)
+        seen_added = world:get(x, B)
+    end)
+    reader.removed(function(x: any)
+        seen_removed = world:get(x, A)
+    end)
+    local f = world:entity()
+    world:set(f, A, 7)
+    world:set(f, B, 8)
+    world:remove(f, A)
+    CHECK(seen_added == 8 and seen_removed == 7)
+    reader.disconnect()
+
+    CASE("excluded ids and Disabled")
+    world = ecs.world()
+    A, B = world:component(), world:component()
+    local Frozen = world:entity()
+    e = world:entity()
+    world:set(e, A, 1)
+    local frozen_in_added: boolean? = nil
+    local monitor, take2 = monitored(world:query(A):without(Frozen), { [e] = "e" })
+    CHECK(take2() == "") -- the matches when the monitor is made are members already
+    world:add(e, Frozen)
+    CHECK(take2() == "-e")
+    monitor.added(function(x: any)
+        frozen_in_added = world:has(x, Frozen)
+    end)
+    world:remove(e, Frozen)
+    CHECK(frozen_in_added == true) -- before the removal of the excluded id completes
+    monitor.disconnect()
+    local _, take3 = monitored(world:query(A):without(Frozen), { [e] = "e" })
+    world:add(e, ecs.Disabled)
+    CHECK(take3() == "-e")
+    world:remove(e, ecs.Disabled)
+    CHECK(take3() == "+e")
+    local _, take4 = monitored(world:query(A):with(ecs.Disabled), { [e] = "e" })
+    world:add(e, ecs.Disabled)
+    CHECK(take4() == "+e" and take3() == "-e")
+
+    CASE("OR terms")
+    world = ecs.world()
+    A = world:component()
+    local T1, T2 = world:entity(), world:entity()
+    e = world:entity()
+    world:set(e, A, 1)
+    local _, take5 = monitored(world:query(A):any(T1, T2), { [e] = "e" })
+    world:add(e, T1)
+    CHECK(take5() == "+e")
+    world:add(e, T2)
+    world:remove(e, T1)
+    CHECK(take5() == "")
+    world:remove(e, T2)
+    CHECK(take5() == "-e")
+
+    CASE("pairs with a target and with any target")
+    world = ecs.world()
+    A = world:component()
+    local Likes = world:entity()
+    local t1, t2 = world:entity(), world:entity()
+    e = world:entity()
+    world:set(e, A, 1)
+    local _, take_pair = monitored(world:query(A):with(pair(Likes, t1)), { [e] = "e" })
+    local _, take_any = monitored(world:query(A):with(pair(Likes, ecs.Wildcard)), { [e] = "e" })
+    world:add(e, pair(Likes, t2))
+    CHECK(take_pair() == "" and take_any() == "+e")
+    world:add(e, pair(Likes, t1))
+    CHECK(take_pair() == "+e" and take_any() == "")
+    world:remove(e, pair(Likes, t2))
+    CHECK(take_pair() == "" and take_any() == "")
+    world:add(e, pair(Likes, t2))
+    world:remove(e, pair(Likes, ecs.Wildcard))
+    CHECK(take_pair() == "-e" and take_any() == "-e")
+    world:add(e, Likes) -- the relation as a tag: no pair
+    CHECK(take_pair() == "" and take_any() == "")
+
+    CASE("an exclusive relation that replaces a pair")
+    world = ecs.world()
+    A = world:component()
+    local p1, p2 = world:entity(), world:entity()
+    local c = world:entity()
+    world:set(c, A, 1)
+    local names = { [c] = "c" }
+    local _, any_parent = monitored(world:query(A):with(pair(ecs.ChildOf, ecs.Wildcard)), names)
+    local _, of_p1 = monitored(world:query(A):with(pair(ecs.ChildOf, p1)), names)
+    local _, of_p2 = monitored(world:query(A):with(pair(ecs.ChildOf, p2)), names)
+    local _, orphan = monitored(world:query(A):without(pair(ecs.ChildOf, ecs.Wildcard)), names)
+    world:add(c, pair(ecs.ChildOf, p1))
+    CHECK(any_parent() == "+c" and of_p1() == "+c" and of_p2() == "" and orphan() == "-c")
+    local has_new_parent: boolean? = nil
+    local timing = world:query(A):with(pair(ecs.ChildOf, ecs.Wildcard)):without(pair(ecs.ChildOf, p1)):monitor()
+    timing.added(function(entity: any)
+        has_new_parent = world:has(entity, pair(ecs.ChildOf, p2)) -- the entry comes with the add
+    end)
+    world:add(c, pair(ecs.ChildOf, p2))
+    timing.disconnect()
+    CHECK(has_new_parent == true)
+    CHECK(any_parent() == "" and of_p1() == "-c" and of_p2() == "+c" and orphan() == "")
+    world:remove(c, pair(ecs.ChildOf, p2))
+    CHECK(any_parent() == "-c" and of_p2() == "-c" and orphan() == "+c")
+
+    CASE("an exclusive replacement whose new pair is not added")
+    local p3 = world:entity()
+    world:add(c, pair(ecs.ChildOf, p1))
+    CHECK(any_parent() == "+c" and of_p1() == "+c" and orphan() == "-c")
+    local disconnect = world:removed(ecs.ChildOf, function(_: any, id: any)
+        if id == pair(ecs.ChildOf, p1) then
+            world:delete(p3) -- the new target goes while the old pair is removed
+        end
+    end)
+    world:add(c, pair(ecs.ChildOf, p3))
+    disconnect()
+    CHECK(not world:has(c, pair(ecs.ChildOf, ecs.Wildcard)))
+    CHECK(any_parent() == "-c" and orphan() == "+c")
+
+    CASE("clear and delete leave once, and never enter")
+    world = ecs.world()
+    A, B = world:component(), world:component()
+    local Excluded = world:entity()
+    local x, y = world:entity(), world:entity()
+    for _, entity in { x, y } do
+        world:set(entity, A, 1)
+        world:set(entity, B, 2)
+    end
+    world:add(y, Excluded)
+    local _, take6 = monitored(world:query(A, B):without(Excluded), { [x] = "x", [y] = "y" })
+    world:clear(x)
+    CHECK(take6() == "-x")
+    world:clear(y) -- a non-member with the excluded id: nothing
+    CHECK(take6() == "")
+    world:set(x, A, 1)
+    world:set(x, B, 2)
+    CHECK(take6() == "+x")
+    world:delete(x)
+    CHECK(take6() == "-x")
+    world:set(y, A, 1)
+    world:set(y, B, 2)
+    world:add(y, Excluded)
+    CHECK(take6() == "+y -y")
+    world:delete(y)
+    CHECK(take6() == "")
+
+    CASE("cascades and deleted ids")
+    world = ecs.world()
+    A = world:component()
+    local parent = world:entity()
+    local kids: { [any]: string } = {}
+    for i = 1, 3 do
+        local kid = world:entity()
+        world:set(kid, A, i)
+        world:add(kid, pair(ecs.ChildOf, parent))
+        kids[kid] = "k"
+    end
+    local _, take7 = monitored(world:query(A):with(pair(ecs.ChildOf, parent)), kids)
+    world:delete(parent)
+    CHECK(take7() == "-k -k -k")
+    local Tag = world:entity()
+    local tagged: { [any]: string } = {}
+    for _ = 1, 2 do
+        local t = world:entity()
+        world:set(t, A, 0)
+        world:add(t, Tag)
+        tagged[t] = "t"
+    end
+    local _, take8 = monitored(world:query(A):with(Tag), tagged)
+    world:delete(Tag) -- the id goes from its members
+    CHECK(take8() == "-t -t")
+
+    CASE("batch operations")
+    world = ecs.world()
+    A = world:component()
+    local Mark = world:entity()
+    local all: { [any]: string } = {}
+    for i = 1, 3 do
+        local b = world:entity()
+        world:set(b, A, i)
+        all[b] = "b"
+    end
+    local _, take9 = monitored(world:query(A):with(Mark), all)
+    world:query(A):add_all(Mark)
+    CHECK(take9() == "+b +b +b")
+    world:remove_all(Mark)
+    CHECK(take9() == "-b -b -b")
+    world:query(A):add_all(Mark)
+    CHECK(take9() == "+b +b +b")
+    world:query(A):with(Mark):delete_all()
+    CHECK(take9() == "-b -b -b")
+
+    CASE("disconnect, also from a callback")
+    world = ecs.world()
+    A = world:component()
+    e = world:entity()
+    local m, take10 = monitored(world:query(A), { [e] = "e" })
+    m.disconnect()
+    m.disconnect() -- again: nothing
+    world:set(e, A, 1)
+    CHECK(take10() == "")
+    local calls = 0
+    local self_stopping = world:query(A):monitor()
+    self_stopping.removed(function()
+        calls += 1
+        self_stopping.disconnect()
+    end)
+    world:remove(e, A)
+    world:set(e, A, 2)
+    world:remove(e, A)
+    CHECK(calls == 1)
+
+    CASE("callbacks that change the world")
+    world = ecs.world()
+    A, B = world:component(), world:component()
+    e = world:entity()
+    local bouncing, take11 = monitored(world:query(A):with(B), { [e] = "e" })
+    local once = true
+    bouncing.added(function(entity: any)
+        if once then
+            once = false
+            world:remove(entity, B) -- leaves from inside its entry
+        end
+    end)
+    world:set(e, A, 1)
+    world:set(e, B, 2)
+    CHECK(take11() == "-e" and not world:has(e, B))
+    world:set(e, B, 3)
+    CHECK(take11() == "")
+
+    CASE("several monitors, and a hook on the same id")
+    world = ecs.world()
+    A = world:component()
+    local hooked = 0
+    world:set(A, ecs.OnAdd, function()
+        hooked += 1
+    end)
+    e = world:entity()
+    local _, first = monitored(world:query(A), { [e] = "e" })
+    local _, second = monitored(world:query(A), { [e] = "e" })
+    world:set(e, A, 1)
+    CHECK(first() == "+e" and second() == "+e" and hooked == 1)
+
+    CASE("a monitor without required ids sees deletes")
+    world = ecs.world()
+    local X1, X2 = world:entity(), world:entity()
+    e = world:entity()
+    world:add(e, X2)
+    local _, take_or = monitored(world:query():any(X1, X2), { [e] = "e" })
+    world:delete(e)
+    CHECK(take_or() == "-e")
+
+    CASE("ids without records when the monitor is made")
+    world = ecs.world()
+    A = world:component()
+    local Later, Rel = world:entity(), world:entity()
+    local target = world:entity()
+    e = world:entity()
+    local _, take12 = monitored(world:query(A):with(Later, pair(Rel, ecs.Wildcard)), { [e] = "e" })
+    world:set(e, A, 1)
+    world:add(e, Later)
+    world:add(e, pair(Rel, target))
+    CHECK(take12() == "+e")
+    world:delete(e)
+    CHECK(take12() == "-e")
+
+    CASE("an exclusive replacement that removes an excluded pair")
+    world = ecs.world()
+    A = world:component()
+    local Slot = world:entity()
+    world:add(Slot, ecs.Exclusive)
+    local old_item, new_item = world:entity(), world:entity()
+    e = world:entity()
+    world:set(e, A, 1)
+    world:add(e, pair(Slot, old_item))
+    local _, take_swap = monitored(world:query(A):without(pair(Slot, old_item)), { [e] = "e" })
+    world:add(e, pair(Slot, new_item)) -- replaces the excluded pair: the entity enters
+    CHECK(take_swap() == "+e")
+    world:add(e, pair(Slot, old_item))
+    CHECK(take_swap() == "-e")
+
+    CASE("a pair term and a term (R, *) of its relation in other roles")
+    world = ecs.world()
+    A = world:component()
+    local Tagged, Held = world:entity(), world:entity()
+    local item = world:entity()
+    e = world:entity()
+    world:set(e, A, 1)
+    world:add(e, Tagged)
+    local _, take_roles =
+        monitored(world:query(A):without(pair(Held, ecs.Wildcard)):any(Tagged, pair(Held, item)), { [e] = "e" })
+    world:add(e, pair(Held, item)) -- an OR term, but any pair of Held excludes the entity
+    CHECK(take_roles() == "-e")
+    world:remove(e, pair(Held, item))
+    CHECK(take_roles() == "+e")
+
+    CASE("the terms of a query that is not shared, changed after its monitor was made")
+    world = ecs.world()
+    A = world:component()
+    local Rel2 = world:entity()
+    local owner = world:entity()
+    local Or1, Or2, B2, C2 = world:entity(), world:entity(), world:entity(), world:entity()
+    -- an id that is not alive keeps the shape from being shared: a state of its own, changed in
+    -- place by the modifiers (it excludes nothing: no entity has the id)
+    local gone = world:entity()
+    world:delete(gone)
+    local grown = world:query(A):with(pair(Rel2, owner)):without(gone):any(Or1)
+    local grown_monitor = grown:monitor()
+    local grown_log: { string } = {}
+    grown_monitor.added(function()
+        table.insert(grown_log, "+")
+    end)
+    grown:any(Or2) -- the monitor keeps the terms it was made with
+    e = world:entity()
+    world:set(e, A, 1)
+    world:add(e, Or1)
+    world:add(e, pair(Rel2, owner))
+    CHECK(table.concat(grown_log) == "+")
+    local replaced = world:query(A):with(pair(Rel2, owner)):without(B2, gone)
+    local other = world:entity()
+    local _, take_replaced = monitored(replaced, { [other] = "f" })
+    replaced:without(C2)
+    world:set(other, A, 1)
+    world:add(other, pair(Rel2, owner))
+    world:add(other, B2)
+    world:add(other, C2)
+    world:remove(other, B2) -- excluded by the terms of the monitor no more
+    CHECK(take_replaced() == "+f -f +f" and not replaced:has(other))
+
+    CASE("terms that a monitor does not take")
+    world = ecs.world()
+    A = world:component()
+    world:track(A)
+    CHECK_EXPECT_ERR(function()
+        world:query(A):with(pair(ecs.Wildcard, world:entity())):monitor()
+    end)
+    CHECK_EXPECT_ERR(function()
+        world:query(A):changed(A):monitor()
+    end)
 end)
 
 -- a failed case must fail the process (CI reads the exit code)
