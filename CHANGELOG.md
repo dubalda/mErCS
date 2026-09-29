@@ -1,5 +1,169 @@
 # Changelog
 
+## v0.2.3 — 2026-09-29
+
+The reference workload of a game that uses the library is the priority from this release on: a
+performance suite models it (the tests P1–P9 of `bench/workload.luau`), and the behavior it
+relies on is a set of tests (`test/workload_cases.luau`). `world:each` and `world:children`
+return the members of the id at the start of the loop again, and faster than 0.2.2 did: a
+frame of the model at the target scale takes 10 % less in native code and 12 % less in the
+interpreter, and allocates 60 % less. Also: the listeners of deleted ids, and what signals
+and monitors cost once they are gone.
+
+### Changed behavior
+
+- `world:each` and `world:children` return the members of the id when the loop starts, for
+  every id. 0.2.2 walked the bitsets of an id whose members lay in more than two words (beyond
+  64 slots): it skipped an entity that lost the id or was deleted before the loop reached it,
+  and visited an entity that got the id during the loop when its slot lay ahead of the loop in
+  a word with members (not in a word, or a block of 1024 slots, without members). Now an entity
+  that gets the id during the loop is not visited, one that loses it is visited, and one deleted
+  before the loop reaches it comes as a dead id.
+- A listener of a deleted id (a signal, change tracking, a query monitor with the id as a term)
+  hears nothing until the id is made alive again; 0.2.2 ran it for the pairs of the relation
+  that took the slot of the id (see Fixed).
+
+### Fixed
+
+- A signal listener (or change tracking) connected to a deleted id ran for the pairs of the
+  relation that took the slot of the id (a pair keeps only the slots of its elements), and so
+  did a query monitor with the deleted id as a term; the listeners of a deleted id also took
+  the hook of the entity in its slot. A deleted id now gives its dispatcher to no record: its
+  listeners hear nothing until the id is made alive again (`world:entity(id)`). The problem
+  was in 0.2.2.
+
+### Iteration
+
+- `world:each` and `world:children` collect the members of the id into a buffer taken from a
+  pool of the module, and the loop reads the buffer, which goes back to the pool when the loop
+  ends (a loop left with `break` leaves it to the collector); an id with one member needs no
+  buffer. The words of an id with at most 64 words of members are taken with their keys sorted
+  (a sparse id, the holders of a pair, the children of a parent); a larger id is walked through
+  the levels of its bitset, a full word copied at once. A loop allocates its iterator only
+  (176 bytes instead of 736), and a frame of the model allocates 60 % less. The loops are
+  faster than the walk of 0.2.2 on sparse and dense ids alike: 16 / 256 / 2 048 / 16 384
+  members spread among 350 000 entities (the test P1) take 1.12 / 14.1 / 97 / 571 µs per loop
+  in native code (0.2.2: 2.29 / 25.9 / 171 / 910 µs) and 1.61 / 27.1 / 177 / 1 133 µs in the
+  interpreter (0.2.2: 3.24 / 42.1 / 270 / 1 499 µs).
+
+### Signals
+
+- The last listener of an id that disconnects (a signal, or the listeners of a query monitor)
+  removes the dispatcher of the id, and its records call the hook of the id (or nothing)
+  again. 0.2.2 kept the dispatcher, and every add or remove of the id then cost 27–35 ns more:
+  a tag added or removed after its monitor disconnected takes 103 / 65 ns instead of
+  134 / 91 ns (interpreter / native), as much as a tag that never had a listener.
+
+### Query monitors
+
+- A world without monitors pays nothing for them: the only code of the monitors on the
+  operations of the world, around the removal of the old pair when an exclusive relation
+  replaces a pair (`ChildOf` moved to another parent), runs only while a monitor exists. A
+  child moved to another parent takes 408 / 250 ns instead of 420 / 260 ns, as much as
+  without that code (402 / 247 ns).
+
+### Tests and benchmarks
+
+- `bench/workload.luau` with `bench/workload_model.luau`, and `tools/workload.sh`: the
+  performance suite of the reference workload (P1–P9) against the previous release and the
+  library twice (the noise), in the interpreter and in native code, at the small and the target
+  scale, medians and ranges of 5 runs (see the development guide).
+- `test/workload_cases.luau`: the behavior cases of the reference workload (ids and liveness,
+  hooks and signals, relations, loops, among them the members of `world:each` and
+  `world:children` at the start of the loop for every layout, debugging aids); `tools/test.sh`
+  runs it.
+- `test/lib.luau`: loops over large records return the members of their start, and the
+  buffers of the loops (nested loops over one id, loops left with `break`, an iterator called
+  after its end, the buffer of a large loop reused by a smaller one); the last
+  listener of an id that disconnects (the hook of the id, set before or while listeners were
+  connected, the pairs of a relation, `OnRemove` and deletes, change tracking, the internal
+  hook of `Exclusive`, a relation deleted before its listener disconnects and whose slot another
+  relation took), and a listener connected to a deleted relation (the relation in its slot, the
+  id made alive again).
+- The [comparison with jecs](https://github.com/dubalda/mErCS/tree/main/docs/jecs-comparison#performance)
+  gives the numbers of 0.2.3 beside 0.2.2 and jecs 0.11.0, each implementation measured in a
+  process of its own (in one process, the implementations that run first change the timings of
+  the later ones by up to 30 % in some rows); its tables add the queries of a concrete pair built
+  per call, an entity used as a term in 4 inline queries and the group `state tags`.
+
+### Performance on the reference workload
+
+The suite of `bench/workload.luau` (`bash tools/workload.sh`), luau 0.740. The small scale has
+about 120 agents with 12 owned entities each, the target scale 700 agents with 500 (350 000
+entities); P1 has worlds of its own. No test is worse than on 0.2.2 beyond the noise: the
+events of P6 (a millisecond each at the target scale) move by up to 10 % between two runs of
+the suite, in both directions.
+
+Native code: 0.2.2 → 0.2.3, the median and the range of 5 runs, the ratio, and the median of the
+second run of 0.2.3 (the noise):
+
+| Test | Case | Unit | Small | Target |
+|---|---|---|---|---|
+| P1 | 16 members spread (world:each) | µs per loop | — | 2.29 (2.15–2.39) → 1.12 (1.07–1.19), 0.49× (again 1.11) |
+| P1 | 256 members spread (world:each) | µs per loop | — | 25.9 (25.1–26.2) → 14.1 (14.0–14.3), 0.54× (again 14.3) |
+| P1 | 2048 members spread (world:each) | µs per loop | — | 171 (163–176) → 97.1 (95.1–98.9), 0.57× (again 96.7) |
+| P1 | 16384 members spread (world:each) | µs per loop | — | 910 (896–927) → 571 (564–593), 0.63× (again 580) |
+| P1 | 2048 members in runs of 8 | µs per loop | — | 103 (102–105) → 72.7 (71.3–73.7), 0.71× (again 72.8) |
+| P1 | 100 000 of 100 000 (dense) | µs per loop | — | 3265 (3234–3274) → 2530 (2516–2604), 0.77× (again 2562) |
+| P8 | the heap of the world after it is built | MB | 2.80 (2.73–2.81) → 2.80 (2.73–2.81), 1.00× (again 2.80) | 138 (138–146) → 138 (138–146), 1.00× (again 138) |
+| P3 | world:each over (Trigger_k, agent) | ns per call | 435 (349–600) → 337 (293–438), 0.77× (again 309) | 5411 (5178–6349) → 3264 (3090–4379), 0.60× (again 3519) |
+| P2 | 10 walks: world:each with a check | µs per frame | 17.1 (16.0–20.5) → 10.6 (9.43–11.3), 0.62× (again 10.7) | 124 (99.4–132) → 83.7 (67.7–98.7), 0.68× (again 81.6) |
+| P2 | 10 walks: one stored query per system tag | µs per frame | 5.23 (5.07–5.46) → 5.22 (4.92–5.43), 1.00× (again 5.19) | 13.5 (11.1–14.8) → 12.2 (10.7–13.1), 0.90× (again 11.8) |
+| P4 | 25 stored queries at their periods | µs per frame | 25.1 (24.3–25.3) → 24.9 (24.5–25.8), 0.99× (again 25.7) | 116 (112–119) → 110 (106–121), 0.95× (again 116) |
+| P5 | messages and deferred messages | µs per frame | 24.3 (23.7–25.0) → 23.1 (21.3–24.8), 0.95× (again 21.3) | 204 (184–219) → 161 (155–182), 0.79× (again 171) |
+| P7 | a frame with the lifecycle events | µs per frame | 141 (136–144) → 130 (122–134), 0.92× (again 131) | 664 (633–718) → 600 (585–622), 0.90× (again 615) |
+| P7 | the ECS work per second (60 frames) | ms per second | 8.45 (8.14–8.61) → 7.77 (7.33–8.02), 0.92× (again 7.84) | 39.8 (38.0–43.1) → 36.0 (35.1–37.3), 0.90× (again 36.9) |
+| P9 | allocated by a frame | bytes | 16196 (16060–17033) → 7407 (7083–7646), 0.46× (again 7407) | 26146 (25890–26402) → 10121 (9830–10359), 0.39× (again 10172) |
+| P9 | allocated by a loop over a stored query | bytes | 0.00 (0.00–0.00) → 0.00 (0.00–0.00), — (again 0.00) | 0.00 (0.00–0.00) → 0.00 (0.00–0.00), — (again 0.00) |
+| P9 | allocated by a loop over world:each | bytes | 735 (735–736) → 176 (175–176), 0.24× (again 176) | 736 (735–736) → 176 (176–176), 0.24× (again 176) |
+| P6 | the end of the activity of an agent | µs per event | 12.2 (10.1–13.1) → 11.7 (10.9–16.4), 0.96× (again 13.6) | 71.7 (63.8–80.3) → 67.9 (66.0–77.4), 0.95× (again 71.8) |
+| P6 | the removal of a retained agent (cascade) | µs per event | 45.4 (42.0–60.1) → 45.2 (40.4–71.2), 1.00× (again 57.0) | 1125 (1057–1221) → 1100 (1068–1208), 0.98× (again 1127) |
+| P6 | a new agent with its owned entities | µs per event | 46.0 (44.4–50.5) → 46.5 (43.4–56.6), 1.01× (again 49.9) | 1021 (980–1068) → 1010 (971–1031), 0.99× (again 1025) |
+| P8 | the heap after 100 lifecycle rounds | MB | 3.24 (3.21–3.30) → 3.24 (3.21–3.30), 1.00× (again 3.24) | 139 (139–147) → 139 (139–147), 1.00× (again 139) |
+| P8 | the heap after 3 000 more frames | MB | 3.80 (3.78–3.86) → 3.80 (3.77–3.86), 1.00× (again 3.80) | 140 (140–148) → 140 (140–148), 1.00× (again 140) |
+| P8 | bytes per distinct pair (and its holder) | bytes | 1186 (1181–1189) → 1184 (1183–1189), 1.00× (again 1184) | 1235 (1234–1236) → 1235 (1234–1236), 1.00× (again 1235) |
+| P8 | bytes per holder of a pair | bytes | 58.7 (58.7–58.7) → 58.7 (58.7–58.7), 1.00× (again 58.7) | 103 (103–103) → 103 (102–103), 1.00× (again 103) |
+
+Interpreter: 0.2.2 → 0.2.3, the median and the range of 5 runs, the ratio, and the median of the
+second run of 0.2.3 (the noise):
+
+| Test | Case | Unit | Small | Target |
+|---|---|---|---|---|
+| P1 | 16 members spread (world:each) | µs per loop | — | 3.24 (3.15–3.53) → 1.61 (1.57–1.63), 0.50× (again 1.60) |
+| P1 | 256 members spread (world:each) | µs per loop | — | 42.1 (41.7–42.2) → 27.1 (26.8–28.0), 0.64× (again 27.6) |
+| P1 | 2048 members spread (world:each) | µs per loop | — | 270 (265–272) → 177 (177–179), 0.66× (again 174) |
+| P1 | 16384 members spread (world:each) | µs per loop | — | 1499 (1481–1548) → 1133 (1110–1168), 0.76× (again 1155) |
+| P1 | 2048 members in runs of 8 | µs per loop | — | 153 (151–154) → 124 (123–125), 0.81× (again 123) |
+| P1 | 100 000 of 100 000 (dense) | µs per loop | — | 3821 (3790–3834) → 3111 (3093–3159), 0.81× (again 3091) |
+| P8 | the heap of the world after it is built | MB | 2.80 (2.73–2.81) → 2.80 (2.73–2.81), 1.00× (again 2.80) | 138 (138–146) → 138 (138–146), 1.00× (again 138) |
+| P3 | world:each over (Trigger_k, agent) | ns per call | 458 (442–648) → 399 (385–463), 0.87× (again 462) | 6451 (6157–7437) → 5171 (4702–6418), 0.80× (again 4991) |
+| P2 | 10 walks: world:each with a check | µs per frame | 21.9 (21.5–30.8) → 15.2 (14.3–16.8), 0.69× (again 14.8) | 184 (149–201) → 141 (108–153), 0.77× (again 137) |
+| P2 | 10 walks: one stored query per system tag | µs per frame | 8.08 (7.64–8.57) → 7.90 (7.68–8.39), 0.98× (again 7.78) | 18.2 (15.5–19.3) → 19.1 (15.8–19.5), 1.05× (again 18.5) |
+| P4 | 25 stored queries at their periods | µs per frame | 36.6 (35.6–41.5) → 36.7 (35.9–37.5), 1.00× (again 36.0) | 159 (155–182) → 154 (149–160), 0.97× (again 159) |
+| P5 | messages and deferred messages | µs per frame | 32.5 (30.1–34.6) → 29.8 (28.0–34.5), 0.92× (again 28.5) | 291 (254–305) → 248 (241–288), 0.85× (again 238) |
+| P7 | a frame with the lifecycle events | µs per frame | 210 (208–211) → 195 (192–205), 0.93× (again 194) | 1011 (982–1023) → 889 (875–911), 0.88× (again 895) |
+| P7 | the ECS work per second (60 frames) | ms per second | 12.6 (12.5–12.6) → 11.7 (11.5–12.3), 0.93× (again 11.6) | 60.7 (58.9–61.4) → 53.3 (52.5–54.7), 0.88× (again 53.7) |
+| P9 | allocated by a frame | bytes | 16196 (16077–17033) → 7407 (7083–7646), 0.46× (again 7441) | 26146 (25890–26385) → 10121 (9830–10394), 0.39× (again 10172) |
+| P9 | allocated by a loop over a stored query | bytes | 0.00 (0.00–0.00) → 0.00 (0.00–0.00), — (again 0.00) | 0.00 (0.00–0.00) → 0.00 (0.00–0.00), — (again 0.00) |
+| P9 | allocated by a loop over world:each | bytes | 735 (735–736) → 176 (175–176), 0.24× (again 176) | 736 (735–736) → 176 (175–176), 0.24× (again 176) |
+| P6 | the end of the activity of an agent | µs per event | 19.4 (17.9–19.8) → 19.8 (15.6–20.7), 1.02× (again 18.8) | 110 (101–116) → 109 (105–120), 0.99× (again 122) |
+| P6 | the removal of a retained agent (cascade) | µs per event | 67.7 (61.8–84.6) → 70.2 (64.9–78.5), 1.04× (again 63.9) | 1603 (1573–1675) → 1593 (1559–1619), 0.99× (again 1851) |
+| P6 | a new agent with its owned entities | µs per event | 65.2 (64.8–71.1) → 69.0 (67.5–71.6), 1.06× (again 66.2) | 1543 (1523–1556) → 1564 (1553–1591), 1.01× (again 1606) |
+| P8 | the heap after 100 lifecycle rounds | MB | 3.24 (3.21–3.30) → 3.24 (3.21–3.30), 1.00× (again 3.24) | 139 (139–147) → 139 (139–147), 1.00× (again 139) |
+| P8 | the heap after 3 000 more frames | MB | 3.80 (3.78–3.86) → 3.80 (3.77–3.86), 1.00× (again 3.80) | 140 (140–148) → 140 (140–148), 1.00× (again 140) |
+| P8 | bytes per distinct pair (and its holder) | bytes | 1184 (1181–1189) → 1184 (1183–1189), 1.00× (again 1184) | 1235 (1234–1236) → 1235 (1234–1235), 1.00× (again 1235) |
+| P8 | bytes per holder of a pair | bytes | 58.7 (58.7–58.7) → 58.7 (57.8–58.7), 1.00× (again 58.7) | 103 (103–103) → 103 (102–103), 1.00× (again 103) |
+
+### Memory
+
+- The heap of the world of the model at the target scale is the one of 0.2.2: 138 MB after it
+  is built, 139 MB after 100 lifecycle rounds, 140 MB after 3 000 more frames (with the lists
+  of the model); 1 235 bytes per distinct pair with a new target and its holder, 103 bytes per
+  holder of a pair.
+- New: the pool of the buffers of `world:each` and `world:children` keeps up to 16 buffers,
+  each of the size of the largest loop that gave it back (16 bytes per member): a loop takes
+  the buffer the previous one gave back, only nested loops hold more than one.
+
 ## v0.2.2 — 2026-09-29
 
 The strengths of jecs: ten cases where an archetype ECS is at its best and jecs 0.11.0 was far

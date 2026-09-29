@@ -929,13 +929,12 @@ export type World = {
     @within World
     @param id Id
     @return () -> Entity? -- an iterator
-    Iterates the entities that have `id`, in ascending slot order, allocating only the
-    iterator. Changes during the loop: the current entity may be changed or deleted; an entity
-    that loses the id or is deleted before the loop reaches it is skipped, and an entity that
-    gets the id is visited only when its slot lies ahead of the loop and existed when the loop
-    started (a loop that gives the id to new entities ends). The members of an id that lie in
-    at most two words of its bitset (up to 64 entities, like the children of a parent created
-    together) are collected first: the loop returns the members of its start.
+    Iterates the entities that have `id` when the loop starts, in ascending slot order,
+    whatever their number. They are collected into a buffer that the world reuses: a loop
+    allocates only its iterator. Nothing that changes during the loop changes what it returns:
+    an entity that gets the id is not visited, one that loses it is visited, and one deleted
+    before the loop reaches it is returned as a dead id (a loop that deletes other entities
+    checks `world:contains`).
 ]=]
 
 --[=[
@@ -1352,6 +1351,18 @@ local SHAPES_EXHAUSTED = `mErCS: {MAX_SHAPES} query shapes are shared, the most 
 local function NOOP(): any
     return nil
 end
+
+-- The buffers of world:each and world:children (see iterate_record in world_new): a loop
+-- collects the members of the id into a buffer taken from here and gives it back when it ends
+-- (a loop left with break leaves its buffer to the collector). A buffer holds entity ids only.
+-- At most EACH_POOL_MAX buffers are kept, of any size: a loop takes the buffer that the
+-- previous one gave back, so only nested loops hold more than one. each_words holds the sorted
+-- keys of the words of a record of at most EACH_FEW_WORDS words.
+local each_pool: { { number } } = {}
+local each_pool_n = 0
+local EACH_POOL_MAX = 16
+local each_words: { number } = {}
+local EACH_FEW_WORDS = 64
 
 --------------------------------------------------------------------------------
 -- Id helpers
@@ -2868,11 +2879,17 @@ local function world_new(debug: boolean?): World
         local slot_pair = wc_rel.slot_pair :: { [number]: Record }
         local first = slot_pair[slot]
         if first ~= nil and wc_rel.exclusive then
-            -- the monitors take the new pair as present while the old one is removed
-            local outer_entity, outer_id = monitoring.entity, monitoring.id
-            monitoring.entity, monitoring.id = entity, id
-            world_remove(world, entity, first.id)
-            monitoring.entity, monitoring.id = outer_entity, outer_id
+            if monitoring.list[1] == nil then
+                -- no monitor checks the entity during the removal: one that a hook of the old pair
+                -- makes is not among the listeners of this removal (see Query.monitor)
+                world_remove(world, entity, first.id)
+            else
+                -- the monitors take the new pair as present while the old one is removed
+                local outer_entity, outer_id = monitoring.entity, monitoring.id
+                monitoring.entity, monitoring.id = entity, id
+                world_remove(world, entity, first.id)
+                monitoring.entity, monitoring.id = outer_entity, outer_id
+            end
             if records[id] ~= rec then
                 -- the record was freed meanwhile: a hook deleted its relation or target, or the
                 -- record was empty and the removal freed a batch of empty pair records (see
@@ -4268,15 +4285,14 @@ local function world_new(debug: boolean?): World
         return if pair_rec then pair_rec.target else nil
     end
 
-    -- Iterates the entities that have a record, in ascending slot order. A record of at most
-    -- two words (up to 64 members, the children of a parent created together) is collected
-    -- into a list first: the loop returns the members of the start, cheaper than the state of a
-    -- walk. A larger one is walked through its tops, sums and words: nothing is collected, an
-    -- iteration allocates only its closure. Changes during the loop: the current entity may be
-    -- changed or deleted; in a walk, an entity that loses the id or is deleted before the loop
-    -- reaches it is skipped (the word of the current slot is read again when it changed), and
-    -- the slots created after the loop started are not visited (a loop that gives the id to new
-    -- entities ends); a collected member deleted ahead of the loop is returned as a dead id.
+    -- world:each and world:children: the members of the id at the start of the loop, in
+    -- ascending slot order, whatever their number and their layout, collected into a buffer of
+    -- each_pool that the loop reads: it allocates its closure only. A record of a few words
+    -- (at most EACH_FEW_WORDS, none emptied) has the keys of its words sorted (a sparse id, the
+    -- children of a parent: fewer steps than the levels of the bitset); a larger one is walked
+    -- through its tops, its sums and its words, a full word copied at once. Nothing that changes
+    -- during the loop changes what it returns: an entity that gets the id is not visited, one
+    -- that loses it is visited, one deleted before the loop reaches it is returned as a dead id.
     local function iterate_record(rec: Record?): () -> i53?
         if rec and rec.kind == KIND_TARGET then
             target_materialize(rec)
@@ -4284,103 +4300,118 @@ local function world_new(debug: boolean?): World
         if rec == nil or rec.word_count == 0 then
             return NOOP
         end
-        if rec.word_count <= 2 then
-            local list = members_of(rec)
-            -- members_of returns the members of a word in order, but two words of different
-            -- sums in the order of the hash of the sums: the higher word first puts the first
-            -- member after the last one
-            local last = #list
-            if last > 1 and list[1] % ENTITY_MASK > list[last] % ENTITY_MASK then
-                table.sort(list, function(a: i53, b: i53): boolean
-                    return a % ENTITY_MASK < b % ENTITY_MASK
-                end)
-            end
-            local i = 0
-            return function(): i53?
-                i += 1
-                return list[i]
+        local words = rec.words
+        local word_count = rec.word_count
+        if word_count == 1 and rec.zeros == 0 then
+            local w, word = next(words)
+            local bits = word :: number
+            if band(bits, bits - 1) == 0 then
+                -- one member (a pair with one holder, a parent with one child): no buffer
+                local only: i53? = alive[((w :: number) - 1) * 32 + countrz(bits)]
+                return function(): i53?
+                    local e = only
+                    only = nil
+                    return e
+                end
             end
         end
-        local sums, words = rec.sums, rec.words
-        local max_tw = max_slot // TOP_SLOTS + 1
-        -- the last word of the slots that exist now, and its bits of those slots
-        local last_w = max_slot // 32 + 1
-        local last_bit = max_slot % 32
-        local last_mask = if last_bit == 31 then FULL_WORD else lshift(1, last_bit + 1) - 1
-        local tw, tmask, sw, smask = 0, 0, 0, 0
-        -- the current word, its value when it was read, its first slot and its bits left; a
-        -- full word is walked slot by slot instead (next_slot..end_slot) while it stays full
-        local w, word, base, bits = 0, 0, 0, 0
-        local next_slot, end_slot = 1, 0
-        return function(): i53?
-            while true do
-                local s = next_slot
-                if s <= end_slot then
-                    if words[w] == FULL_WORD then
-                        next_slot = s + 1
-                        local e = alive[s]
-                        if e > 0 then
-                            return e
-                        end
-                        continue
+        local list: { i53 }
+        if each_pool_n > 0 then
+            list = each_pool[each_pool_n]
+            each_pool[each_pool_n] = nil
+            each_pool_n -= 1
+        else
+            list = {}
+        end
+        local n = 0
+        local sums = rec.sums
+        if word_count <= EACH_FEW_WORDS and rec.zeros == 0 then
+            local keys = each_words
+            local k = word_count
+            if word_count <= 2 then
+                -- one or two words: in order without a sort
+                local w1 = (next(words)) :: number
+                keys[1] = w1
+                if word_count == 2 then
+                    local w2 = (next(words, w1)) :: number
+                    if w2 < w1 then
+                        keys[1], keys[2] = w2, w1
+                    else
+                        keys[2] = w2
                     end
-                    -- the word lost members during the loop: its other slots through the bits
-                    word = words[w] or 0
-                    bits = band(word, lshift(FULL_WORD, s - base))
-                    next_slot, end_slot = 1, 0
-                    continue
                 end
-                local m = bits
-                if m ~= 0 then
-                    local current = words[w]
-                    if current ~= word then
-                        -- the word changed during the loop: the members that left it are skipped
-                        word = current or 0
-                        m = band(m, word)
-                        if m == 0 then
-                            bits = 0
-                            continue
-                        end
-                    end
-                    bits = band(m, m - 1)
-                    local e = alive[base + countrz(m)]
-                    if e > 0 then
-                        return e
-                    end
-                    continue
+            else
+                table.clear(keys)
+                k = 0
+                for w in words do
+                    k += 1
+                    keys[k] = w
                 end
-                -- the next non-empty word, in ascending order
-                local sum = smask
-                while sum == 0 do
-                    local t = tmask
-                    while t == 0 do
-                        local next_tw = tw + 1
-                        if next_tw > max_tw then
-                            return nil
-                        end
-                        tw = next_tw
-                        t = sums[-next_tw] or 0
-                    end
-                    tmask = band(t, t - 1)
-                    sw = (tw - 1) * 32 + countrz(t) + 1
-                    sum = sums[sw] or 0
-                end
-                smask = band(sum, sum - 1)
-                local next_w = (sw - 1) * 32 + countrz(sum) + 1
-                if next_w > last_w then
-                    tw, tmask, smask = max_tw, 0, 0 -- later calls return nil as well
-                    return nil
-                end
-                w = next_w
-                local first = (next_w - 1) * 32
-                base = first
-                word = words[next_w] or 0
-                if word == FULL_WORD and next_w < last_w then
-                    next_slot, end_slot = first, first + 31
+                table.sort(keys)
+            end
+            for j = 1, k do
+                local w = keys[j]
+                local word = words[w]
+                local base = (w - 1) * 32
+                if word == FULL_WORD then
+                    -- 32 members: copied at once (the slot of a member is always alive)
+                    table.move(alive, base, base + 31, n + 1, list)
+                    n += 32
                 else
-                    bits = if next_w == last_w then band(word, last_mask) else word
+                    while word ~= 0 do
+                        n += 1
+                        list[n] = alive[base + countrz(word)]
+                        word = band(word, word - 1)
+                    end
                 end
             end
+        else
+            -- (a bit of a level always has its word below it)
+            for tw = 1, max_slot // TOP_SLOTS + 1 do
+                local t = sums[-tw] or 0
+                local sw_base = (tw - 1) * 32 + 1
+                while t ~= 0 do
+                    local sw = sw_base + countrz(t)
+                    t = band(t, t - 1)
+                    local sum = sums[sw]
+                    local w_base = (sw - 1) * 32 + 1
+                    while sum ~= 0 do
+                        local w = w_base + countrz(sum)
+                        sum = band(sum, sum - 1)
+                        local word = words[w]
+                        local base = (w - 1) * 32
+                        if word == FULL_WORD then
+                            table.move(alive, base, base + 31, n + 1, list)
+                            n += 32
+                        else
+                            while word ~= 0 do
+                                n += 1
+                                list[n] = alive[base + countrz(word)]
+                                word = band(word, word - 1)
+                            end
+                        end
+                    end
+                end
+            end
+        end
+        -- the end of the members (a reused buffer holds older ones after it)
+        list[n + 1] = nil
+        local i = 0
+        return function(): i53?
+            i += 1
+            local e = list[i]
+            if e ~= nil then
+                return e
+            end
+            if i > 0 then
+                -- the end of the loop: the buffer goes back, once
+                i = -math.huge
+                if each_pool_n < EACH_POOL_MAX then
+                    each_pool_n += 1
+                    each_pool[each_pool_n] = list
+                end
+            end
+            return nil
         end
     end
 
@@ -4444,8 +4475,13 @@ local function world_new(debug: boolean?): World
     -- the signal dispatcher of the id, which never replace the internal one (chain_hooks).
     local internal_hooks: { [string]: { [i53]: Hook } } = { on_add = {}, on_change = {}, on_remove = {} }
 
-    -- Gives the records of an id (and of its pairs, for a relation) their callback.
+    -- Gives the records of an id (and of its pairs, for a relation) their callback. Only those
+    -- of a live id: a deleted one has no records, and the pairs of its slot belong to the entity
+    -- that took the slot (a pair keeps only the slots of its elements).
     local function install_hook(entity: i53, field: string, value: Hook?)
+        if alive[entity % ENTITY_MASK] ~= entity then
+            return
+        end
         local rec = records[entity]
         if rec then
             local callback = chain_hooks(internal_hooks[field][entity], value);
@@ -4465,8 +4501,12 @@ local function world_new(debug: boolean?): World
         end
     end
 
-    -- The hooked masks of the records of an id after its dispatcher changed.
+    -- The hooked masks of the records of an id after its dispatcher changed (a live id, see
+    -- install_hook).
     local function refresh_hooked(id: i53)
+        if alive[id % ENTITY_MASK] ~= id then
+            return
+        end
         local rec = records[id]
         if rec then
             set_hooked(rec, rec.on_remove ~= nil)
@@ -4492,14 +4532,17 @@ local function world_new(debug: boolean?): World
     end
 
     -- Signals: the first listener of an id installs a dispatcher that calls the hook of the id
-    -- (if any) and then the listeners, so hooks and signals (and change tracking) coexist.
+    -- (if any) and then the listeners, so hooks and signals (and change tracking) coexist; the
+    -- last one that disconnects removes it.
     -- The listener list is copied on write: a listener that connects or disconnects others (or
     -- itself) during a dispatch changes the next dispatches only. A quiet listener has nothing
     -- to do when an entity is deleted (change tracking).
     local function connect(field: string, id: i53, listener: Hook, quiet: boolean?): () -> ()
         local cell = dispatched_hooks[field][id]
         if cell == nil then
-            local created: Dispatch = { hook = hook_of(HOOK_IDS[field], id % ENTITY_MASK), listeners = {}, loud = 0 }
+            -- (a deleted id has no hook: the hook of its slot is that of the entity that took it)
+            local own_hook = if alive[id % ENTITY_MASK] == id then hook_of(HOOK_IDS[field], id % ENTITY_MASK) else nil
+            local created: Dispatch = { hook = own_hook, listeners = {}, loud = 0 }
             cell = created
             local function dispatch(entity: i53, component: i53, value: any?)
                 local hook = created.hook
@@ -4533,9 +4576,16 @@ local function world_new(debug: boolean?): World
             dispatch_cell.listeners = rest
             if not quiet then
                 dispatch_cell.loud -= 1
-                if field == "on_remove" then
-                    refresh_hooked(id)
-                end
+            end
+            if rest[1] == nil and dispatched_hooks[field][id] == dispatch_cell then
+                -- The last listener: the dispatcher goes, and the records of the id call its hook
+                -- (or nothing) again, as if no signal had been connected (a live id, see
+                -- install_hook). A dispatch that is running keeps the listeners it started with.
+                dispatchers[field][id] = nil
+                dispatched_hooks[field][id] = nil
+                install_hook(id, field, dispatch_cell.hook)
+            elseif not quiet and field == "on_remove" then
+                refresh_hooked(id)
             end
         end
     end

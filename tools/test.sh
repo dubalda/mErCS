@@ -17,7 +17,7 @@ fi
 
 for file in test/core.luau test/lib.luau test/types.luau test/fuzz.luau test/jabby.luau \
     test/jecs_compat/tests.luau test/jecs_compat/ob.luau test/monitors_fuzz.luau test/queries_fuzz.luau \
-    test/loops_fuzz.luau examples/basics.luau; do
+    test/loops_fuzz.luau test/workload_cases.luau examples/basics.luau; do
     echo "== $file"
     luau "${flags[@]}" "$file"
 done
