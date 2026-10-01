@@ -11,6 +11,8 @@ work.
 - `wally install` puts the dev dependencies of `wally.toml` into `DevPackages/`: jecs (the
   reference for the comparisons, the core tests and the benchmarks) and jabby (the debugger,
   for the Studio check). The library itself has no dependencies.
+- Python 3.11+ runs the isolated reference workload and its report checks; only the standard
+  library is used.
 - `.luaurc` aliases: `@lib` (the library), `@jecs` (the jecs package), `@testkit`, `@bench`,
   `@test`.
 
@@ -48,6 +50,8 @@ tools/check.sh         formatting, lints and types, checked like the editor does
 tools/test.sh          every test, the example and a fuzz run (--codegen: with native code)
 tools/previous.sh      the previous release from its git tag into tmp/previous, for the benchmarks
 tools/workload.sh      the performance suite of the reference workload, interpreter and native code
+tools/workload.py      isolated runs against a verified release tag, controls, raw samples and release gates
+tools/test_workload.py tests of the report parser, controls and release selection
 test/core.luau         core semantics, run against jecs and this library
 test/lib.luau          library features, the model tests
 test/types.luau        typed API usage (must type-check)
@@ -58,12 +62,18 @@ test/monitors_fuzz.luau random queries and changes of the world against query mo
 test/queries_fuzz.luau random queries and changes of the world against brute force
 test/loops_fuzz.luau   loops that change the world (no entity twice, untouched ones once)
 test/workload_cases.luau the behavior cases of the reference workload
+test/edge_cases.luau   snapshot boundaries, reentrant cleanup, signal replacement and query return values
+test/snapshots_fuzz.luau independent model of exact each/children snapshots held across world changes
+test/workload_model.luau verifies the model's bound of three expiry pairs per group during churn
 examples/basics.luau   a runnable tour of the API
 bench/run.luau         the benchmark matrix (harness.luau, scenarios.luau, shapes.luau, strengths.luau, monitors.luau, impls.luau, impl_defs.luau)
 bench/query_cases.luau query cases where an archetype ECS is at its best: jecs for-in against query:each
 bench/frame.luau       a synthetic game frame (frame_scene.luau)
 bench/leak.luau        a long session with changing relationship targets (memory growth)
 bench/workload.luau    the performance suite of the reference workload, P1–P9 (workload_model.luau: the model of the world)
+bench/workload_extra.luau client marker queries and memory retained by the module after temporary worlds
+bench/workload_session.luau long-session diagnostic with live-entity and slot counts
+bench/results/        release workload reports and raw samples
 bench/gc.luau          garbage collector access that works in the luau CLI and in Roblox
 bench/versions.luau    the versions of jecs and the library in the output of the benchmarks
 bench/previous.luau    the previous release (tmp/previous) when tools/previous.sh has extracted it
@@ -86,13 +96,33 @@ bash tools/test.sh --codegen   # native code
 `tools/test.sh` runs `test/core.luau`, `test/lib.luau`, `test/types.luau`, `test/fuzz.luau`,
 `test/jabby.luau`, `test/jecs_compat/tests.luau`, `test/jecs_compat/ob.luau`,
 `test/monitors_fuzz.luau`, `test/queries_fuzz.luau`, `test/loops_fuzz.luau`,
-`test/workload_cases.luau` and `examples/basics.luau`, and stops at the first failure with a
+`test/workload_cases.luau`, `test/edge_cases.luau`, `test/snapshots_fuzz.luau`, `test/workload_model.luau` and
+`examples/basics.luau`, and stops at the first failure with a
 non-zero exit code (a failed case of the test kit fails its file).
+It also requires exactly one actual shared-query warning from `workload_cases.luau`.
 
 `test/workload_cases.luau` holds the behavior cases of the reference workload (the next
 section), one case per line of the requirements: ids and liveness, hooks and signals,
 relations, loops, debugging aids. A release passes all of them; a change of one is a changed
 behavior of the release notes.
+
+`test/edge_cases.luau` checks the snapshot word/page boundaries and generations, more than
+16 held iterators across two worlds, messages created and replaced by hooks, reentrant target
+and relation deletion, overlapping ownership cascades, nested batch operations, listener
+replacement, query return arities and callback errors. An optional module path runs it against
+a saved release (`luau test/edge_cases.luau -a ../tmp/release-024-baseline`).
+
+`test/snapshots_fuzz.luau` compares exact full-id snapshots with its own model of liveness,
+tags and parents, independent of library queries. It holds iterators across deletes, cascades,
+slot reuse and nested loops, including abandoned loops. Failures include seed, round and
+operation trace. The default runs seeds 1, 42 and 20260930 for 250 rounds each; CI runs each
+for 2 000 rounds (`luau test/snapshots_fuzz.luau -a 42 2000`).
+
+The workload runner has separate evidence-validation tests:
+
+```sh
+python -B -m unittest discover -s tools -p 'test_workload.py'
+```
 
 `test/monitors_fuzz.luau` builds random queries (tags, components, pairs, relations with any
 target, an exclusive relation, `ChildOf`, `Disabled`, excluded ids and OR terms, sometimes a
@@ -148,6 +178,8 @@ bash tools/check.sh
 workspace: the new type solver, the Roblox platform and the Roblox type definitions, with the
 luau-lsp server of the installed VS Code extension (the version the editor uses), or
 `luau-lsp` from `rokit.toml` without it. The Wally packages are not checked.
+Explicit executable paths can be supplied through `MERCS_LUAU_LSP`, `MERCS_STYLUA` and
+`MERCS_SELENE`; `tools/test.sh` accepts `MERCS_LUAU`.
 
 ## The reference workload
 
@@ -162,27 +194,50 @@ cases passed. Its release notes list the changed behavior, the results of the su
 memory of the target world.
 
 ```sh
-bash tools/previous.sh                                     # the previous release, once
-bash tools/workload.sh                                     # both modes, 5 runs: tmp/workload-report.md
-luau -O2 --codegen bench/workload.luau -a runs=3 tests=P1,P7 scales=target
+bash tools/workload.sh baseline=v0.2.3 release=yes          # full acceptance, both modes, 5 runs
+python tools/workload.py runs=10 tests=P1,P7 scales=sparse,target modes=native
+python tools/workload.py --luau /path/to/luau output=tmp/workload-custom
 ```
 
-`bench/workload.luau` runs the tests P1–P9 for the previous release, the library and the
-library again (the two columns of one build give the noise); each run builds its worlds anew,
-with one seed for all columns, in another order of the columns; the report is a table of the
-medians and the ranges of the runs, and the ratio to the previous release:
+`tools/workload.py` extracts `src/init.luau` from the specified git tag, verifies the tag and
+records its commit and source hash. It snapshots the candidate too. Each build, control,
+profile and repeat runs in a fresh Luau process with `-O2`, with `--codegen` in native mode.
+The four columns are baseline, baseline again, candidate and candidate again. Their order
+rotates; corresponding repeats use identical seeds.
+
+`tmp/workload/report.md` contains medians, min–max ranges and ratios. `samples.json` keeps
+every raw sample, seeds, source/tool hashes and environment; `logs/` holds process output.
+The noise allowance per row is the maximum of the baseline control median difference,
+three times the median paired absolute control difference and the heap measurement
+resolution. Candidate variation never enlarges it. A disputed row needs another 10–20
+repeats and investigation; overlapping ranges alone do not settle it.
+
+The [0.2.4 report](https://github.com/dubalda/mErCS/blob/main/bench/results/0.2.4.md) keeps the
+primary measurements and additional repeats together. It includes every initial flag,
+the combined decision and commands to reproduce the runs or verify the saved comparisons.
+
+The default profiles are `sparse`, `small`, `target`, `small-empty-retained`,
+`target-empty-retained`, `client` and `buffers`. `release=yes` requires all profiles,
+P1–P9, both modes and at least five repeats, fails on missing/non-finite/duplicate rows or a
+missing baseline, and rejects regressions or a run without measured progress. A source
+change during measurement invalidates the run. The benchmark loads only one implementation
+per process; it does not use the potentially stale `tmp/previous` copy.
+
+`bench/workload.luau` remains available for exploration (`previous=no`, or
+`implementation=../src` for a single build). Its in-process comparison is not release
+evidence. The measured tests are:
 
 | Test | What is measured |
 |---|---|
-| P1 | `world:each` over a tag whose members are spread evenly among 350 000 entities (16, 256, 2 048, 16 384 members), in runs of 8, and the dense case (100 000 of 100 000) |
+| P1 | `world:each` over a tag whose members are spread evenly among 350 000 entities (exactly 16, 256, 2 048, 16 384 members), in runs of 8, the dense case (100 000 of 100 000), and 16 members after an emptied word |
 | P2 | 10 walks per frame over state tags with the members of a system tag, with the state transitions of a frame between: `world:each` with a check, and one stored query per system tag |
 | P3 | `world:each` over the holders of `(Trigger_k, agent)`: about 60 at the target scale, 2 at the small one |
 | P4 | the 25 stored queries at their periods (1 to 60 frames) while agents change and owned entities change state |
 | P5 | the messages of a frame handled (the walks of P3 and of `(Extra, agent)`, 3 values read per holder) and deleted, new ones made, the deferred ones visited |
 | P6 | the end of the activity of an agent, the removal of a retained agent (the cascade over its 500 owned entities, with removal listeners), a new agent with its owned entities; the median of the events of a run |
 | P7 | the frames of the model with the lifecycle events at their rate: µs per frame and ms of ECS work per second of server time |
-| P8 | the heap of the world after it is built, after 100 lifecycle rounds and after 3 000 more frames; bytes per distinct pair and per holder |
-| P9 | bytes allocated by a frame, and by a loop over a stored query and over `world:each` (their iterator) |
+| P8 | the heap after build, after preceding measurement phases and 100 additional lifecycle rounds, then after 3 000, 6 000 and 9 000 more frames; bytes per distinct pair and per holder |
+| P9 | net heap growth during warmed frames and loops over a stored query or `world:each`; the first large snapshot in a fresh module |
 
 `bench/workload_model.luau` is the model of the world and of a frame: agents from a slot pool,
 owned entities created in one burst after their agent, groups and anchors in `ChildOf` trees,
@@ -191,6 +246,27 @@ owned entities created in one burst after their agent, groups and anchors in `Ch
 modifiers, expiry data pairs removed with `remove_all`, about 85 components and 115 tags. Its
 header lists the choices that the requirements leave open. The heap it reports includes the
 lists of the model (the same for every column).
+Each group keeps at most three expiry pairs: a refresh updates an existing pair or replaces
+one removed when its agent ended activity. The old model chose a new random target on every
+refresh, gradually increasing the number of pairs beyond the workload's bound.
+
+The `empty-retained` variants delete owned entities when activity ends and build retained
+agents without them. The client profile has 300 entities and 15 usually empty stored marker
+queries, add/remove listeners and replication at five entities per second. The buffer profile
+holds 17 snapshots of 100 000 members, exhausts them, drops the world and measures the memory
+the module keeps after GC; it then checks abandoned snapshots in another world.
+
+Memory values labelled MB are MiB. P9 uses a weak witness to reject a completed GC cycle
+during each measured interval. It is a net heap growth proxy, not total allocator traffic:
+table resizing frees storage, and an incomplete incremental cycle may not clear the witness.
+Report warmed frames separately from the first large snapshot. Long-session memory should
+settle across the three equal windows; compare corresponding seeds and both controls.
+A longer diagnostic also reports live-entity and allocated-slot counts, to separate changes
+in the modeled population from retained storage:
+
+```sh
+luau -O2 --codegen bench/workload_session.luau -a ../src target 1001 60000 10000
+```
 
 ## Benchmarks in the luau CLI
 
@@ -217,7 +293,10 @@ In one process the implementations run in turn, and the ones that run first chan
 of the later ones: by up to 30 % in some rows. The numbers of
 [the comparison](../jecs-comparison/README.md#performance) run each implementation in a process
 of its own (`impls=jecs`, `impls=previous`, `impls=lib`), 5 times in each mode, and take the
-medians.
+medians. The
+[0.2.4 comparison evidence](https://github.com/dubalda/mErCS/blob/main/bench/results/0.2.4-jecs.md)
+includes the full ranges, raw samples, source hashes and isolated entry points for reproducing
+the matrix, synthetic frame, long session and memory probes.
 
 The group `jecs strengths` (`bench/strengths.luau`) holds ten cases where an archetype ECS is at
 its best, in time or in memory: `(*, T)` and `(R, *)` wildcards that return values, the memory
@@ -253,7 +332,7 @@ first loops included; the matrix takes the minimum of several runs.
 `bench/visual/*.bench.luau` follow the format of the Benchmarker plugin (the same as
 `jecs/test/benches/visual`): `ParameterGenerator`, `BeforeAll` / `AfterAll` /
 `BeforeEach` / `AfterEach` and `Functions` with an entry for jecs and one for mErCS, named with
-their versions (`jecs 0.11.0`, `mErCS 0.2.3`: `libs.luau` reads the version of jecs from its
+their versions (`jecs 0.11.0`, `mErCS 0.2.4`: `libs.luau` reads the version of jecs from its
 Wally package and holds the version of mErCS). The parameters are generated before every call
 and give each function its own fresh world.
 
@@ -348,7 +427,7 @@ The workflows of `.github/workflows/` get the tools from `rokit.toml` (the
 
 | Workflow | When | What |
 |---|---|---|
-| `ci.yml` | every pull request and push to `main` | `tools/check.sh`; `tools/test.sh` in the interpreter and with native code, plus 3 fuzz runs of 400 rounds (`wide hooks`) and 2 with `sparse pool verify hooks wide churn shapes`; the model `mercs.rbxm` and the Wally package as artifacts; the documentation site is built, not published |
+| `ci.yml` | every pull request and push to `main` | `tools/check.sh`; `tools/test.sh` in both modes; workload runner tests; 3 fuzz runs of 400 rounds (`wide hooks`), 2 with `sparse pool verify hooks wide churn shapes monitors`, and 3 exact-snapshot seeds of 2 000 rounds; model/package artifacts; documentation build |
 | `release.yml` | a pushed tag `vX.Y.Z` | the tag must match `version` in `wally.toml`; checks and tests; `wally publish`; a GitHub release with `mercs.rbxm`, whose text is the section of the tag in `CHANGELOG.md` (generated notes when there is none) |
 | `docs.yml` | a push to `main` that changes `src/`, `docs/`, `README.md` or `moonwave.toml` | builds the documentation site and publishes it to GitHub Pages |
 
@@ -359,11 +438,15 @@ To release a version:
    shows `CHANGELOG.md` as its Changelog page.
 2. Set the version (without the `v`) in `wally.toml`, and in the output of the benchmarks:
    `library` in `bench/versions.luau` and `LIBRARY_VERSION` in `bench/visual/libs.luau`.
-3. Commit, wait for a green CI, then push the tag:
+3. Run `python tools/workload.py baseline=v0.2.3 release=yes` (select the actual previous tag
+   for later releases). Review performance and long-session memory, and save the report and
+   raw samples under `bench/results/`. Summarize both modes/scales and every observable
+   behavior change in the release notes.
+4. Commit, wait for a green CI, then push the tag:
 
 ```sh
-git tag -a v0.2.3 -m "mErCS v0.2.3"
-git push origin v0.2.3
+git tag -a v0.2.4 -m "mErCS v0.2.4"
+git push origin v0.2.4
 ```
 
 Settings of the GitHub repository:

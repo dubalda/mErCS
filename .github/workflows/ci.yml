@@ -39,6 +39,8 @@ jobs:
           cache: true
       - run: wally install
       - run: bash tools/test.sh $FLAGS
+      - name: Workload report validation
+        run: python3 -B -m unittest discover -s tools -p 'test_workload.py'
       - name: Longer fuzz runs
         run: |
           for seed in 1 2 3; do
@@ -49,6 +51,9 @@ jobs:
           # query shapes of entities that are deleted, and query monitors
           for seed in 4 5; do
             luau $FLAGS test/fuzz.luau -a "$seed" 400 sparse pool verify hooks wide churn shapes monitors
+          done
+          for seed in 1 42 20260930; do
+            luau $FLAGS test/snapshots_fuzz.luau -a "$seed" 2000
           done
 
   build:

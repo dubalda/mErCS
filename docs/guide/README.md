@@ -90,7 +90,10 @@ world:remove(e, Frozen)
   it from all of them at once (about 20 ns per entity when the id has no `OnRemove` hook).
   `world:each` and `world:children` return the members of the id when the loop starts, in
   ascending slot order, whatever their number and their layout; they are collected into a
-  buffer that the world reuses, so a loop allocates only its iterator. Nothing that changes
+  buffer from a module pool, so a loop with a reusable buffer allocates only its iterator.
+  The pool retains at most 16 buffers and 4 MiB of array values (plus table headers), shared
+  across worlds; larger snapshots and excess concurrent buffers are collected after use.
+  A loop abandoned with `break` leaves its buffer to GC. Nothing that changes
   during the loop changes what it returns: an entity that gets the id is not visited (the
   messages that a loop over messages makes wait for the next loop), one that loses it is
   visited, and one deleted before the loop reaches it is returned as a dead id: a loop that
@@ -271,14 +274,17 @@ disconnect()
   pairs: `world:added(Likes, fn)` runs for every pair of `Likes`. A pair (`ecs.pair(Likes, bob)`
   or a wildcard pair) raises an error.
 - A listener may connect or disconnect listeners, itself included, while it runs: the change
-  applies from the next event.
+  applies from the next event, including the next holder removed while deleting a pair's
+  target or relation.
 - Once the last listener of an id disconnects (the listeners of a monitor too), the changes of
   the id cost what they cost before the first one connected.
 - A listener of a deleted id hears nothing, not even the pairs of the relation that takes its
   slot, until the id is made alive again (`world:entity(id)`).
 - `OnRemove` runs before anything is removed, so the other values of the entity can still be
   read; `deleting` is true when the entity itself is being deleted. When a hook removes
-  another id of the entity, the `OnRemove` of that id runs once, from the removal.
+  another id of the entity, the `OnRemove` of that id runs once, from the removal. If a hook
+  removes a pair from another holder or deletes that holder during target/relation cleanup,
+  the outer cleanup skips that already removed membership.
 - An error raised by a hook or a listener is not caught: the call that ran it stops half
   done. When it interrupts a delete, the cascade stops, and the world may no longer finish
   the cascades deeper than 100 levels queued afterwards or run the hooks of that entity

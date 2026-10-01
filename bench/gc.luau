@@ -7,6 +7,10 @@
       so there it yields one frame instead (which also keeps long runs under the script
       timeout).
     - gc.kb(): the heap size in KB.
+    - gc.allocated(body): net heap growth in bytes, after a full collection. A weak witness
+      rejects intervals in which a GC cycle clears it. This is an allocation proxy, not a
+      counter of allocator traffic: table resizing releases old storage, and a partial
+      incremental GC cycle might not clear the witness yet.
 
     Usage:
         local gc = require("./gc")
@@ -31,7 +35,23 @@ local function kb(): number
     return collect("count")
 end
 
+local function witness(): { {} }
+    return setmetatable({ {} }, { __mode = "v" })
+end
+
+local function allocated(body: () -> ...any): number
+    assert(roblox_task == nil, "allocation measurements require the standalone Luau CLI")
+    full()
+    local guard = witness()
+    local before = kb()
+    body()
+    local bytes = (kb() - before) * 1024
+    assert(guard[1] ~= nil, "GC crossed the allocation interval; reduce the batch and rerun")
+    return bytes
+end
+
 return {
     full = full,
     kb = kb,
+    allocated = allocated,
 }
