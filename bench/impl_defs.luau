@@ -35,7 +35,8 @@ local function jecs_impl(jecs: any, label: string?, ob: any?): Impl
             end
             else nil,
         component = function(world: any): any
-            -- jecs allows 256 world:component() ids; beyond that entities marked as components are used.
+            -- world:component() gives the ids 1..256; jecs makes further components with
+            -- world:entity() and the Component trait, as it advises
             if world.max_component_id < JECS_COMPONENT_LIMIT then
                 return world:component()
             end

@@ -43,7 +43,7 @@ echo "luau-lsp: $("$luau_lsp" --version)"
 status=0
 output=$("$luau_lsp" analyze --flag:LuauSolverV2=true --platform roblox --definitions:@roblox="$definitions" \
     --ignore "Packages/**" --ignore "DevPackages/**" \
-    src/*.luau test/*.luau test/jecs_compat/*.luau bench/*.luau bench/visual/*.luau examples/*.luau studio/*.luau \
+    src/*.luau test/*.luau test/cases/*.luau test/jecs_compat/*.luau bench/*.luau bench/visual/*.luau examples/*.luau studio/*.luau \
     2>&1) || status=$?
 diagnostics=$(printf '%s\n' "$output" | grep -v '^\[INFO\]' || true)
 if [ -n "$diagnostics" ] || [ "$status" -ne 0 ]; then
@@ -52,3 +52,11 @@ if [ -n "$diagnostics" ] || [ "$status" -ne 0 ]; then
     exit "$status"
 fi
 echo "luau-lsp: no errors"
+# the misuses that the public types must reject (test/typecheck/errors.luau, outside the files
+# analyzed above): each marked line must get its error, and no other line any
+# python3, or python where python3 does not run (the Windows store alias)
+python=python3
+if ! python3 -c "" >/dev/null 2>&1; then
+    python=python
+fi
+"$python" tools/typecheck.py "$luau_lsp" "$definitions"

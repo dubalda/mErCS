@@ -76,9 +76,16 @@
     Value pages of dense components are preallocated arrays, of sparse ones small hash tables.
 
     Also: Disabled (hidden from queries that do not name it), change tracking (world:track,
-    world:tick, query:added/changed/removed), query monitors (query:monitor: callbacks for the
-    entities that start and stop matching a query), batch operations on the matches of a query
-    (query:add_all/set_all/remove_all/delete_all), world:remove_all, world:ids.
+    world:tick, query:added/changed/removed) and creation tracking (world:track_created,
+    query:created), query monitors (query:monitor: callbacks for the entities that start and
+    stop matching a query), batch operations on the matches of a query
+    (query:add_all/set_all/remove_all/delete_all/toggle_all), world:toggle, world:remove_all,
+    world:ids. A query must select entities (a required id, an OR term or a change filter);
+    one with excluded ids alone raises an error when it is used (check: selects). A removal
+    that the hooks of the same removal start again does nothing (see removing), so relations
+    kept in sync by hooks run the hook of each side once. world_new has used all 200
+    registers of a Luau function: new state goes into existing tables or locals declared
+    before the functions that use it, and new methods are assigned to world and Query directly.
 
     Changes during iteration: the current entity may be changed or deleted. Changes of other
     entities may or may not be seen by the running loop; an entity deleted ahead of the loop
@@ -290,6 +297,8 @@ export type Query<T...> = typeof(setmetatable(
         added: (self: Query<T...>, id: Id<any>) -> Query<T...>,
         changed: (self: Query<T...>, id: Id<any>) -> Query<T...>,
         removed: (self: Query<T...>, id: Id<any>) -> Query<T...>,
+        -- the entities made since the previous iteration of this query (see World.track_created)
+        created: (self: Query<T...>) -> Query<T...>,
         spans: (self: Query<T...>) -> () -> (number?, number?, number),
         -- batch operations on the entities that match now
         count: (self: Query<T...>) -> number,
@@ -297,6 +306,7 @@ export type Query<T...> = typeof(setmetatable(
         set_all: <V>(self: Query<T...>, id: Id<V>, value: V) -> (),
         remove_all: (self: Query<T...>, id: Id<any>) -> (),
         delete_all: (self: Query<T...>) -> (),
+        toggle_all: (self: Query<T...>, id: Id<any>) -> (),
         -- callbacks for the entities that start and stop matching the query
         monitor: (self: Query<T...>) -> Monitor,
     },
@@ -345,6 +355,8 @@ export type World = {
     has: (self: World, entity: Id<any>, ...Id<any>) -> boolean,
     has_all: (self: World, entity: Id<any>, ids: { Id<any> }) -> boolean,
     remove: (self: World, entity: Id<any>, id: Id<any>) -> (),
+    -- adds the id when the entity does not have it, removes it when it does: true when added
+    toggle: (self: World, entity: Id<any>, id: Id<any>) -> boolean,
     delete: (self: World, entity: Id<any>) -> (),
     clear: (self: World, entity: Id<any>) -> (),
     contains: (self: World, entity: Id<any>) -> boolean,
@@ -359,6 +371,8 @@ export type World = {
     added: <T>(self: World, id: Id<T>, listener: (entity: Entity, id: Id<T>, value: T) -> ()) -> () -> (),
     -- change tracking: record additions, value changes and removals of an id per tick
     track: (self: World, id: Id<any>) -> (),
+    -- creation tracking: record the entities made from now on per tick (Query.created)
+    track_created: (self: World) -> (),
     -- advances the tick: the changes recorded so far become visible to change filters
     tick: (self: World) -> number,
     changed: <T>(self: World, id: Id<T>, listener: (entity: Entity, id: Id<T>, value: T) -> ()) -> () -> (),
@@ -661,7 +675,9 @@ export type World = {
     @prop Component Entity
     @within mErCS
     @readonly
-    The trait of ids that hold data. [World:component] adds it.
+    The trait of ids that hold data. [World:component] adds it. It is given before the first use
+    of the id (as an id, a relation or a target): added to an id used already, or removed from
+    one (remove, clear), it raises an error and nothing changes.
 ]=]
 
 --[=[
@@ -709,7 +725,8 @@ export type World = {
     @within mErCS
     @readonly
     Trait of a relation: an entity has at most one target of it, and adding another replaces
-    the first: `world:add(Targeting, ecs.Exclusive)`.
+    the first: `world:add(Targeting, ecs.Exclusive)`. Given to a relation that an entity has
+    with several targets already, it raises an error and is not added.
 ]=]
 
 --[=[
@@ -744,8 +761,12 @@ export type World = {
     @within World
     @param id Id? -- an id to make alive
     @return Entity
-    A new entity. With `id`, makes that id alive and returns it (the entity of its slot, if
-    it has another generation, is deleted).
+    A new entity. With `id`, makes that id alive and returns it: the entity of its slot, if it
+    has another generation, is deleted first (and so is a new entity that the hooks of that
+    delete make in the slot). An id made alive again has none of the components of its old
+    life, nor their hooks; the signal listeners of the id hear it again. The next entity of the
+    slot takes the generation after `id`, or after the newest generation of the slot when `id`
+    is an older one: the ids of the newer generations stay dead.
 ]=]
 
 --[=[
@@ -806,7 +827,8 @@ export type World = {
     @param entity Id
     @param id Id
     Adds `id` without a value: a tag, or a component whose value stays nil. Any entity can be
-    a tag: `local Frozen = world:entity()`.
+    a tag: `local Frozen = world:entity()`. An `id` that is not alive is ignored (a debug world
+    raises an error); a pair whose relation or target has a free slot raises an error.
 ]=]
 
 --[=[
@@ -851,25 +873,43 @@ export type World = {
     @within World
     @param entity Id
     @param id Id -- a wildcard pair removes every matching pair
-    Removes `id` from the entity; [mErCS.OnRemove] runs first.
+    Removes `id` from the entity; [mErCS.OnRemove] runs first. A removal of the same id from the
+    same entity that the hooks of this removal start again, also by a delete or a clear of the
+    entity, does nothing (this removal completes it): a relation kept in sync by its hooks, each
+    side removing the pair of the other, runs the hook of each side once.
+]=]
+
+--[=[
+    @method toggle
+    @within World
+    @param entity Id
+    @param id Id -- a component, a tag or a pair (not a wildcard)
+    @return boolean -- true when the id was added
+    Adds `id` when the entity does not have it (as [World:add]: a component gets no value) and
+    removes it when it does (as [World:remove]); the hooks, signals, monitors and change
+    tracking of the id run as for those calls. A dead entity is ignored (false); a debug world
+    raises an error for it.
 ]=]
 
 --[=[
     @method delete
     @within World
     @param entity Id
-    Removes every id of the entity (their [mErCS.OnRemove] hooks run first), applies the
-    cleanup policies of the entity used as an id or a target, and frees the slot. Cascades
-    of any depth work (past 100 nested levels the rest is queued: the queued entities lose the
-    deleted id at once, its [mErCS.OnRemove] runs for them with `deleting = true`, and they are
-    deleted after the cascade).
+    Removes every id of the entity (their [mErCS.OnRemove] hooks run first, once per id; an id
+    that the hooks give the entity meanwhile goes without its hooks), applies the cleanup
+    policies of the entity used as an id or a target (also to the uses that the hooks make
+    meanwhile), and frees the slot. Cascades of any depth work (past 100 nested levels the rest is queued: the
+    queued entities lose the deleted id at once, its [mErCS.OnRemove] runs for them with
+    `deleting = true`, and they are deleted after the cascade).
 ]=]
 
 --[=[
     @method clear
     @within World
     @param entity Id
-    Removes every id of the entity; the entity stays alive.
+    Removes every id of the entity; the entity stays alive. The [mErCS.OnRemove] hooks run
+    first, once per id (an id that the hooks give the entity meanwhile goes without its hooks);
+    a removal of an id whose hook has run already does nothing (the clear removes it).
 ]=]
 
 --[=[
@@ -951,7 +991,8 @@ export type World = {
     @param ... Id -- the ids whose values the query returns
     @return Query
     A query over the entities that have all of the given ids (any number; more than 8 go
-    through a table). See [Query].
+    through a table). See [Query]. A query must select entities through a required id, an OR
+    term or a change filter: one with excluded ids alone raises an error when it is used.
 ]=]
 
 --[=[
@@ -996,11 +1037,23 @@ export type World = {
 ]=]
 
 --[=[
+    @method track_created
+    @within World
+    Starts recording the entities made from now on ([World:entity], a [Pool], [World:entity]
+    with an id that makes a new id alive) per tick, for the change filter [Query:created]. A
+    world that does not track creations pays a test per new entity; one that does pays a bit
+    per new entity, and a deleted entity is gone from the filter.
+]=]
+
+--[=[
     @method tick
     @within World
     @return number -- the new tick
     Advances the tick: the changes recorded so far become visible to change filters. Call it
-    once per frame.
+    once per frame, between frames: outside hooks, listeners and loops. It also drops what an
+    error raised by a hook or a listener left in the world (a removal, a clear or a cascade that
+    did not finish) and deletes the entities that such a cascade had queued, so the frames
+    after the error work again; a debug world reports it.
 ]=]
 
 --[=[
@@ -1009,7 +1062,9 @@ export type World = {
     @param first number
     @param last number?
     The new entity ids of this world come after `first` (the first one is `first + 1`, as in
-    jecs) and stay below `last` (networked worlds).
+    jecs) and stay below `last` (networked worlds), also the ids of the pools made before.
+    [World:entity] with an id makes any id alive, also outside the range (an id of another
+    world); once deleted, its slot is not given to a new entity of this world.
 ]=]
 
 --[=[
@@ -1131,6 +1186,15 @@ export type World = {
 ]=]
 
 --[=[
+    @method created
+    @within Query
+    @return Query
+    Change filter: the entities made since the previous iteration of this query and still
+    alive (see [World:track_created], which it needs). `world:query(Position):created()`
+    returns the new entities that have `Position` now; `world:query():created()` all of them.
+]=]
+
+--[=[
     @method each
     @within Query
     @param callback (entity: Entity, ...any) -> ()
@@ -1167,7 +1231,9 @@ export type World = {
     @within Query
     @param id Id
     Adds `id` to every entity that matches now. A component or tag without hooks is added 32
-    entities at a time; pairs and ids with hooks go entity by entity, and every hook runs.
+    entities at a time; pairs and ids with hooks go entity by entity, and every hook runs. A
+    hook that deletes `id` (or the relation or the target of the pair) ends the operation: the
+    rest of the matches do not get it.
 ]=]
 
 --[=[
@@ -1175,7 +1241,8 @@ export type World = {
     @within Query
     @param id Id<V>
     @param value V -- the same value for every match
-    Sets `id` to `value` on every entity that matches now.
+    Sets `id` to `value` on every entity that matches now (as [Query:add_all], also when a hook
+    deletes `id`).
 ]=]
 
 --[=[
@@ -1189,6 +1256,16 @@ export type World = {
     @method delete_all
     @within Query
     Deletes every entity that matches now.
+]=]
+
+--[=[
+    @method toggle_all
+    @within Query
+    @param id Id -- a component, a tag or a pair (not a wildcard)
+    Removes `id` from every entity that matches now and has it, and adds it to every one that
+    does not. A component or tag without hooks is toggled 32 entities at a time; pairs and ids
+    with hooks go entity by entity, and every hook runs. A hook that deletes `id` (or the
+    relation or the target of the pair) ends the operation.
 ]=]
 
 --[=[
@@ -1227,6 +1304,9 @@ export type World = {
       of its terms.
     - A monitor made inside an `OnRemove` hook or a `removed` callback takes the entity being
       changed as it is before the removal (a member that has left already).
+    - An entity that a callback deletes while one of its terms is being removed leaves at the
+      latest when its slot is freed (its `removed` then gets the dead id), before a new entity
+      can take the slot.
     - The callbacks may change the world; an error in one stops the change that ran it, like
       an error in a hook.
 ]=]
@@ -1341,12 +1421,18 @@ local MAX_SHAPES = 1024
 local MAX_MARKS = 16 * MAX_SHAPES
 -- the kinds of changes a tracked id records (see world:track)
 local TRACK_KINDS = { "added", "changed", "removed" }
+-- the key of the creation marks among the tracked ids (no id is 0): world:track_created
+local CREATED = 0
 
 local TOO_MANY_IDS = "at most 8 ids can be passed; use get_list/has_all for more"
 -- reported once by a debug world whose shared query states ran out (see share_shape)
 local SHAPES_EXHAUSTED = `mErCS: {MAX_SHAPES} query shapes are shared, the most a world keeps; a query of a new `
     .. "shape builds a new state on every world:query call. Entity ids and pairs with an entity target used "
     .. "as query terms make a shape per entity: see the Queries section of the guide."
+
+-- what a debug world reports when world:tick finds what an error raised by a callback left
+local RECOVERED = "mErCS: world:tick dropped what an error raised by a hook or a listener left (a removal, "
+    .. "a clear or a cascade that did not finish): the changes of the frame of the error may be incomplete"
 
 local function NOOP(): any
     return nil
@@ -1502,6 +1588,67 @@ local function new_bitset(): Record
         kind = KIND_PLAIN,
         index = 0,
     } :: any
+end
+
+-- The checks of a debug world (see the end of world_new): they take the alive table of the
+-- world, so that they take no registers of world_new, which has used all 200 of them. `level`
+-- is the level of the error, as for error(): 3 when a wrapper of a world method calls them.
+local function debug_check_entity(alive: { number }, entity: i53, level: number)
+    if type(entity) ~= "number" or alive[entity % ENTITY_MASK] ~= entity then
+        error(`entity {entity} is not alive: an outdated handle or a deleted entity`, level)
+    end
+end
+
+local function debug_check_id(alive: { number }, id: i53, level: number, allow_wildcard: boolean)
+    if type(id) ~= "number" then
+        error(`id {id} is not a number`, level)
+    end
+    if id > PAIR_OFFSET then
+        if is_wildcard(id) then
+            if not allow_wildcard then
+                error("wildcard pairs can only be used in queries and remove", level)
+            end
+            return
+        end
+        local first, second = alive[ECS_PAIR_FIRST(id)], alive[ECS_PAIR_SECOND(id)]
+        if first == nil or first <= 0 or second == nil or second <= 0 then
+            error("an element of the pair is not alive", level)
+        end
+    elseif alive[id % ENTITY_MASK] ~= id then
+        error(
+            `id {id} is not alive: an outdated handle, a deleted id, or ecs.component() called after ecs.world()`,
+            level
+        )
+    end
+end
+
+-- A query must select entities: a required id, an OR term or a change filter. Excluded ids
+-- alone would match nothing, so a query used without such a term (iterated, counted, checked
+-- with has, made a monitor, given to a batch operation) raises NO_TERMS from the query method,
+-- at level 2 (the code that called it; the compiler may inline `selects`, so the method raises
+-- the error itself). A query object without terms that is not used (jabby takes the metatable
+-- of one) is not an error.
+local NO_TERMS = "a query needs a required id, an OR term or a change filter: excluded ids alone match nothing"
+local function selects(query: any): boolean
+    return query.filter_with[1] ~= nil or query.any_groups ~= nil or query.tracking ~= nil
+end
+
+-- Keeps the free slots of a free list (list[1..count]) that are inside the range of
+-- world:range (bounds[1], bounds[2]), in their order, and returns how many are kept.
+local function keep_in_range(list: { number }, count: number, bounds: { number }): number
+    local kept = 0
+    for i = 1, count do
+        local e = list[i]
+        local slot = e % ENTITY_MASK
+        if slot > bounds[1] and slot < bounds[2] then
+            kept += 1
+            list[kept] = e
+        end
+    end
+    for i = kept + 1, count do
+        list[i] = nil
+    end
+    return kept
 end
 
 -- The query states that a world shares by shape (see query_state in world_new). The shape of
@@ -1681,7 +1828,16 @@ local function world_new(debug: boolean?): World
     local free: { number } = {}
     local free_count = 0
     local max_slot = 0
-    local range_end: number? = nil
+    -- world:range: the new ids of this world come after range[1] and stay below range[2]
+    -- (math.huge without a last one); nil without a range. One table, not two locals: world_new
+    -- has used all its registers.
+    local range: { number }? = nil
+    -- The floors of the generations of slots (see world:entity): an older generation of a slot
+    -- made alive again over newer ones keeps here the generation after the newest one, which
+    -- the next entity of the slot takes when it is deleted, so that the ids of the newer ones
+    -- stay dead. Such an entity is marked in id_used: only the delete of a used entity reads
+    -- this table.
+    local floors: { [number]: number } = {}
     -- slot pools (see world:pool): the pool of each reserved block (slot // POOL_BLOCK), and
     -- per pool the free entity ids of its blocks (a stack, like free)
     type PoolState = { free: { number }, count: number }
@@ -1708,20 +1864,62 @@ local function world_new(debug: boolean?): World
     -- have something to do when the entity is deleted (not only change tracking)
     local hooked: Words = table.create(SIG_FLAT, 0) :: Words
     local hooked_delete: Words = table.create(SIG_FLAT, 0) :: Words
+    -- The words of the shared signature tables that have hooked bits (hooked[k] ~= 0), in
+    -- ascending order (hooked_delete has bits in these words only): a clear looks for hooked
+    -- ids in these words of the signature only.
+    local hooked_list: { number } = {}
 
     -- The entities whose on_remove hooks run (see run_remove_hooks), innermost last:
     -- clearing[1..clear_depth], each with the records of its hooks in clear_buffers[depth].
     -- Entities, not slots: an entity that reuses the slot inside a hook runs its own hooks. The
     -- stack is short (a hook that deletes another entity adds a level), and it is empty
-    -- outside a clear or a delete, so a search of it costs next to nothing.
+    -- outside a clear or a delete, so a search of it costs next to nothing. A buffer keeps its
+    -- records until the clear ends; its field `at` is the place of the hook that runs (the
+    -- records up to it are notified, or false: see removal_runs).
     local clear_buffers: { { Record } } = {}
     local clear_depth = 0
     local clearing: { i53 } = {}
+    -- The removals whose on_remove hooks run, innermost last: the entity at 2k - 1, the id at
+    -- 2k. A removal of the same id from the same entity that one of these hooks starts again
+    -- does nothing (world_remove): the running removal completes it, so the hooks of a relation
+    -- kept in sync by hooks (each side removes the pair of the other) run once per side. Empty
+    -- outside the hooks of a removal (an error in a hook leaves it as it is, until world:tick).
+    -- Made with an array part: every clear tests removing[1], and a table without one answers
+    -- from its hash part, a slower path.
+    local removing: { i53 } = table.create(2) :: { i53 }
+
+    -- Whether the removal of the id of a record from the entity runs: its hooks run (see
+    -- removing), or a clear of the entity has notified the id (the records of the clear up to
+    -- its place, see clear_buffers). Such a removal is not started again.
+    local function removal_runs(entity: i53, rec: Record): boolean
+        local id = rec.id
+        for k = 1, #removing, 2 do
+            if removing[k] == entity and removing[k + 1] == id then
+                return true
+            end
+        end
+        for d = 1, clear_depth do
+            if clearing[d] == entity then
+                local buffer = clear_buffers[d]
+                for i = 1, (buffer :: any).at do
+                    if buffer[i] == rec then
+                        return true
+                    end
+                end
+            end
+        end
+        return false
+    end
+    -- Creation tracking (see world:track_created): marks the slot of a new entity in the
+    -- created bitset of the current tick; nil until the world tracks creations, so that a
+    -- world that does not costs a test per new entity.
+    local mark_created: ((slot: number) -> ())? = nil
     -- the first ChildOf pair of every slot (slot_pair of the (ChildOf, *) record), for parent()
     local childof_pairs: { [number]: Record }? = nil
 
     -- id_used[slot]: the entity of the slot is (or was) a component, tag, relation or target,
-    -- or a term of a shared query shape (world_delete cleans up after such an entity)
+    -- or a term of a shared query shape, or it has a floor of its generation (world_delete
+    -- cleans up after such an entity; false while it does)
     local id_used: { [number]: boolean } = {}
     -- the query states shared by shape (see query_state)
     local shapes: Shapes = { roots = {}, count = 0, marks = 0, keys = {}, warned = false }
@@ -1734,6 +1932,8 @@ local function world_new(debug: boolean?): World
     -- entity index
     ----------------------------------------------------------------------------
 
+    -- The free list holds only slots inside the range of the world (world_delete, world_entity
+    -- and world_range keep the others out of it), so a new id never leaves the range.
     local function new_slot(): i53
         if free_count > 0 then
             local e = free[free_count]
@@ -1743,7 +1943,8 @@ local function world_new(debug: boolean?): World
             return e
         end
         local slot = max_slot + 1
-        if range_end and slot >= range_end then
+        local bounds = range
+        if bounds and slot >= bounds[2] then
             error("entity id is outside the range set by world:range")
         end
         max_slot = slot
@@ -2095,7 +2296,7 @@ local function world_new(debug: boolean?): World
     -- relation adds to `entity` in place of the pair it removes (see pair_add), which the
     -- monitors take as present while the old pair is removed. The functions are in the table:
     -- world_new is at the limit of local registers.
-    type MonitorState = { check: (entity: i53) -> () }
+    type MonitorState = { check: (entity: i53) -> (), leave: (entity: i53, w: number, bit: number) -> () }
     -- the terms of a query when its monitor was made (see Query.monitor)
     type MonitorTerms = {
         filter_with: { i53 },
@@ -2110,8 +2311,11 @@ local function world_new(debug: boolean?): World
         present: (id: i53, slot: number, w: number, bit: number, excluded: i53, included: i53) -> boolean,
         match: (terms: MonitorTerms, slot: number, excluded: i53, included: i53) -> boolean,
         recheck: (entity: i53) -> (),
+        pending: (entity: i53, id: i53) -> boolean,
+        removing: (entity: i53) -> boolean,
     }
-    local monitoring: Monitoring = { list = {}, entity = 0, id = 0 } :: any
+    -- (the list is made with an array part: every delete tests list[1], see removing)
+    local monitoring: Monitoring = { list = table.create(1), entity = 0, id = 0 } :: any
 
     -- The pair records that lost their last member since the previous batch was freed, in
     -- empty_pairs[1..empty_pair_count] (see note_empty_pair and free_empty_pairs): a pair
@@ -2184,10 +2388,24 @@ local function world_new(debug: boolean?): World
         end
         local k, bit = rec.sig_word, rec.sig_bit
         local mask = hooked[k] or 0
+        local word_hooked = mask ~= 0
         if band(mask, bit) ~= 0 then
             mask -= bit
         end
-        hooked[k] = if on then mask + bit else mask
+        mask = if on then mask + bit else mask
+        hooked[k] = mask
+        if k <= SIG_FLAT and (mask ~= 0) ~= word_hooked then
+            -- the word enters or leaves the list of the hooked words
+            if mask ~= 0 then
+                local at = 1
+                while hooked_list[at] and hooked_list[at] < k do
+                    at += 1
+                end
+                table.insert(hooked_list, at, k)
+            else
+                table.remove(hooked_list, table.find(hooked_list, k))
+            end
+        end
         local cell = dispatched_hooks.on_remove[if rec.kind == KIND_RELATION then rec.relation :: i53 else rec.id]
         local loud = on and (cell == nil or cell.hook ~= nil or cell.loud > 0)
         mask = hooked_delete[k] or 0
@@ -2901,16 +3119,44 @@ local function world_new(debug: boolean?): World
         local wc_rel = rec.wc_rel :: Record
         local slot_pair = wc_rel.slot_pair :: { [number]: Record }
         local first = slot_pair[slot]
-        if first ~= nil and wc_rel.exclusive then
+        -- An exclusive relation replaces the pairs the entity has. The hooks of a removal may give
+        -- the entity another pair of the relation: it is replaced as well, until the entity has
+        -- none but the one this call adds (a hook that keeps adding pairs is an error).
+        local replaced = 0
+        while first ~= nil and wc_rel.exclusive do
+            -- A pair whose removal runs already (this call comes from its hooks) is left to that
+            -- removal; when it is an exclusive replacement as well, it replaces what this call
+            -- adds in turn. Another pair of the slot is replaced in its place.
+            local victim: Record? = first
+            if (removing[1] ~= nil or clear_depth > 0) and removal_runs(entity, first) then
+                victim = nil
+                local list = (wc_rel.slot_pairs :: { [number]: { Record } })[slot]
+                if list then
+                    for _, pair_rec in list do
+                        if not removal_runs(entity, pair_rec) then
+                            victim = pair_rec
+                            break
+                        end
+                    end
+                end
+                if victim == nil then
+                    break
+                end
+            end
+            replaced += 1
+            if replaced > 100 then
+                error("the hooks of an exclusive relation keep giving the entity other targets", 3)
+            end
+            local old_id = (victim :: Record).id
             if monitoring.list[1] == nil then
                 -- no monitor checks the entity during the removal: one that a hook of the old pair
                 -- makes is not among the listeners of this removal (see Query.monitor)
-                world_remove(world, entity, first.id)
+                world_remove(world, entity, old_id)
             else
                 -- the monitors take the new pair as present while the old one is removed
                 local outer_entity, outer_id = monitoring.entity, monitoring.id
                 monitoring.entity, monitoring.id = entity, id
-                world_remove(world, entity, first.id)
+                world_remove(world, entity, old_id)
                 monitoring.entity, monitoring.id = outer_entity, outer_id
             end
             if records[id] ~= rec then
@@ -2935,11 +3181,27 @@ local function world_new(debug: boolean?): World
                 if rec.word_count == 0 then
                     note_empty_pair(rec) -- a hook deleted the entity: nobody may get the pair
                 end
+                if monitoring.list[1] ~= nil then
+                    -- the monitors that took the pair as replaced (the entity staying in their
+                    -- query) see that it is gone
+                    monitoring.recheck(entity)
+                end
                 return
             end
-            -- the hooks of the removal may have changed the entity
+            -- the hooks of the removal may have changed the entity: a pair that they added is
+            -- there, and a set gives it the value of this call (as to a pair there before it)
             word = words[w]
             if word ~= nil and band(word, bit) ~= 0 then
+                if with_value and rec.pages then
+                    set_value(rec, slot, value)
+                    if mirror_count > 0 then
+                        mirror.pair(rec, slot, value)
+                    end
+                    local on_change = rec.on_change
+                    if on_change then
+                        on_change(entity, id, value)
+                    end
+                end
                 return
             end
             first = slot_pair[slot]
@@ -3034,6 +3296,10 @@ local function world_new(debug: boolean?): World
         if existing then
             rec = existing
         else
+            -- an id that is not alive is ignored (a deleted one has no records left)
+            if alive[id % ENTITY_MASK] ~= id then
+                return
+            end
             rec = record_create(id)
             pages = rec.pages
             if pages then
@@ -3118,7 +3384,14 @@ local function world_new(debug: boolean?): World
             pair_add(entity, slot, id, nil, false)
             return
         end
-        local rec = records[id] or record_create(id)
+        local rec = records[id]
+        if rec == nil then
+            -- an id that is not alive is ignored (a deleted one has no records left)
+            if alive[id % ENTITY_MASK] ~= id then
+                return
+            end
+            rec = record_create(id)
+        end
         local words = rec.words
         local w = slot // 32 + 1
         local bit = lshift(1, slot % 32)
@@ -3221,7 +3494,33 @@ local function world_new(debug: boolean?): World
         end
         local on_remove = rec.on_remove
         if on_remove then
+            local n = #removing
+            for i = 1, n, 2 do
+                if removing[i] == entity and removing[i + 1] == id then
+                    return -- started again by the hooks of this removal: it completes itself
+                end
+            end
+            -- the entity may be cleared further out: an id that the clear has notified goes when
+            -- the clear ends (see removal_runs), another one goes now
+            for d = 1, clear_depth do
+                if clearing[d] == entity then
+                    if removal_runs(entity, rec) then
+                        return
+                    end
+                    break
+                end
+            end
+            removing[n + 1] = entity
+            removing[n + 2] = id
             on_remove(entity, id)
+            -- a clear of the entity in the hooks removed the id (it ended the entry, see
+            -- clear_slot): an id given back since is a new one, which stays
+            local completed = removing[n + 2] ~= id
+            removing[n + 2] = nil
+            removing[n + 1] = nil
+            if completed then
+                return
+            end
             -- the hook may have changed the entity already
             word = words[w]
             if alive[slot] ~= entity or word == nil or band(word, bit) == 0 then
@@ -3529,23 +3828,23 @@ local function world_new(debug: boolean?): World
     end
 
     -- Runs the on_remove hooks of the ids of a slot. clear_slot found the first word of the
-    -- signature with hooked ids: word k0 of the shared tables with the hooked bits mask0, or
-    -- k0 = sig_flat_used + 1 when only `more` (sig_more[slot]) has them. Returns false when a
-    -- hook deleted the entity. A hook that clears or deletes the same entity again does not run
-    -- the hooks again.
+    -- signature with hooked ids: word k0 of the shared tables with the hooked bits mask0, the
+    -- words of hooked_list after its place j0, or k0 = 0 when only `more` (sig_more[slot]) has
+    -- them. Returns false when a hook deleted the entity.
+    -- Every id that the entity has is notified once. The records stay in the buffer of the clear
+    -- until its hooks have all run, notified up to the place of the hook that runs: a removal of
+    -- one of them that a later hook starts does nothing (the clear removes it), and a nested
+    -- clear or delete of the entity does not notify them again (see removal_runs). An id that
+    -- the hooks give the entity meanwhile goes with the others, without its hooks.
     local function run_remove_hooks(
         entity: i53,
         slot: number,
         deleting: boolean?,
         more: Words?,
         k0: number,
-        mask0: number
+        mask0: number,
+        j0: number
     ): boolean
-        for d = 1, clear_depth do
-            if clearing[d] == entity then
-                return true
-            end
-        end
         local depth = clear_depth + 1
         clear_depth = depth
         clearing[depth] = entity
@@ -3554,18 +3853,15 @@ local function world_new(debug: boolean?): World
             buffer = {}
             clear_buffers[depth] = buffer
         end
-        local n = 0
         local masks = if deleting then hooked_delete else hooked
-        for k = k0, sig_flat_used do
-            local mask = mask0
-            if k > k0 then
-                mask = band(sig_flat[k][slot] or 0, masks[k])
-            end
+        local n = 0
+        local k, mask = k0, mask0
+        while true do
             if mask ~= 0 then
                 -- collect_hooked, inline for the shared signature tables
-                local base = (k - 1) * 32 + 1
+                local index = (k - 1) * 32 + 1
                 repeat
-                    local rec = by_index[base + countrz(mask)]
+                    local rec = by_index[index + countrz(mask)]
                     mask = band(mask, mask - 1)
                     if rec.kind == KIND_RELATION then
                         n = collect_pairs(rec, slot, buffer, n)
@@ -3575,28 +3871,57 @@ local function world_new(debug: boolean?): World
                     end
                 until mask == 0
             end
+            -- the next word with hooked bits, until the end of the list
+            j0 += 1
+            k = hooked_list[j0]
+            if k == nil then
+                break
+            end
+            mask = band(sig_flat[k][slot] or 0, masks[k])
         end
         if more then
-            for k, mask in more do
-                mask = band(mask, masks[k] or 0)
-                if mask ~= 0 then
-                    n = collect_hooked(slot, buffer, n, k, mask)
+            for more_k, word in more do
+                local hooked_bits = band(word, masks[more_k] or 0)
+                if hooked_bits ~= 0 then
+                    n = collect_hooked(slot, buffer, n, more_k, hooked_bits)
                 end
             end
+        end
+        -- An id whose removal from the entity runs already is skipped: further out (its hooks
+        -- notify it) or in an outer clear of the entity (see removal_runs). A clear that neither
+        -- can concern checks nothing (and its place is set by its first hook, before anything
+        -- reads it).
+        local frame = buffer :: any
+        local check = removing[1] ~= nil
+        if not check then
+            for d = 1, depth - 1 do
+                if clearing[d] == entity then
+                    check = true
+                    break
+                end
+            end
+        end
+        if check then
+            frame.at = 0
         end
         local w = slot // 32 + 1
         local bit = lshift(1, slot % 32)
         for i = 1, n do
             local rec = buffer[i]
-            buffer[i] = nil :: any
             local on_remove = rec.on_remove
             -- an earlier hook may have removed the id (its hook ran then) or the entity
             if on_remove and alive[slot] == entity then
                 local word = rec.words[w]
-                if word ~= nil and band(word, bit) ~= 0 then
+                if word ~= nil and band(word, bit) ~= 0 and not (check and removal_runs(entity, rec)) then
+                    frame.at = i
                     on_remove(entity, rec.id, deleting)
+                    continue
                 end
             end
+            buffer[i] = false :: any -- not notified by this clear
+        end
+        for i = 1, n do
+            buffer[i] = nil :: any
         end
         clearing[depth] = nil :: any
         clear_depth = depth - 1
@@ -3645,54 +3970,63 @@ local function world_new(debug: boolean?): World
         bit_clear(rec, slot)
     end
 
-    -- Removes a plain id of a slot (rare path of clear_slot: records beyond the shared
-    -- signature tables).
-    local function drop_record(rec: Record, slot: number)
-        if rec.kind == KIND_RELATION then
-            drop_relation(rec, slot)
-            return
-        end
-        bit_clear(rec, slot)
-        local pages = rec.pages
-        if pages then
-            local page = pages[slot // PAGE_SIZE + 1]
-            if page then
-                page[slot % PAGE_SIZE + 1] = nil
-            end
-        end
-    end
-
     -- Removes every id of the slot. on_remove hooks run first (once, whichever part of the
     -- signature holds the hooked ids), while all values are present; the removal then reads
-    -- the signature again, because hooks may change the entity.
-    local function clear_slot(entity: i53, slot: number, deleting: boolean?)
+    -- the signature again, because hooks may change the entity. Returns whether hooks ran:
+    -- without them no code outside the library ran, and the entity lives as it did.
+    local function clear_slot(entity: i53, slot: number, deleting: boolean?): boolean
         local more = sig_more[slot]
         local masks = if deleting then hooked_delete else hooked
-        -- the first word with hooked ids (see run_remove_hooks)
-        local k0, mask0 = 0, 0
-        for k = 1, sig_flat_used do
+        -- the first word with hooked ids (see run_remove_hooks), among the words of the world
+        -- that have hooked bits
+        local k0, mask0, j0 = 0, 0, 0
+        for j, k in hooked_list do
             local mask = sig_flat[k][slot]
             if mask then
                 mask = band(mask, masks[k])
                 if mask ~= 0 then
-                    k0, mask0 = k, mask
+                    k0, mask0, j0 = k, mask, j
                     break
                 end
             end
         end
-        if more and k0 == 0 then
+        local hooks = k0 ~= 0
+        if not hooks and more then
             for k, mask in more do
                 if band(mask, masks[k] or 0) ~= 0 then
-                    k0 = sig_flat_used + 1
+                    hooks = true
+                    j0 = #hooked_list -- only `more` has hooked ids
                     break
                 end
             end
         end
-        if k0 ~= 0 then
-            if not run_remove_hooks(entity, slot, deleting, more, k0, mask0) then
-                return
+        if hooks then
+            if not run_remove_hooks(entity, slot, deleting, more, k0, mask0, j0) then
+                return true
             end
             more = sig_more[slot]
+        end
+        -- The ids of the entity go now. Within the hooks of a clear or of a removal (both stacks
+        -- are empty otherwise, see removing): the removals of them that run (whose hooks cleared
+        -- or deleted the entity) have nothing left to do, their entries in `removing` end, so
+        -- that an id given to the entity again afterwards is a new one, notified when it goes.
+        if clear_depth ~= 0 or removing[1] ~= nil then
+            for k = 1, #removing, 2 do
+                if removing[k] == entity then
+                    removing[k + 1] = 0
+                end
+            end
+            -- An outer clear of the entity (a hook of it cleared or deleted the entity again):
+            -- what it notified is gone, and an id given back since is a new one, which a removal
+            -- notifies.
+            for d = 1, clear_depth do
+                if clearing[d] == entity then
+                    local frame = clear_buffers[d] :: any
+                    for i = 1, frame.at do
+                        frame[i] = false
+                    end
+                end
+            end
         end
         local w = slot // 32 + 1
         local bit = lshift(1, slot % 32)
@@ -3795,13 +4129,26 @@ local function world_new(debug: boolean?): World
                 while mask ~= 0 do
                     local rec = by_index[base + countrz(mask)]
                     mask = band(mask, mask - 1)
-                    drop_record(rec, slot)
+                    -- a relation drops its pairs, a plain id its bit and its value
+                    if rec.kind == KIND_RELATION then
+                        drop_relation(rec, slot)
+                    else
+                        bit_clear(rec, slot)
+                        local pages = rec.pages
+                        if pages then
+                            local page = pages[slot // PAGE_SIZE + 1]
+                            if page then
+                                page[slot % PAGE_SIZE + 1] = nil
+                            end
+                        end
+                    end
                 end
             end
         end
         if empty_pair_count > EMPTY_PAIRS then
             free_empty_pairs()
         end
+        return hooks
     end
 
     -- Whether the slot has any id (its signature is not empty).
@@ -3942,13 +4289,36 @@ local function world_new(debug: boolean?): World
                 -- dispatcher. The next member is a new event and must use that dispatcher.
                 local callback = rec.on_remove
                 if callback then
-                    callback(member, id, deleting)
+                    -- (a removal of the id from the member that runs has notified it)
+                    local pending = (removing[1] ~= nil or clear_depth > 0) and removal_runs(member, rec)
+                    if not pending then
+                        local top = #removing
+                        removing[top + 1] = member
+                        removing[top + 2] = id
+                        callback(member, id, deleting)
+                        local completed = removing[top + 2] ~= id
+                        removing[top + 2] = nil
+                        removing[top + 1] = nil
+                        if completed then
+                            -- a clear of the member removed the id: one given back since is a
+                            -- new member, which a next round of the cleanup notifies
+                            continue
+                        end
+                    end
                 end
                 if alive[slot] ~= member or not bit_test(rec, slot) then
                     continue
                 end
-                -- keep the record consistent for the hooks of the next members
+                -- keep the record consistent for the hooks of the next members: the bit and the
+                -- value go (a value without its bit would read as present)
                 bit_clear(rec, slot)
+                local pages = rec.pages
+                if pages then
+                    local page = pages[slot // PAGE_SIZE + 1]
+                    if page then
+                        page[slot % PAGE_SIZE + 1] = nil
+                    end
+                end
             end
             if is_pair then
                 pair_detach(rec, slot)
@@ -3985,48 +4355,81 @@ local function world_new(debug: boolean?): World
 
     -- Deletes the members of a record, or removes the id from them; then frees the record.
     local function cleanup_record(rec: Record, delete: boolean)
-        if delete then
-            if delete_depth >= MAX_DELETE_DEPTH then
-                -- the members are deleted after the record is freed: they leave it now, so that
-                -- none of them keeps its signature bit or a reference to it (the on_remove hook
-                -- of the id runs for them now, as for deleted entities)
-                local members = members_of(rec)
-                table.move(members, 1, #members, #deferred + 1, deferred)
-                strip_members(rec, members, true)
-            else
-                delete_depth += 1
-                for _, member in members_of(rec) do
-                    world_delete(world, member)
-                end
-                delete_depth -= 1
+        -- A hook that runs here (a removal listener of the id, a hook of a deleted member) may
+        -- give the id to more entities: they are cleaned up as well, until the record has no
+        -- member, so that no signature keeps the index of the freed record. Without a hook of
+        -- the id, a removal (the last branch) runs no code and leaves the bits of the record as
+        -- they are; then no member can be new.
+        for round = 1, 101 do
+            if round > 100 then
+                error("hooks keep giving an id to entities while it is deleted", 0)
             end
-        else
-            strip_members(rec, members_of(rec), nil)
+            local has_hook = rec.on_remove ~= nil
+            local stripped = not delete
+            if delete then
+                if delete_depth >= MAX_DELETE_DEPTH then
+                    -- the members are deleted after the record is freed: they leave it now, so
+                    -- that none of them keeps its signature bit or a reference to it (the
+                    -- on_remove hook of the id runs for them now, as for deleted entities)
+                    local members = members_of(rec)
+                    table.move(members, 1, #members, #deferred + 1, deferred)
+                    strip_members(rec, members, true)
+                    stripped = true
+                else
+                    delete_depth += 1
+                    for _, member in members_of(rec) do
+                        world_delete(world, member)
+                    end
+                    delete_depth -= 1
+                end
+            else
+                strip_members(rec, members_of(rec), nil)
+            end
+            if rec.word_count == 0 or (stripped and not has_hook) then
+                break
+            end
         end
         free_record(rec)
     end
 
-    local function has_policy(entity: i53, policy: i53, action: i53): boolean
-        return world_has_pair(entity, ECS_PAIR(policy, action))
-    end
-
-    -- Applies cleanup policies for an entity that is used as an id, relation or target.
+    -- Applies cleanup policies for an entity that is used as an id, relation or target. A hook
+    -- that runs meanwhile may delete the entity (that delete cleans up its uses) and give its
+    -- slot to a new entity: the records of the slot are then those of the new one, and the
+    -- cleanup stops.
     local function cleanup_ids(entity: i53, delete_policy: boolean)
+        local slot = entity % ENTITY_MASK
         -- the entity used as a component or tag
         local rec = records[entity]
         if rec then
             cleanup_record(rec, delete_policy)
+            if alive[slot] ~= entity then
+                return
+            end
         end
 
+        -- The entity used as a relation, then as a target. A cleaned pair record leaves the pairs
+        -- of both; the hooks of the cleanup may make new pairs with the entity meanwhile, which
+        -- another round cleans, until none is left.
         -- the entity used as a relation: pairs (entity, *)
         local relation_rec = records[ECS_PAIR(entity, EcsWildcard)]
         if relation_rec then
-            local list: { Record } = {}
-            for _, pair_rec in relation_rec.pairs :: { [i53]: Record } do
-                table.insert(list, pair_rec)
-            end
-            for _, pair_rec in list do
-                cleanup_record(pair_rec, delete_policy)
+            local pairs_of = relation_rec.pairs :: { [i53]: Record }
+            local rounds = 0
+            while next(pairs_of) ~= nil do
+                rounds += 1
+                if rounds > 100 then
+                    error("hooks keep making pairs of an entity while it is deleted", 0)
+                end
+                local list: { Record } = {}
+                for _, pair_rec in pairs_of do
+                    table.insert(list, pair_rec)
+                end
+                for _, pair_rec in list do
+                    cleanup_record(pair_rec, delete_policy)
+                    if alive[slot] ~= entity then
+                        return
+                    end
+                end
             end
             free_record(relation_rec)
         end
@@ -4034,14 +4437,29 @@ local function world_new(debug: boolean?): World
         -- the entity used as a target: pairs (*, entity)
         local target_rec = records[ECS_PAIR(EcsWildcard, entity)]
         if target_rec then
-            local list: { Record } = {}
-            for _, pair_rec in target_rec.pairs :: { [i53]: Record } do
-                table.insert(list, pair_rec)
-            end
+            local pairs_of = target_rec.pairs :: { [i53]: Record }
             local outer = dying_target
             dying_target = target_rec
-            for _, pair_rec in list do
-                cleanup_record(pair_rec, has_policy(pair_rec.relation :: i53, EcsOnDeleteTarget, EcsDelete))
+            local rounds = 0
+            while next(pairs_of) ~= nil do
+                rounds += 1
+                if rounds > 100 then
+                    error("hooks keep making pairs of an entity while it is deleted", 0)
+                end
+                local list: { Record } = {}
+                for _, pair_rec in pairs_of do
+                    table.insert(list, pair_rec)
+                end
+                for _, pair_rec in list do
+                    cleanup_record(
+                        pair_rec,
+                        world_has_pair(pair_rec.relation :: i53, ECS_PAIR(EcsOnDeleteTarget, EcsDelete))
+                    )
+                    if alive[slot] ~= entity then
+                        dying_target = outer
+                        return
+                    end
+                end
             end
             dying_target = outer
             free_record(target_rec)
@@ -4053,37 +4471,71 @@ local function world_new(debug: boolean?): World
         if alive[slot] ~= entity then
             return
         end
-        if id_used[slot] then
-            -- the cleanup policy of the entity itself is one of its own ids: read it first
-            local delete_policy = has_policy(entity, EcsOnDelete, EcsDelete)
-            clear_slot(entity, slot, true)
+        -- the cleanup policy of the entity itself is one of its own ids: read it first (id_used:
+        -- true for an entity used as an id, false while its uses are cleaned up)
+        local used = id_used[slot]
+        local delete_policy = used ~= nil and world_has_pair(entity, ECS_PAIR(EcsOnDelete, EcsDelete))
+        -- the floor of the generations of the slot, taken with the uses (see floors)
+        local floor: number? = nil
+        if clear_slot(entity, slot, true) then
             if alive[slot] ~= entity then
                 return -- deleted by a hook
             end
-            cleanup_ids(entity, delete_policy)
-            -- the shared query shapes that have the id can never match again
-            prune_shapes(shapes, slot)
+            -- The hooks may have used the entity as an id for the first time (giving it to another
+            -- entity): those uses go by the default policy, its own ids being gone. A used entity
+            -- stays used while it lives (only the end of its delete clears the flag).
+            used = id_used[slot]
+        end
+        if used ~= nil then
+            -- The uses of the entity as an id go. The hooks that run meanwhile may use it as an id
+            -- again (a new record sets the flag back to true) or give it ids again (a child that
+            -- writes into its parent while the parent is deleted): they go as well, in more
+            -- rounds, or the freed slot would keep them for the entity that reuses it. The flag
+            -- stays false while a round runs: an error that stops it leaves the cleanup to the
+            -- next delete.
+            local rounds = 0
+            repeat
+                rounds += 1
+                if rounds > 100 then
+                    error("hooks keep giving an entity ids or uses while it is deleted", 0)
+                end
+                id_used[slot] = false
+                cleanup_ids(entity, delete_policy == true)
+                if alive[slot] == entity then
+                    -- the shared query shapes that have the id can never match again (a hook that
+                    -- deleted the entity pruned them, and the slot may be another entity's now)
+                    prune_shapes(shapes, slot)
+                end
+                if delete_depth == 0 and deferred[1] ~= nil then
+                    drain_deferred()
+                end
+                if alive[slot] ~= entity then
+                    return -- deleted by a hook
+                end
+                if slot_has_ids(slot) then
+                    clear_slot(entity, slot, true)
+                    if alive[slot] ~= entity then
+                        return -- deleted by a hook
+                    end
+                end
+            until id_used[slot] ~= true
             id_used[slot] = nil
-            if delete_depth == 0 and deferred[1] ~= nil then
-                drain_deferred()
+            -- the hooks that the dispatchers of the id kept for the cleanup of its members go: the
+            -- id, when it lives again (world:entity, or after the generations of its slot went
+            -- round), has none of them (its signal listeners stay connected, see connect)
+            for _, cells in dispatched_hooks do
+                local cell = cells[entity]
+                if cell then
+                    cell.hook = nil
+                end
             end
-            -- a hook of the cascade may have given the entity ids again (a child that writes
-            -- into its parent while the parent is deleted): they go as well, or the freed slot
-            -- would keep them for the entity that reuses it
-            if alive[slot] == entity and slot_has_ids(slot) then
-                clear_slot(entity, slot, true)
+            floor = floors[slot]
+            if floor ~= nil then
+                floors[slot] = nil
             end
-        else
-            clear_slot(entity, slot, true)
         end
-        if alive[slot] ~= entity then
-            return -- deleted by a hook
-        end
-        if id_used[slot] then
-            -- a hook of this delete made query shapes with the entity (after its shapes were
-            -- pruned, or when it was no id before): they go too
-            prune_shapes(shapes, slot)
-        end
+        -- (the rounds above end with the entity alive and its uses gone: query shapes that a
+        -- hook made with the entity marked it used again, and went with the next round)
         local marked = last_marked[slot]
         if marked then
             last_marked[slot] = nil
@@ -4106,19 +4558,48 @@ local function world_new(debug: boolean?): World
                 end
             end
         end
-        alive[slot] = -1 - slot * ENTITY_MASK
         local generation = entity // ENTITY_MASK + 1
         if generation >= GENERATION_MASK then
             generation = 0
         end
-        local pool = if has_pools then block_pool[slot // POOL_BLOCK] else nil
-        if pool then
-            local count = pool.count + 1
-            pool.count = count
-            pool.free[count] = slot + generation * ENTITY_MASK
-        else
-            free_count += 1
-            free[free_count] = slot + generation * ENTITY_MASK
+        if floor ~= nil then
+            generation = floor
+        end
+        -- the free slot holds the negative of its next id + 1 (see world:entity)
+        local next_id = slot + generation * ENTITY_MASK
+        local dead = -1 - next_id
+        alive[slot] = dead
+        -- the monitors that still count the entity see it leave before the slot can go to a new
+        -- entity (see Query.monitor); a callback that disconnects monitors is safe, and one that
+        -- makes an entity of the slot keeps it (the slot is not free then)
+        local monitors = monitoring.list
+        if monitors[1] ~= nil then
+            local w = slot // 32 + 1
+            local bit = lshift(1, slot % 32)
+            for i = #monitors, 1, -1 do
+                local monitor = monitors[i]
+                if monitor then
+                    monitor.leave(entity, w, bit)
+                end
+            end
+            if alive[slot] ~= dead then
+                return
+            end
+        end
+        -- a slot outside the range of the world (an id of another world that world:entity(id)
+        -- made alive, or a slot taken before world:range) is not given to a new entity: it stays
+        -- off the free lists of the world and of its pools
+        local bounds = range
+        if bounds == nil or (slot > bounds[1] and slot < bounds[2]) then
+            local pool = if has_pools then block_pool[slot // POOL_BLOCK] else nil
+            if pool then
+                local count = pool.count + 1
+                pool.count = count
+                pool.free[count] = next_id
+            else
+                free_count += 1
+                free[free_count] = next_id
+            end
         end
     end
 
@@ -4128,6 +4609,12 @@ local function world_new(debug: boolean?): World
 
     local function world_entity(_: any, id: i53?): i53
         if id == nil then
+            -- (the creation is marked here, not in new_slot: a function that small is inlined)
+            if mark_created then
+                local e = new_slot()
+                mark_created(e % ENTITY_MASK)
+                return e
+            end
             return new_slot()
         end
         local slot = id % ENTITY_MASK
@@ -4135,16 +4622,33 @@ local function world_new(debug: boolean?): World
             return id
         end
         if slot > max_slot then
-            for s = max_slot + 1, slot - 1 do
-                alive[s] = -1 - s * ENTITY_MASK
-                free_count += 1
-                free[free_count] = s
+            -- the slots skipped before it are free for new ids (inside the range only), pushed
+            -- from the last one: world:entity() takes them in ascending order
+            local bounds = range
+            for s = slot - 1, max_slot + 1, -1 do
+                alive[s] = -1 - s
+                if bounds == nil or (s > bounds[1] and s < bounds[2]) then
+                    free_count += 1
+                    free[free_count] = s
+                end
             end
             max_slot = slot
         else
+            -- The owner of the slot is deleted first. The hooks of that delete may make a new
+            -- entity in the freed slot (or make the id alive themselves): it goes as well, until
+            -- the slot is free.
             local current = alive[slot]
-            if current > 0 then
+            local rounds = 0
+            while current > 0 do
+                if current == id then
+                    return id
+                end
+                rounds += 1
+                if rounds > 100 then
+                    error("hooks keep making entities in the slot of an explicit id", 2)
+                end
                 world_delete(world, current)
+                current = alive[slot]
             end
             -- the slot leaves the free list it is on: its pool's or the world's
             local pool = if has_pools then block_pool[slot // POOL_BLOCK] else nil
@@ -4166,8 +4670,18 @@ local function world_new(debug: boolean?): World
                     end
                 end
             end
+            -- an older generation than the newest one of the slot (its marker holds the next id,
+            -- see world_delete): the generations after it stay dead (see floors)
+            local next_generation = (-1 - current) // ENTITY_MASK
+            if id // ENTITY_MASK + 1 < next_generation then
+                floors[slot] = next_generation
+                id_used[slot] = true -- (its delete takes the floor, see world_delete)
+            end
         end
         alive[slot] = id
+        if mark_created then
+            mark_created(slot)
+        end
         return id
     end
 
@@ -4177,15 +4691,15 @@ local function world_new(debug: boolean?): World
         local block = max_slot // POOL_BLOCK + 1
         local first = block * POOL_BLOCK
         local last = first + POOL_BLOCK - 1
-        if range_end and last >= range_end then
-            last = range_end - 1
+        if range and last >= range[2] then
+            last = range[2] - 1
             if last < first then
                 error("entity id is outside the range set by world:range", 3)
             end
         end
         -- pushed from the last slot: world:entity() takes them in ascending order
         for s = first - 1, max_slot + 1, -1 do
-            alive[s] = -1 - s * ENTITY_MASK
+            alive[s] = -1 - s
             free_count += 1
             free[free_count] = s
         end
@@ -4193,7 +4707,7 @@ local function world_new(debug: boolean?): World
         local count = pool.count
         -- pushed from the last slot: the pool hands out its slots in ascending order
         for s = last, first, -1 do
-            alive[s] = -1 - s * ENTITY_MASK
+            alive[s] = -1 - s
             count += 1
             list[count] = s
         end
@@ -4217,6 +4731,9 @@ local function world_new(debug: boolean?): World
                 list[count] = nil
                 pool.count = count - 1
                 alive[e % ENTITY_MASK] = e
+                if mark_created then
+                    mark_created(e % ENTITY_MASK)
+                end
                 return e
             end,
         }
@@ -4245,11 +4762,19 @@ local function world_new(debug: boolean?): World
         return alive[entity % ENTITY_MASK] ~= nil
     end
 
-    local function world_range(_: any, range_begin: number, range_end_: number?)
-        range_end = range_end_
+    local function world_range(_: any, range_begin: number, range_end: number?)
+        local bounds = { range_begin, range_end or math.huge }
+        range = bounds
+        -- the free slots outside the range, of the world and of its pools, are not for new ids
+        -- any more (a pool of several blocks is filtered once per block: the next passes keep
+        -- all of its slots)
+        free_count = keep_in_range(free, free_count, bounds)
+        for _, pool in block_pool do
+            pool.count = keep_in_range(pool.free, pool.count, bounds)
+        end
         if range_begin > max_slot then
             for s = max_slot + 1, range_begin do
-                alive[s] = -1 - s * ENTITY_MASK
+                alive[s] = -1 - s
             end
             max_slot = range_begin
         end
@@ -4321,8 +4846,11 @@ local function world_new(debug: boolean?): World
     -- world:each and world:children: the members of the id at the start of the loop, in
     -- ascending slot order, whatever their number and their layout, collected into a buffer of
     -- each_pool that the loop reads: a reused buffer costs only the iterator closure. A record of a few words
-    -- (at most EACH_FEW_WORDS keys, including emptied ones) has its non-empty keys sorted (a sparse id, the
-    -- children of a parent: fewer steps than the levels of the bitset); a larger one is walked
+    -- (at most EACH_FEW_WORDS keys, emptied ones included, and no more words emptied since its
+    -- zeros were dropped than non-empty words) has its non-empty keys sorted (a sparse id, the
+    -- children of a parent: fewer steps than the levels of the bitset); a larger one, or one whose
+    -- members keep moving to other words (a state tag of a small world, where the levels of the
+    -- bitset reach its few non-empty words in fewer steps than its emptied keys take), is walked
     -- through its tops, its sums and its words, a full word copied at once. Nothing that changes
     -- during the loop changes what it returns: an entity that gets the id is not visited, one
     -- that loses it is visited, one deleted before the loop reaches it is returned as a dead id.
@@ -4351,10 +4879,12 @@ local function world_new(debug: boolean?): World
         local list = each_take()
         local n = 0
         local sums = rec.sums
-        if word_count <= EACH_FEW_WORDS and word_count + rec.zeros <= EACH_FEW_WORDS then
+        local zeros = rec.zeros
+        -- the keys path visits at most twice the non-empty words
+        if zeros <= word_count and word_count + zeros <= EACH_FEW_WORDS then
             local keys = each_words
             local k = word_count
-            if word_count <= 2 and rec.zeros == 0 then
+            if word_count <= 2 and zeros == 0 then
                 -- one or two words: in order without a sort
                 local w1 = (next(words)) :: number
                 keys[1] = w1
@@ -4369,7 +4899,7 @@ local function world_new(debug: boolean?): World
             else
                 table.clear(keys)
                 k = 0
-                if rec.zeros == 0 then
+                if zeros == 0 then
                     -- Clean records keep the branch-free key collection of 0.2.3.
                     for w in words do
                         k += 1
@@ -4560,6 +5090,9 @@ local function world_new(debug: boolean?): World
         local cell = dispatched_hooks[field][entity]
         if cell then
             cell.hook = value
+            if value ~= nil then
+                id_used[entity % ENTITY_MASK] = true -- (its delete drops the hook, see world_delete)
+            end
             if field == "on_remove" then
                 refresh_hooked(entity)
             end
@@ -4579,6 +5112,9 @@ local function world_new(debug: boolean?): World
         if cell == nil then
             -- (a deleted id has no hook: the hook of its slot is that of the entity that took it)
             local own_hook = if alive[id % ENTITY_MASK] == id then hook_of(HOOK_IDS[field], id % ENTITY_MASK) else nil
+            if own_hook ~= nil then
+                id_used[id % ENTITY_MASK] = true -- (its delete drops the hook, see world_delete)
+            end
             local created: Dispatch = { hook = own_hook, listeners = {}, loud = 0 }
             cell = created
             local function dispatch(entity: i53, component: i53, value: any?)
@@ -4686,21 +5222,62 @@ local function world_new(debug: boolean?): World
         end
         tracked[id] = rings
         local added, changed, removed = rings.added, rings.changed, rings.removed
+        -- Only for the entity of the event while it is alive: a listener that runs before these
+        -- may have deleted it, and world_delete has forgotten the changes of its slot already
+        -- (its slot may even hold a new entity).
         connect("on_add", id, function(entity: i53)
-            track_mark(added[current_tick % TRACK_TICKS + 1], entity % ENTITY_MASK)
+            local slot = entity % ENTITY_MASK
+            if alive[slot] == entity then
+                track_mark(added[current_tick % TRACK_TICKS + 1], slot)
+            end
         end)
         connect("on_change", id, function(entity: i53)
-            track_mark(changed[current_tick % TRACK_TICKS + 1], entity % ENTITY_MASK)
+            local slot = entity % ENTITY_MASK
+            if alive[slot] == entity then
+                track_mark(changed[current_tick % TRACK_TICKS + 1], slot)
+            end
         end)
         connect("on_remove", id, function(entity: i53, _: i53, deleting: any?)
             -- not for a deleted entity: world_delete forgets all changes of its slot
-            if not deleting then
-                track_mark(removed[current_tick % TRACK_TICKS + 1], entity % ENTITY_MASK)
+            local slot = entity % ENTITY_MASK
+            if not deleting and alive[slot] == entity then
+                track_mark(removed[current_tick % TRACK_TICKS + 1], slot)
             end
         end, true)
     end
 
     local function world_tick(_: any): number
+        -- An error raised by a hook, a listener or a monitor callback stops the call that ran it
+        -- half done, and leaves the bookkeeping of the calls in progress as it was: the removals
+        -- whose hooks run, the clears, the depth of a cascade and its queue, the target being
+        -- cleaned up, the pair that an exclusive relation replaces. A tick runs between frames,
+        -- outside every call, so what it finds there is what such an error left: it goes, and
+        -- the entities that the stopped cascade had queued are deleted now.
+        if
+            removing[1] ~= nil
+            or clear_depth ~= 0
+            or delete_depth ~= 0
+            or draining
+            or deferred[1] ~= nil
+            or dying_target ~= nil
+            or monitoring.entity ~= 0
+        then
+            table.clear(removing)
+            for d = 1, clear_depth do
+                clearing[d] = nil :: any
+                table.clear(clear_buffers[d])
+            end
+            clear_depth = 0
+            delete_depth = 0
+            draining = false
+            dying_target = nil
+            monitoring.entity, monitoring.id = 0, 0
+            if debug then
+                local report = warn or print -- the luau CLI has no warn
+                report(RECOVERED)
+            end
+            drain_deferred()
+        end
         current_tick += 1
         local index = current_tick % TRACK_TICKS + 1
         for _, rings in tracked do
@@ -4733,6 +5310,9 @@ local function world_new(debug: boolean?): World
     local function tracking_record(id: i53, kind: string, first: number, last: number): Record?
         local rings = tracked[id]
         if rings == nil then
+            if id == CREATED then
+                error("the created filter needs world:track_created() first", 4)
+            end
             error("change filters need a tracked id: call world:track(id) first", 4)
         end
         local ring = rings[kind]
@@ -6055,6 +6635,7 @@ local function world_new(debug: boolean?): World
                 buffered = scan.new_buffered(n_ids)
                 spare_contexts.buffered[n_ids] = buffered
             end
+            local seen = query.seen_tick
             local driver = plan_query(query, buffered.others, buffered.without)
             if driver == nil then
                 return NOOP, nil, 0
@@ -6066,6 +6647,11 @@ local function world_new(debug: boolean?): World
                 buffered.bind(query)
                 buffered.busy = true
                 return buffered.step, nil, 0
+            end
+            -- the loop goes the general way, which plans again: over the same changes (a plan
+            -- marks the changes of the change filters as seen)
+            if query.tracking then
+                query.seen_tick = seen
             end
         end
         local ctx = query.direct
@@ -7445,9 +8031,19 @@ local function world_new(debug: boolean?): World
             if debug and not list_unchanged(query) then
                 error("mErCS: a cached query missed a change of its records (a library bug)", 2)
             end
-        elseif list_unchanged(query) or iteration_mode(query) == 2 then
+        elseif list_unchanged(query) then
             listed = true
             query.list_stamp = changes_stamp
+        else
+            -- a query that selects nothing never has a list: it is refused here, so that the
+            -- loops over lists that are up to date pay nothing for the check
+            if not selects(query) then
+                error(NO_TERMS, 2)
+            end
+            if iteration_mode(query) == 2 then
+                listed = true
+                query.list_stamp = changes_stamp
+            end
         end
         if listed then
             if query.list_groups == 0 then
@@ -7680,6 +8276,10 @@ local function world_new(debug: boolean?): World
                     break
                 end
             end
+        end
+        if not stable and not selects(query) then
+            -- a query that selects nothing never has a list (see query_iter)
+            error(NO_TERMS, 2)
         end
         if stable or iteration_mode(query) == 2 then
             query.list_stamp = changes_stamp
@@ -8436,9 +9036,22 @@ local function world_new(debug: boolean?): World
         if n == 0 then
             return
         end
+        -- The id (both elements of a pair) must be alive, also while the hooks of the batch run:
+        -- the matches after a hook that deleted it do not get it.
+        local first_slot, second_slot = id % ENTITY_MASK, id % ENTITY_MASK
+        if id > PAIR_OFFSET then
+            first_slot, second_slot = ECS_PAIR_FIRST(id), ECS_PAIR_SECOND(id)
+        end
+        local first, second = alive[first_slot] or 0, alive[second_slot] or 0
+        if first <= 0 or second <= 0 or (id < PAIR_OFFSET and first ~= id) then
+            return
+        end
         local rec = if id > PAIR_OFFSET then nil else records[id] or record_create(id)
         if rec == nil or rec.on_add or (set and rec.on_change) then
             for _, entity in matched_entities(n) do
+                if alive[first_slot] ~= first or alive[second_slot] ~= second then
+                    break
+                end
                 if set then
                     world_set(world, entity, id, value)
                 else
@@ -8912,12 +9525,22 @@ local function world_new(debug: boolean?): World
         return self
     end
 
+    -- Change filter: the entities made since the previous iteration of the query and still
+    -- alive (world:track_created records them).
+    function Query.created(self: QueryHandle): QueryHandle
+        self.state = add_tracking(self.state, "created", CREATED)
+        return self
+    end
+
     -- A cached query keeps what it observed and its match list between iterations (shared
     -- queries are cached already). A query that has not been iterated yet picks its mode and
     -- builds its match list now, like jecs matches its archetypes here: the first loop costs
     -- no more than the next ones.
     function Query.cached(self: QueryHandle): QueryHandle
         local state = self.state
+        if not selects(state) then
+            error(NO_TERMS, 2)
+        end
         if not (state.first_use and promote(state)) then
             make_cached(state)
         end
@@ -8930,32 +9553,151 @@ local function world_new(debug: boolean?): World
     Query.each = query_each
 
     function Query.has(self: QueryHandle, entity: i53): boolean
+        if not selects(self.state) then
+            error(NO_TERMS, 2)
+        end
         return query_has(self.state, entity)
     end
 
     -- Batch operations on the entities that match the query at the time of the call.
     function Query.count(self: QueryHandle): number
+        if not selects(self.state) then
+            error(NO_TERMS, 2)
+        end
         return query_count(self.state)
     end
 
     function Query.add_all(self: QueryHandle, id: i53)
+        if not selects(self.state) then
+            error(NO_TERMS, 2)
+        end
         query_insert(self.state, id, nil, false)
     end
 
     function Query.set_all(self: QueryHandle, id: i53, value: any)
+        if not selects(self.state) then
+            error(NO_TERMS, 2)
+        end
         query_insert(self.state, id, value, true)
     end
 
     function Query.remove_all(self: QueryHandle, id: i53)
+        if not selects(self.state) then
+            error(NO_TERMS, 2)
+        end
         query_remove(self.state, id)
     end
 
     function Query.delete_all(self: QueryHandle)
+        if not selects(self.state) then
+            error(NO_TERMS, 2)
+        end
         query_delete(self.state)
+    end
+
+    -- Removes id from every match that has it and adds it to every match that does not. A plain
+    -- id without hooks (nor tracking, signals or monitors) is toggled a word of 32 entities at a
+    -- time; pairs and hooked ids go entity by entity through world:remove and world:add, and a
+    -- match that the hook of an earlier one deleted is skipped. (Defined here, not as a local
+    -- function: world_new has used all its registers.)
+    function Query.toggle_all(self: QueryHandle, id: i53)
+        if debug then
+            debug_check_id(alive, id, 3, false)
+        elseif id > PAIR_OFFSET and is_wildcard(id) then
+            error("toggle takes a component, a tag or a pair, not a wildcard", 2)
+        end
+        local query = self.state
+        if not selects(query) then
+            error(NO_TERMS, 2)
+        end
+        local n = match_words(query)
+        if n == 0 then
+            return
+        end
+        -- the id (both elements of a pair) must be alive, also while the hooks run (see
+        -- query_insert)
+        local first_slot, second_slot = id % ENTITY_MASK, id % ENTITY_MASK
+        if id > PAIR_OFFSET then
+            first_slot, second_slot = ECS_PAIR_FIRST(id), ECS_PAIR_SECOND(id)
+        end
+        local first, second = alive[first_slot] or 0, alive[second_slot] or 0
+        if first <= 0 or second <= 0 or (id < PAIR_OFFSET and first ~= id) then
+            return
+        end
+        local rec = if id > PAIR_OFFSET then nil else records[id] or record_create(id)
+        if rec == nil or rec.kind ~= KIND_PLAIN or rec.on_add or rec.on_remove then
+            for _, entity in matched_entities(n) do
+                if alive[first_slot] ~= first or alive[second_slot] ~= second then
+                    break
+                end
+                if alive[entity % ENTITY_MASK] == entity then
+                    if world_has(world, entity, id) then
+                        world_remove(world, entity, id)
+                    else
+                        world_add(world, entity, id)
+                    end
+                end
+            end
+            return
+        end
+        local buffer = match_buffer
+        local words = rec.words
+        local st, sig_bit = rec.sig_table, rec.sig_bit
+        local pages = rec.pages
+        for i = 1, n, 2 do
+            local w, m = buffer[i], buffer[i + 1]
+            local old = words[w]
+            -- the matches that have the id lose it, the others get it
+            local gone = if old then band(m, old) else 0
+            local fresh = m - gone
+            if old == nil or old == 0 then
+                word_first(rec, w, fresh)
+            else
+                local word = old - gone + fresh
+                if word == 0 then
+                    word_last(rec, w)
+                else
+                    words[w] = word
+                end
+            end
+            local base = (w - 1) * 32
+            if gone ~= 0 then
+                local page = if pages then pages[base // PAGE_SIZE + 1] else nil
+                local offset = base % PAGE_SIZE + 1
+                repeat
+                    local index = countrz(gone)
+                    gone = band(gone, gone - 1)
+                    if st then
+                        st[base + index] -= sig_bit
+                    else
+                        sig_more_remove(rec, base + index)
+                    end
+                    if page then
+                        page[offset + index] = nil
+                    end
+                until gone == 0
+            end
+            while fresh ~= 0 do
+                local slot = base + countrz(fresh)
+                fresh = band(fresh, fresh - 1)
+                if st then
+                    local sig = st[slot]
+                    st[slot] = if sig then sig + sig_bit else sig_bit
+                else
+                    sig_more_add(rec, slot)
+                end
+            end
+        end
+        -- many slots at once: no journal entry, the queries of the id scan it again
+        rec.version += 1
+        changes_stamp += 1
     end
 
     -- Fast path: iterator of (first_slot, last_slot, mask), see make_advance.
     function Query.spans(self: QueryHandle): () -> (number?, number?, number)
+        if not selects(self.state) then
+            error(NO_TERMS, 2)
+        end
         local driver, others, without = plan_query(self.state)
         if driver == nil then
             return function(): (number?, number?, number)
@@ -8989,11 +9731,50 @@ local function world_new(debug: boolean?): World
         if not has_bit(id, w, bit) then
             return false
         end
-        if wildcard and excluded > PAIR_OFFSET and ECS_PAIR_FIRST(excluded) == ECS_PAIR_FIRST(id) then
+        local entity = alive[slot]
+        if removing[1] ~= nil and not wildcard and monitoring.pending(entity, id) then
+            return false -- its removal runs: the entity is checked as it will be
+        end
+        if wildcard and (removing[1] ~= nil or excluded > PAIR_OFFSET) then
+            -- (R, *): a pair of R that the entity keeps
             local rec = records[id]
-            return rec ~= nil and (rec.slot_pairs :: { [number]: { Record } })[slot] ~= nil
+            if rec == nil then
+                return false
+            end
+            local list = (rec.slot_pairs :: { [number]: { Record } })[slot]
+            if list == nil then
+                local single = (rec.slot_pair :: { [number]: Record })[slot]
+                list = if single then { single } else {}
+            end
+            for _, pair_rec in list :: { Record } do
+                local pair_id = pair_rec.id
+                if pair_id ~= excluded and not monitoring.pending(entity, pair_id) then
+                    return true
+                end
+            end
+            return false
         end
         return true
+    end
+
+    -- Whether the removal of the id from the entity runs (its hooks run now, see `removing`).
+    function monitoring.pending(entity: i53, id: i53): boolean
+        for k = 1, #removing, 2 do
+            if removing[k] == entity and removing[k + 1] == id then
+                return true
+            end
+        end
+        return false
+    end
+
+    -- Whether a removal from the entity runs.
+    function monitoring.removing(entity: i53): boolean
+        for k = 1, #removing, 2 do
+            if removing[k] == entity then
+                return true
+            end
+        end
+        return false
     end
 
     -- Whether the slot matches the terms of a query once `excluded` is removed and `included`
@@ -9050,6 +9831,9 @@ local function world_new(debug: boolean?): World
 
     function Query.monitor(self: QueryHandle): Monitor
         local state = self.state
+        if not selects(state) then
+            error(NO_TERMS, 2)
+        end
         if state.tracking then
             error("a monitor cannot use change filters", 2)
         end
@@ -9221,10 +10005,17 @@ local function world_new(debug: boolean?): World
             end
         end
 
-        -- Whether the slot of a live entity that is not being cleared matches now.
+        -- Whether the slot of a live entity that is not being cleared matches now (the ids whose
+        -- removal from the entity runs are absent already, see monitoring.present).
         local function matches(w: number, bit: number): boolean
             if no_terms then
                 return false -- a query without terms matches nothing (see plan_query)
+            end
+            if removing[1] ~= nil then
+                local slot = (w - 1) * 32 + countrz(bit)
+                if monitoring.removing(alive[slot]) then
+                    return monitoring.match(terms, slot, 0, 0)
+                end
             end
             if words_generation ~= records_generation then
                 read_words()
@@ -9261,14 +10052,25 @@ local function world_new(debug: boolean?): World
 
         -- a full check of the entity as it is now (see monitoring.recheck)
         local function check(entity: i53)
-            if connected then
-                local slot = entity % ENTITY_MASK
-                update(
-                    entity,
-                    alive[slot] == entity
-                        and not being_cleared(entity)
-                        and matches(slot // 32 + 1, lshift(1, slot % 32))
-                )
+            local slot = entity % ENTITY_MASK
+            -- (a dead entity left when its slot was freed: see leave)
+            if connected and alive[slot] == entity then
+                update(entity, not being_cleared(entity) and matches(slot // 32 + 1, lshift(1, slot % 32)))
+            end
+        end
+
+        -- A member leaves when its slot is freed (world_delete), before the slot can go to a new
+        -- entity, whose membership the bit then means: an entity that a hook deleted while the
+        -- removal of a term ran (the hooks of that term then skip it) leaves here.
+        local function leave(entity: i53, w: number, bit: number)
+            local word = members[w]
+            if word ~= nil and band(word, bit) ~= 0 then
+                word -= bit
+                members[w] = if word ~= 0 then word else nil
+                local callback = on_removed
+                if callback then
+                    callback(entity)
+                end
             end
         end
 
@@ -9293,8 +10095,9 @@ local function world_new(debug: boolean?): World
             local bit = lshift(1, slot % 32)
             local word = members[w] or 0
             if band(word, bit) ~= 0 then
-                -- a member: an excluded id makes it leave
-                if effect == EXIT_ON_ADD or (effect == OTHER_TERM and not matches(w, bit)) then
+                -- a member: an excluded id makes it leave, unless a listener that ran before this
+                -- one took the id back (the entity is checked as it is now)
+                if (effect == EXIT_ON_ADD or effect == OTHER_TERM) and not matches(w, bit) then
                     word -= bit
                     members[w] = if word ~= 0 then word else nil
                     local callback = on_removed
@@ -9331,8 +10134,11 @@ local function world_new(debug: boolean?): World
                     return
                 end
             end
+            local slot = entity % ENTITY_MASK
+            if alive[slot] ~= entity then
+                return -- a dead entity left when its slot was freed (see leave)
+            end
             if effect == EXIT_ON_REMOVE or deleting or being_cleared(entity) then
-                local slot = entity % ENTITY_MASK
                 local w = slot // 32 + 1
                 local bit = lshift(1, slot % 32)
                 local word = members[w]
@@ -9382,7 +10188,7 @@ local function world_new(debug: boolean?): World
             table.insert(disconnects, connect("on_add", id, on_add))
             table.insert(disconnects, connect("on_remove", id, on_remove, anchor ~= nil and id ~= anchor))
         end
-        local handle: MonitorState = { check = check }
+        local handle: MonitorState = { check = check, leave = leave }
         table.insert(monitoring.list, handle)
 
         local function disconnect()
@@ -9439,15 +10245,6 @@ local function world_new(debug: boolean?): World
         return setmetatable(state, Query) :: any
     end
 
-    -- Fast path: page table of a component (page index -> values of PAGE_SIZE slots).
-    local function world_column(_: any, id: i53): Pages
-        return columns[id] or EMPTY_PAGES
-    end
-
-    local function world_alive_table(_: any): { number }
-        return alive
-    end
-
     ----------------------------------------------------------------------------
     -- assembly and bootstrap
     ----------------------------------------------------------------------------
@@ -9479,82 +10276,114 @@ local function world_new(debug: boolean?): World
     world.removed = world_removed
     world.range = world_range
     world.query = world_query
-    world.column = world_column
-    world.alive_table = world_alive_table
+    -- Fast path: page table of a component (page index -> values of PAGE_SIZE slots). (These two
+    -- are written here, not as local functions: world_new has used all its registers.)
+    world.column = function(_: any, id: i53): Pages
+        return columns[id] or EMPTY_PAGES
+    end
+    world.alive_table = function(_: any): { number }
+        return alive
+    end
     world.ids = world_ids
+
+    -- Adds the id when the entity does not have it and removes it when it does; true when it was
+    -- added. (Written here, not as local functions: world_new has used all its registers.)
+    world.toggle = function(_: any, entity: i53, id: i53): boolean
+        if debug then
+            debug_check_entity(alive, entity, 3)
+            debug_check_id(alive, id, 3, false)
+        elseif id > PAIR_OFFSET and is_wildcard(id) then
+            error("toggle takes a component, a tag or a pair, not a wildcard", 2)
+        end
+        if alive[entity % ENTITY_MASK] ~= entity then
+            return false
+        end
+        if world_has(world, entity, id) then
+            world_remove(world, entity, id)
+            return false
+        end
+        if id < PAIR_OFFSET and alive[id % ENTITY_MASK] ~= id then
+            return false -- an id that is not alive is ignored (see world_add)
+        end
+        world_add(world, entity, id)
+        return true
+    end
+
+    -- Starts recording the entities made from now on (world:entity, a pool, world:entity(id)
+    -- making an id alive), per tick, for the change filter Query.created: a ring of TRACK_TICKS
+    -- bitsets like those of a tracked id, cleared for a deleted entity with them.
+    world.track_created = function(_: any)
+        if tracked[CREATED] then
+            return
+        end
+        local ring: { Record } = table.create(TRACK_TICKS) :: { Record }
+        for t = 1, TRACK_TICKS do
+            local rec = new_bitset()
+            ring[t] = rec
+            table.insert(track_rings, rec)
+            table.insert(track_words, rec.words)
+        end
+        tracked[CREATED] = { created = ring }
+        mark_created = function(slot: number)
+            track_mark(ring[current_tick % TRACK_TICKS + 1], slot)
+        end
+    end
 
     -- Debug mode (ecs.world(true)): set/add/remove/delete/clear raise an error for an entity
     -- that is not alive (an outdated handle) or an id that is not alive, instead of ignoring
     -- the call. Internal calls (cascades) are not checked. Patched match lists are checked by
     -- iteration_mode (verify_list), the lists taken as they are by the loops (list_stamp).
     if debug then
-        local function check_entity(entity: i53, level: number)
-            if type(entity) ~= "number" or alive[entity % ENTITY_MASK] ~= entity then
-                error(`entity {entity} is not alive: an outdated handle or a deleted entity`, level)
-            end
-        end
-        local function check_id(id: i53, level: number, allow_wildcard: boolean)
-            if type(id) ~= "number" then
-                error(`id {id} is not a number`, level)
-            end
-            if id > PAIR_OFFSET then
-                if is_wildcard(id) then
-                    if not allow_wildcard then
-                        error("wildcard pairs can only be used in queries and remove", level)
-                    end
-                    return
-                end
-                local first, second = alive[ECS_PAIR_FIRST(id)], alive[ECS_PAIR_SECOND(id)]
-                if first == nil or first <= 0 or second == nil or second <= 0 then
-                    error("an element of the pair is not alive", level)
-                end
-            elseif alive[id % ENTITY_MASK] ~= id then
-                error(
-                    `id {id} is not alive: an outdated handle, a deleted id, or ecs.component() called after ecs.world()`,
-                    level
-                )
-            end
-        end
         world.set = function(_: any, entity: i53, id: i53, value: any)
-            check_entity(entity, 3)
-            check_id(id, 3, false)
+            debug_check_entity(alive, entity, 3)
+            debug_check_id(alive, id, 3, false)
             world_set(world, entity, id, value)
         end
         world.add = function(_: any, entity: i53, id: i53)
-            check_entity(entity, 3)
-            check_id(id, 3, false)
+            debug_check_entity(alive, entity, 3)
+            debug_check_id(alive, id, 3, false)
             world_add(world, entity, id)
         end
         world.remove = function(_: any, entity: i53, id: i53)
-            check_entity(entity, 3)
-            check_id(id, 3, true)
+            debug_check_entity(alive, entity, 3)
+            debug_check_id(alive, id, 3, true)
             world_remove(world, entity, id)
         end
         world.delete = function(_: any, entity: i53)
-            check_entity(entity, 3)
+            debug_check_entity(alive, entity, 3)
             world_delete(world, entity)
         end
         world.clear = function(_: any, entity: i53)
-            check_entity(entity, 3)
+            debug_check_entity(alive, entity, 3)
             world_clear(world, entity)
         end
         function Query.add_all(self: QueryHandle, id: i53)
-            check_id(id, 3, false)
+            debug_check_id(alive, id, 3, false)
+            if not selects(self.state) then
+                error(NO_TERMS, 2)
+            end
             query_insert(self.state, id, nil, false)
         end
         function Query.set_all(self: QueryHandle, id: i53, value: any)
-            check_id(id, 3, false)
+            debug_check_id(alive, id, 3, false)
+            if not selects(self.state) then
+                error(NO_TERMS, 2)
+            end
             query_insert(self.state, id, value, true)
         end
         function Query.remove_all(self: QueryHandle, id: i53)
-            check_id(id, 3, true)
+            debug_check_id(alive, id, 3, true)
+            if not selects(self.state) then
+                error(NO_TERMS, 2)
+            end
             query_remove(self.state, id)
         end
     end
 
     -- The builtin ids and the pre-registered ones: a function of its own, whose loops and
-    -- calls take no registers of world_new (see the helpers before world_new).
-    local function bootstrap()
+    -- calls take no registers of world_new (see the helpers before world_new), called at once
+    -- without a local (world_new has used all its registers).
+    (function()
         -- ids 1..EcsRest (and pre-registered tags) exist as entities
         for _ = 1, preregistered_tags do
             new_slot()
@@ -9609,12 +10438,22 @@ local function world_new(debug: boolean?): World
         world_set(world, EcsRest, EcsName, "mercs.Rest")
         world_set(world, EcsDisabled, EcsName, "mercs.Disabled")
 
-        -- Exclusive marks relations with one target per entity; keep existing pair records in sync
+        -- Exclusive marks relations with one target per entity; keep existing pair records in sync.
+        -- A relation that an entity has with several targets cannot take it: the add is undone
+        -- before its error (slot_pairs lists the slots with several pairs, see pair_attach).
         set_internal_hook(EcsExclusive, "on_add", function(entity: i53)
             local wc = records[ECS_PAIR(entity, EcsWildcard)]
-            if wc then
-                wc.exclusive = true
+            if wc == nil then
+                return
             end
+            if next(wc.slot_pairs :: { [number]: { Record } }) ~= nil then
+                local ok, problem = pcall(world_remove, world, entity, EcsExclusive)
+                if not ok then
+                    error(problem, 0)
+                end
+                error("the Exclusive trait cannot be added to a relation that an entity has with several targets", 0)
+            end
+            wc.exclusive = true
         end)
         set_internal_hook(EcsExclusive, "on_remove", function(entity: i53)
             local wc = records[ECS_PAIR(entity, EcsWildcard)]
@@ -9636,8 +10475,51 @@ local function world_new(debug: boolean?): World
                 end
             end
         end
-    end
-    bootstrap()
+
+        -- Component decides whether the records of an id hold values when they are made: it
+        -- cannot be added to or removed from an id used already (as an id, a relation or a
+        -- target), whose records would not follow. The add is undone before its error. The
+        -- removal is refused before it changes anything (in a clear too: the hook of Component
+        -- runs first, its record is the oldest one with hooks), and it takes its entries off the
+        -- removal stacks, which the error leaves.
+        local undoing = false
+        local function used(entity: i53): boolean
+            return records[entity] ~= nil
+                or records[ECS_PAIR(entity, EcsWildcard)] ~= nil
+                or records[ECS_PAIR(EcsWildcard, entity)] ~= nil
+        end
+        set_internal_hook(EcsComponent, "on_add", function(entity: i53)
+            if used(entity) then
+                -- the undo runs the removal listeners of Component: one that raises an error
+                -- must not leave the removal hook below off (a rare path: pcall costs nothing)
+                undoing = true
+                local ok, problem = pcall(world_remove, world, entity, EcsComponent)
+                undoing = false
+                if not ok then
+                    error(problem, 0)
+                end
+                error("the Component trait cannot be added to an id used already: give it before the first use", 0)
+            end
+        end)
+        set_internal_hook(EcsComponent, "on_remove", function(entity: i53, _: i53, deleting: any?)
+            if deleting or undoing or not used(entity) then
+                return
+            end
+            -- (world:remove runs the hook with its entry on the stack, a clear without one)
+            local top = #removing
+            if removing[top] == EcsComponent and removing[top - 1] == entity then
+                removing[top] = nil
+                removing[top - 1] = nil
+            end
+            local depth = clear_depth
+            if depth > 0 and clearing[depth] == entity then
+                table.clear(clear_buffers[depth])
+                clearing[depth] = nil
+                clear_depth = depth - 1
+            end
+            error("the Component trait cannot be removed from an id used already", 0)
+        end)
+    end)()
 
     return world :: World
 end
@@ -9675,10 +10557,11 @@ return {
     IS_PAIR = (ECS_IS_PAIR :: any) :: (id: Id) -> boolean,
     pair_first = (pair_first :: any) :: (world: World, pair: Id) -> Entity,
     pair_second = (pair_second :: any) :: (world: World, pair: Id) -> Entity,
-    ECS_PAIR_FIRST = (ECS_PAIR_FIRST :: any) :: (pair: Id<any> | number) -> number,
-    ECS_PAIR_SECOND = (ECS_PAIR_SECOND :: any) :: (pair: Id<any> | number) -> number,
-    ECS_ID = (ECS_ID :: any) :: (entity: Id<any> | number) -> number,
-    ECS_GENERATION = (ECS_GENERATION :: any) :: (entity: Id<any> | number) -> number,
+    -- (generic: an id of any data type, also the result of a call, as `world:entity()`)
+    ECS_PAIR_FIRST = (ECS_PAIR_FIRST :: any) :: <T>(pair: Id<T> | number) -> number,
+    ECS_PAIR_SECOND = (ECS_PAIR_SECOND :: any) :: <T>(pair: Id<T> | number) -> number,
+    ECS_ID = (ECS_ID :: any) :: <T>(entity: Id<T> | number) -> number,
+    ECS_GENERATION = (ECS_GENERATION :: any) :: <T>(entity: Id<T> | number) -> number,
     ECS_GENERATION_INC = (ECS_GENERATION_INC :: any) :: <T>(entity: Id<T>) -> Id<T>,
     ENTITY_MASK = ENTITY_MASK,
     PAGE_SIZE = PAGE_SIZE,

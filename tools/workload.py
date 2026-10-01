@@ -1,6 +1,6 @@
 """Run P1-P9 in isolated Luau processes and compare a release with two control runs.
 
-Usage: python tools/workload.py [--luau path] [runs=5] [baseline=v0.2.3]
+Usage: python tools/workload.py [--luau path] [runs=5] [baseline=v0.2.4]
        [tests=P1,P7] [scales=target] [modes=native] [release=yes] [output=tmp/workload]
 
 The default covers the server, the alternate retained-agent lifecycle, the client and
@@ -29,7 +29,7 @@ ROOT = Path(__file__).resolve().parent.parent
 TESTS = tuple(f"P{i}" for i in range(1, 10))
 GROUPS = ("sparse", "small", "target", "small-empty-retained", "target-empty-retained", "client", "buffers")
 BUILDS = ("baseline", "baseline_again", "candidate", "candidate_again")
-COUNTS = {"P2": 2, "P3": 1, "P4": 1, "P5": 1, "P6": 3, "P7": 2, "P8": 7, "P9": 3}
+COUNTS = {"P2": 4, "P3": 1, "P4": 1, "P5": 2, "P6": 3, "P7": 2, "P8": 7, "P9": 3}
 
 
 def checked(*command: str) -> bytes:
@@ -60,7 +60,7 @@ def parse_samples(output: str) -> dict[tuple[str, str, str, str], float]:
 
 def expected_counts(group: str, selected: set[str]) -> dict[str, int]:
     if group == "sparse":
-        counts = {"P1": 7}
+        counts = {"P1": 10}
     elif group == "client":
         counts = {"P4": 1, "P7": 1, "P8": 4, "P9": 1}
     elif group == "buffers":
@@ -86,7 +86,11 @@ def compare(samples: dict[str, list[float]], unit: str, case: str) -> dict:
     noise = max(resolution, abs(med(a) - med(b)), 3 * med([abs(x - y) for x, y in zip(a, b)]))
     before, after = med(a + b), med(c + d)
     delta = after - before
-    status = "regression" if delta > noise else "improved" if delta < -noise else "within noise"
+    # A difference of exactly the allowance (one step of the heap resolution) is within it: the
+    # rounding of the float subtraction must not turn it into a change.
+    tolerance = 1e-9 * max(1.0, abs(before), abs(after))
+    status = ("regression" if delta > noise + tolerance
+              else "improved" if delta < -noise - tolerance else "within noise")
     return {
         "baseline": before,
         "candidate": after,
@@ -143,7 +147,7 @@ def options(arguments: list[str]) -> dict:
     parser.add_argument("--luau", default="luau")
     parser.add_argument("settings", nargs="*")
     parsed = parser.parse_args(arguments)
-    settings = {"runs": "5", "baseline": "v0.2.3", "tests": ",".join(TESTS),
+    settings = {"runs": "5", "baseline": "v0.2.4", "tests": ",".join(TESTS),
                 "scales": ",".join(GROUPS), "modes": "interpreter,native", "release": "no",
                 "output": "tmp/workload"}
     for setting in parsed.settings:

@@ -1,5 +1,273 @@
 # Changelog
 
+## v1.0.0 — 2026-10-01
+
+### Changed behavior
+
+- A query whose terms select no entity — excluded ids alone, as `world:query():without(A)` —
+  raises an error when it is used: a loop, `each`, `count`, `has`, `cached`, a monitor or a
+  batch operation. In 0.2.4 it matched nothing. A query selects through a returned or required
+  id, an OR term (`any`) or a change filter; a query object that is not used is not an error.
+- A removal that the hooks of the same removal start again — the same id removed from the same
+  entity, also by a delete or a clear of the entity — does nothing: the running removal
+  completes it. In 0.2.4 the `OnRemove` hook ran again, so a relation kept in sync by its hooks
+  (each side removing the pair of the other) recursed until the stack overflowed when either
+  side removed, replaced (an exclusive relation) or was deleted, and a removal hook that
+  deleted its entity ran twice, the second time with `deleting` true. Now each runs once.
+- The `Component` trait is given to an id before its first use: added to an id used already
+  (as an id, a relation or a target), or removed from a used one by `world:remove` or
+  `world:clear`, it raises an error and changes nothing. In 0.2.4 the add succeeded and
+  `world:has(id, ecs.Component)` was true, but the id stayed a tag (`world:set` raised the
+  error that told to add the trait); a removal left the values of a component whose trait was
+  gone. A used component is deleted as before.
+- A clear or a delete runs the `OnRemove` hooks (and the removal listeners) once per id of the
+  entity: not again for an id that a later hook removes, which 0.2.4 notified a second time
+  (that removal now does nothing: the clear removes the id). An id that these hooks give the
+  entity still goes with the others, without its hooks, as in 0.2.4.
+- `world:tick()` drops what an error raised by a hook or a listener left in the world — a
+  removal, a clear or a cascade that did not finish, the target being cleaned up, the pair an
+  exclusive relation was replacing — and deletes the entities that the stopped cascade had
+  queued; a debug world reports it. In 0.2.4 such an error left the world unable, for the rest
+  of its life, to run the hooks of that entity in a clear or a delete, to finish cascades deeper
+  than 100 levels, and to keep the `(*, T)` query of the target up to date. Call `world:tick()`
+  between frames, outside hooks, listeners and loops.
+- `world:range(first, last)`: the new ids stay inside the range also after `world:entity(id)`
+  made an id outside it alive. In 0.2.4 the slot of a deleted id below the range went to the
+  next new entity, and an id above the range made the next new ids come from the slots skipped
+  below it (`4999` after `world:entity(5000)` in `range(1000, 2000)`, not `1001`).
+- After `world:entity(id)` above the highest slot, new ids take the skipped slots in ascending
+  order (0.2.4: from the highest down).
+- `world:entity(id)` of an older generation of a slot than its newest one: after that id is
+  deleted, the next entity of the slot takes the generation after the newest one, also when
+  the slot left the range of the world and came back. In 0.2.4 it took the generation after
+  `id`, so the ids of the newer generations came alive again (their old handles were valid,
+  and their listeners and hooks ran for the new entity).
+- `Exclusive` given to a relation that an entity has with several targets already raises an
+  error and is not added. In 0.2.4 it was added and the entity kept its targets.
+
+### New
+
+- `world:toggle(entity, id)` adds an id that the entity does not have and removes one that it
+  has, with the hooks, signals, monitors and change tracking of `add` and `remove`, and returns
+  true when it added the id. `query:toggle_all(id)` does it for every match: 32 entities at a
+  time for a component or tag without hooks, entity by entity otherwise.
+- Creation tracking: `world:track_created()` records the entities made from then on
+  (`world:entity`, a slot pool, `world:entity(id)` making an id alive), and the change filter
+  `query:created()` returns those made since the previous iteration of the query, with the ticks
+  of the other change filters. A world that does not track creations pays a test per new entity.
+
+### Fixes
+
+- `world:each` and `world:children` over a sparse id of a small world whose members move between
+  words: the sorted keys of the record are used only while its emptied words are no more than the
+  non-empty ones, otherwise the levels of the bitset. 4 members among 1 500 entities after 40
+  moves: 0.585 → 0.447 µs per loop in native code (23.6 % less), 0.826 → 0.663 µs in the interpreter
+  (19.7 % less).
+- Types: `ECS_ID`, `ECS_GENERATION`, `ECS_PAIR_FIRST` and `ECS_PAIR_SECOND` take an id of any data
+  type, also straight from a call: `ecs.ECS_ID(world:entity())` was reported as an error.
+- An exclusive relation whose removal hook adds another target while a target is replaced: the
+  outer add wins (a `set` with its value, also when the hook set the same pair), the other
+  target is added and replaced in turn (with its hooks), and the entity keeps one target. In
+  0.2.4 the hooks recursed until the stack overflowed.
+- Deleting an id: the entities that its removal hooks give it while it is cleaned up are cleaned
+  up too (they lose it, or are deleted under a delete policy). In 0.2.4 they kept the dead id,
+  and `world:ids` of such an entity raised an error.
+- Deleting an entity that its own removal hooks use as an id for the first time: that use is
+  cleaned up. In 0.2.4 the other entity kept the dead id, and a query of it returned that
+  entity.
+- Deleting an entity: the uses that hooks make while its cascade runs — the entity used as an id
+  for the first time, a pair with it as the relation or the target — are cleaned up as well. In
+  0.2.4 they stayed, with a dead id (`world:ids` of the other entity listed it).
+- Monitors: an entity enters when a listener adds a term of the query while `Disabled` or an
+  excluded id is being removed from it. In 0.2.4 the monitor missed that entry.
+- Change tracking: an entity deleted by a listener of the change no longer passes the change to
+  the new entity in its slot. In 0.2.4, when the id was tracked after the listener was
+  connected, `added`, `changed` or `removed` returned the new entity.
+- Monitors: an excluded id that a listener of its add removes again leaves the monitor as it
+  was. In 0.2.4 the monitor reported an exit while the entity still matched, and then missed
+  its real exit.
+- `world:range` bounds the pools made before it: they take new blocks inside the range, and
+  their slots outside it are not given again. In 0.2.4 such a pool went on giving the slots of
+  its block.
+- `world:add`, `world:set` and `world:toggle` of an id that is not alive do nothing in a world
+  without debug, as the guide says. In 0.2.4 the entity got the deleted id: `world:has` and
+  the queries of the id returned it.
+- A loop over a query with change filters (`added`, `changed`, `removed`, `created`) returns
+  every change also when the query cannot gather its matches first: a driving record of more
+  than 64 words (more than 2 048 entities) or more terms. In 0.2.4 such a loop returned
+  nothing, while `count`, `each` and a cached query returned the changes.
+- `add_all`, `set_all` and `toggle_all` stop when a hook deletes their id (or the relation or
+  the target of their pair): the rest of the matches do not get it. In 0.2.4 they went on and
+  gave the rest the deleted id (`world:has` and the queries of the id returned them), and
+  `set_all` of a deleted component raised an error.
+- `world:entity(id)` over a live entity whose removal hooks make a new entity in the freed
+  slot: that entity is deleted too, before the slot goes to `id`. In 0.2.4 `id` took the slot
+  with the values of that entity, which stayed on its holders as a dead id.
+- Deleting an id (or the target of a pair): a holder that the cleanup has passed reads no
+  value of the id, and a hook that sets the id on it again adds it (`added`, then `removed`
+  when the cleanup removes it again). In 0.2.4 the old value stayed readable, and the set
+  changed it in place (`changed`) without giving the id back.
+- Deleting an id whose removal hook deletes it and makes a new entity in its slot: the cleanup
+  stops at the old id, and the pairs of the new entity (as the relation or the target) and
+  their holders stay. In 0.2.4 the cleanup went on with the records of the new entity: it
+  removed its pairs and, under a delete policy, deleted their holders.
+- An id that lives again (`world:entity(id)`, or the same id when the 16-bit generations of its
+  slot have gone round) has none of the hooks of its old components, also when it has signal
+  listeners: the hooks go when the id is deleted. In 0.2.4 the deleted `OnAdd`, `OnChange` or
+  `OnRemove` hook of the id ran again.
+- Monitors: an entity that a listener deletes while a term of the query is being removed, and
+  a new entity that takes its slot at once, leave and enter: the monitor reports the exit of
+  the old entity (when its slot is freed) and the entry of the new one. It took the new entity
+  for the member that left, missed its entry and then dropped it.
+
+### Tests and tools
+
+- The behavior specification: `test/behavior.luau` runs the cases of `test/cases/`, one module
+  per subject (`changes`, `queries`, `loops`, `hooks`, `relations`, `tracking`, `batches`,
+  `worlds`, `workload`), 339 cases. Named groups run alone, and a module path runs the same
+  cases on a saved release, which shows the changed behavior between two releases.
+  `test/edge_cases.luau` and `test/workload_cases.luau` are groups of it now.
+- New cases: the terms of a query on five entities through every way of reading it; `world:each`
+  and `world:children` return disabled members (`Disabled` hides an entity from queries only);
+  what one tick of change tracking records, batch operations on tracked ids and the depth of the
+  history; relations kept in sync by their own hooks (one to one, two relations, one to many,
+  many to many); batch operations whose matches cascade or leave the query; two worlds in one
+  process; `world:entity(id)` over a live slot; an old id of a slot that a new entity took;
+  `world:range` with ids of another world; listeners disconnected after the list changed;
+  disconnected listeners and monitors that nothing keeps; several excluded ids; listeners that
+  give a changing relation or a deleted id new uses, that delete the entity of their own event
+  (a removal, a tracked change) or take back an excluded id (a monitor); the `Component` trait
+  after the first use of an id; a pool made before `world:range`; what `world:tick()` restores
+  after an error raised by a hook; clears and deletes that notify every id once; monitors and the
+  changes made while an id is removed; uses that hooks make during a cascade; batch operations
+  whose hooks delete their id; `world:entity(id)` whose delete makes a new entity in the slot;
+  holders of a deleted id that its hooks read or set; ids made alive again, also an older
+  generation of a slot and an id whose slot went round its generations; monitors and the
+  cleanups of ids whose slot a listener gives to a new entity; what hooks and listeners see
+  (the new value in an OnChange hook, the additions of an id used before as a tag and a
+  relation), deletes of relations and targets (a relation in the slot of a deleted one, cascades
+  in any order of creation, the other components of a survivor, re-parenting to an entity in
+  the slot of a deleted parent), explicit ids and new entities, values after a component is
+  set, removed and set again.
+- `test/reentrant_fuzz.luau` makes hooks, listeners and monitor callbacks change the world while
+  it changes (also batch operations with ids and pairs that the callbacks delete, explicit ids
+  over live entities, deleted ids made alive again, new entities in a slot freed a moment
+  before, components used as ids), and checks the world against itself after every operation:
+  every addition and
+  removal heard once (but for the ids that hooks give an entity during its own clear or delete),
+  no dead id on a live entity, one target of an exclusive relation, queries,
+  `world:each`, counts and monitors in agreement, change filters returning only changes of the
+  tick. It found the faults of 0.2.4 fixed above; CI runs three seeds. `test/behavior.luau -a
+  debug` runs every case with debug worlds (`tools/test.sh` runs the specification both ways).
+- `test/typecheck/errors.luau` holds 21 misuses of the public types, each marked with the error
+  it must get; `tools/typecheck.py` (run by `tools/check.sh`) requires exactly these errors.
+  `test/types.luau` adds optional and union components, a typed wrapper, a pair of a tag
+  relation, mixed lists of ids, toggles and creation tracking. The Python tests are
+  `tools/test_*.py`.
+- The model of the reference workload follows it more closely: the states out of idle hold a few
+  members each (the busiest one, a passing one that the intersection walks go over, four more),
+  the messages come at their averages, P5 adds a burst of activity and P2 a stress case of 80
+  members; P1 adds a small world (4 members among 1 500 entities, moved 40 and 3 000 times).
+- `tools/check.sh` and `tools/workload.sh` run `python` where `python3` does not run.
+- `bench/basic.luau` runs the four basic benchmarks of jecs (spawn, despawn, insertion, query)
+  for mErCS, jecs and ecr in the CLI; ecr 0.9.0 is a Wally dev dependency, and the Benchmarker
+  files of the same four benchmarks (`bench/visual/`) time ecr as well.
+- `tools/workload.py` takes a difference of exactly one step of the heap resolution as noise
+  (the rounding of a float subtraction made it a change).
+
+### Documentation
+
+- The documentation site has a Comparison section next to the docs, the API and the changelog:
+  the Benchmarker screenshots (captured again with 1.0.0, and with ecr in the four basic
+  benchmarks), 1.0.0 against 0.2.4 (the reference workload and the matrix of single operations),
+  and the pages of jecs and ecr. The comparison with jecs was measured again on 1.0.0
+  ([the measurements](https://github.com/dubalda/mErCS/blob/main/bench/results/1.0.0-comparison.md));
+  the page of ecr is new: the design, the differences, the four basic benchmarks and the
+  migration from ecr.
+- The comparison with jecs no longer says that jecs has at most 256 components: `world:component()`
+  gives the first 256 ids, and jecs makes further components with `world:entity()` and the
+  `Component` trait.
+- The guide describes the `Component` trait, the nested changes from hooks (clears and deletes
+  that notify every id once, exclusive relations, monitors, batch operations whose hooks delete
+  their id, `Exclusive` given late) and what `world:tick()` restores after an error raised by a
+  hook; a pair with a free slot raises an error in any world; `world:entity(id)`:
+  an id made alive again starts without its old components and hooks, and the generations of
+  its slot (16 bits) keep going after the newest one.
+
+### Performance on the reference workload
+
+Both versions are measured with the reference workload model of this release on Luau 0.740,
+`-O2`, in the interpreter and native code. The
+[full report](https://github.com/dubalda/mErCS/blob/main/bench/results/1.0.0.md) and
+[raw samples](https://github.com/dubalda/mErCS/blob/main/bench/results/1.0.0.json) contain 224
+comparison rows from 320 isolated processes: 2 improvements beyond the measured control noise and
+no timing regression beyond it; the memory rows that the report flags are the constant heap of a
+world (see Memory). Each build and its control have five repeats per profile and mode; the target
+profile in native code has ten additional repeats (a row that the first run flagged, within the
+noise with all its samples). All samples remain in the combined report, with the same
+baseline-only noise rule.
+
+The table gives pooled medians [min–max] for each version's two control columns. Full-frame time
+(P7, the client profile included) and frame heap growth (P9) stay within the noise at both scales,
+and so do the lifecycle events (P6), which run the reworked removal hooks:
+
+| Mode | Scale | P7, µs/frame: 0.2.4 → 1.0.0 | P9, bytes/frame: 0.2.4 → 1.0.0 |
+|---|---|---|---|
+| native | small | 102.11 [98.35–116.80] → 99.88 [95.28–109.30] | 4266.7 [4078.9–4403.2] → 4266.7 [4061.9–4386.1] |
+| native | target | 354.48 [319.45–527.89] → 349.23 [320.94–622.74] | 7321.6 [5990.4–7714.1] → 7321.6 [6007.5–7731.2] |
+| native | small-empty-retained | 100.09 [93.38–115.22] → 98.29 [94.48–107.09] | 4437.3 [4266.7–4522.7] → 4437.3 [4249.6–4522.7] |
+| native | target-empty-retained | 325.38 [312.98–385.92] → 320.19 [309.75–379.06] | 6126.9 [5751.5–6963.2] → 6126.9 [5734.4–6963.2] |
+| interpreter | small | 153.51 [148.23–161.19] → 153.57 [149.46–161.11] | 4266.7 [4078.9–4386.1] → 4266.7 [4078.9–4386.1] |
+| interpreter | target | 490.63 [466.34–502.69] → 481.62 [468.92–556.86] | 7321.6 [6502.4–7714.1] → 7321.6 [6502.4–7714.1] |
+| interpreter | small-empty-retained | 154.46 [151.01–158.54] → 155.82 [150.42–185.22] | 4437.3 [4266.7–4522.7] → 4437.3 [4249.6–4522.7] |
+| interpreter | target-empty-retained | 485.27 [473.61–506.39] → 490.41 [474.40–506.29] | 6126.9 [5751.5–6963.2] → 6126.9 [5734.4–6963.2] |
+
+| Mode | P6 target, µs per event: 0.2.4 → 1.0.0 | |
+|---|---|---|
+| native | a new agent with its owned entities | 1010.8 [952.9–1384.9] → 1010.3 [941.9–1438.0] |
+| native | the end of the activity of an agent | 56.8 [52.3–75.0] → 54.0 [49.8–82.7] |
+| native | the removal of a retained agent (cascade) | 1127.5 [1055.8–1483.8] → 1089.8 [1029.8–1545.9] |
+| interpreter | a new agent with its owned entities | 1550.2 [1529.6–1570.0] → 1558.0 [1522.4–1613.7] |
+| interpreter | the end of the activity of an agent | 85.9 [81.7–93.1] → 85.0 [79.9–89.4] |
+| interpreter | the removal of a retained agent (cascade) | 1553.0 [1511.2–1610.0] → 1530.2 [1478.1–1623.1] |
+
+The small world of P1 (4 members among 1 500 entities, after 40 transitions) improves from 0.585
+to 0.447 µs per loop in native code (23.6 %) and from 0.826 to 0.663 µs in the interpreter
+(19.7 %), the fix of `world:each` above. Other timing changes remain within the noise; the report
+includes the dense loops, the stress cases and both retained-agent variants.
+
+Single operations ([1.0.0 and 0.2.4](https://github.com/dubalda/mErCS/blob/main/docs/comparison/previous-release.md),
+measured with the comparison with jecs) mostly stay within a few percent of 0.2.4. Deletes cost
+more where the fixes of nested hooks and of monitors added work (interpreter / native): an entity
+with four components 1.05× / 1.06×, a `ChildOf` cascade 1.05× / 1.11× per child, an entity with
+an `OnRemove` hook 1.12× / 1.19×, a member of a monitored query 1.21× / 1.33×, a child moved
+under a monitor 1.12× / 1.06×. The lifecycle events of the workload (P6), which delete hundreds
+of entities with listeners, stay within the noise.
+
+### Memory
+
+A new world takes 2 529 bytes more: 54 533 instead of 52 004 bytes (200 worlds kept alive), the
+closures and small tables of the new features and fixes (toggles, creation tracking, the
+bookkeeping of removal hooks and monitors, the floors of generations). There is no new per-entity, per-pair or
+per-query field. The heap rows of P8 measure whole worlds at a resolution of 1 KiB, so this constant
+shows in them as +2 or +3 KiB, and in the bytes per distinct pair of the small scale (+1.7 bytes:
+the heap divided by the pairs of a small world); the bytes per holder are unchanged, and nothing
+accumulates over the lifecycle rounds and the long sessions.
+
+Target-world P8 medians [min–max] (MiB means 1024² bytes; pair and holder costs are incremental
+benchmark measurements):
+
+| Mode | P8 target | 0.2.4 → 1.0.0 |
+|---|---|---|
+| native | the heap of the world after it is built | 137.64 [137.62–145.61] → 137.64 [137.62–145.61] |
+| native | the heap after 100 lifecycle rounds | 138.58 [138.56–146.58] → 138.58 [138.56–146.58] |
+| native | bytes per distinct pair (and its holder) | 1528.320 [1526.272–1529.344] → 1527.808 [1526.272–1528.832] |
+| native | bytes per holder of a pair | 37.139 [35.090–37.395] → 37.139 [35.090–37.395] |
+| interpreter | the heap of the world after it is built | 137.63 [137.62–145.61] → 137.63 [137.62–145.61] |
+| interpreter | the heap after 100 lifecycle rounds | 138.56 [138.56–146.55] → 138.57 [138.56–146.55] |
+| interpreter | bytes per distinct pair (and its holder) | 1528.320 [1527.808–1529.344] → 1528.320 [1527.808–1528.832] |
+| interpreter | bytes per holder of a pair | 37.139 [37.139–37.395] → 37.139 [36.882–37.395] |
+
 ## v0.2.4 — 2026-09-30
 
 ### Changed behavior
@@ -116,7 +384,7 @@ run remains pending; no new Studio timing claim is made for this release.
 
 ## v0.2.3 — 2026-09-29
 
-The reference workload of a game that uses the library is the priority from this release on: a
+The reference workload is the priority from this release on: a
 performance suite models it (the tests P1–P9 of `bench/workload.luau`), and the behavior it
 relies on is a set of tests (`test/workload_cases.luau`). `world:each` and `world:children`
 return the members of the id at the start of the loop again, and faster than 0.2.2 did: a
@@ -194,7 +462,7 @@ and monitors cost once they are gone.
   hook of `Exclusive`, a relation deleted before its listener disconnects and whose slot another
   relation took), and a listener connected to a deleted relation (the relation in its slot, the
   id made alive again).
-- The [comparison with jecs](https://github.com/dubalda/mErCS/tree/main/docs/jecs-comparison#performance)
+- The [comparison with jecs](https://github.com/dubalda/mErCS/blob/main/docs/comparison/jecs.md#performance)
   gives the numbers of 0.2.3 beside 0.2.2 and jecs 0.11.0, each implementation measured in a
   process of its own (in one process, the implementations that run first change the timings of
   the later ones by up to 30 % in some rows); its tables add the queries of a concrete pair built
@@ -285,7 +553,7 @@ ahead of mErCS 0.2.1 (the group `jecs strengths` of the benchmarks). Wildcards t
 values, queries over large terms that change and inline queries with a pair are now faster
 than in jecs, the other cases are closer; the rest of the benchmarks is on par with 0.2.1
 (see the table below and
-[the comparison](https://github.com/dubalda/mErCS/tree/main/docs/jecs-comparison#the-strengths-of-jecs)).
+[the comparison](https://github.com/dubalda/mErCS/blob/main/docs/comparison/jecs.md#the-strengths-of-jecs)).
 New: query monitors, callbacks for the entities that enter and leave a query, in place of the
 monitors of the jecs addon `modules/OB`.
 
@@ -555,7 +823,7 @@ Queries after small changes, empty queries and `(*, T)` wildcards (the query cas
 archetype ECS is expected to be at its best), plus slot pools. In native code (the Roblox
 server) mErCS 0.2.0 is faster than jecs 0.11.0 in every query case; in the interpreter one case
 is on par (see the tables below and
-[the comparison](https://github.com/dubalda/mErCS/tree/main/docs/jecs-comparison#performance)).
+[the comparison](https://github.com/dubalda/mErCS/blob/main/docs/comparison/jecs.md#performance)).
 
 ### Queries
 
@@ -808,7 +1076,7 @@ Measured against jecs 0.11; time of mErCS relative to jecs, lower is better.
   scattered targets.
 
 All numbers, the benchmark sources and the Benchmarker screenshots are in the
-[comparison with jecs](https://github.com/dubalda/mErCS/tree/main/docs/jecs-comparison).
+[comparison with jecs](https://github.com/dubalda/mErCS/blob/main/docs/comparison/jecs.md).
 
 ### Coming from jecs
 
@@ -820,7 +1088,7 @@ All numbers, the benchmark sources and the Benchmarker screenshots are in the
   `is_tag` exist only in the jabby adapter.
 - The builtin ids after `Name` have other numbers: `Exclusive` is 268 (jecs: 270), `Rest` is
   270 (jecs: 271).
-- The [migration guide](https://github.com/dubalda/mErCS/blob/main/docs/jecs-comparison/README.md#migrating-from-jecs)
+- The [migration guide](https://github.com/dubalda/mErCS/blob/main/docs/comparison/jecs.md#migrating-from-jecs)
   lists what to write instead of each call.
 
 ### Installation

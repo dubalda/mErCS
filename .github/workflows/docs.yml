@@ -33,9 +33,11 @@ jobs:
         with:
           node-version: 22
       - name: README links for the site
-        # docs/x/README.md on GitHub is docs/x on the site (README.md becomes the home page)
+        # docs/x/README.md on GitHub is docs/x on the site, docs/x/y.md is docs/x/y (README.md
+        # becomes the home page)
         run: |
-          sed -i -E 's#\]\(docs/([a-z-]+)/README\.md(\#[a-z0-9-]+)?\)#](docs/\1\2)#g' README.md
+          sed -i -E -e 's#\]\(docs/([a-z-]+)/README\.md(\#[a-z0-9-]+)?\)#](docs/\1\2)#g' \
+            -e 's#\]\(docs/([a-z-]+)/([a-z-]+)\.md(\#[a-z0-9-]+)?\)#](docs/\1/\2\3)#g' README.md
       - run: npx --yes moonwave@1.4.2 build
       - uses: actions/upload-pages-artifact@v5
         with:

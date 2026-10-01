@@ -50,11 +50,11 @@ class WorkloadTests(unittest.TestCase):
 
     def test_coverage_distinguishes_all_profiles(self):
         selected = set(workload.TESTS)
-        self.assertEqual(workload.expected_counts("sparse", selected), {"P1": 7})
+        self.assertEqual(workload.expected_counts("sparse", selected), {"P1": 10})
         self.assertEqual(workload.expected_counts("client", selected), {"P4": 1, "P7": 1, "P8": 4, "P9": 1})
         self.assertEqual(workload.expected_counts("buffers", selected), {"P8": 2, "P9": 1})
         for group in ("small", "target", "small-empty-retained", "target-empty-retained"):
-            self.assertEqual(sum(workload.expected_counts(group, selected).values()), 20)
+            self.assertEqual(sum(workload.expected_counts(group, selected).values()), 23)
             self.assertEqual(workload.expected_counts(group, {"P7"}), {"P7": 2})
 
     def test_noise_uses_paired_baseline_controls_not_seed_variance_or_candidate_noise(self):
@@ -78,6 +78,19 @@ class WorkloadTests(unittest.TestCase):
         samples["baseline_again"] = []
         with self.assertRaises(ValueError):
             workload.compare(samples, "µs", "time")
+
+    def test_one_step_of_the_heap_resolution_is_within_noise(self):
+        # 151.552 -> 152.576 bytes per loop: one KiB over 1000 loops, the resolution of the heap;
+        # the float difference is 1.0240000000000009, the allowance 1.024
+        samples = {build: [151.552] * 5 for build in workload.BUILDS}
+        for build in ("candidate", "candidate_again"):
+            samples[build] = [152.576] * 5
+        result = workload.compare(samples, "bytes", "allocated by a loop over world:each")
+        self.assertEqual(result["noise"], 1.024)
+        self.assertEqual(result["status"], "within noise")
+        for build in ("candidate", "candidate_again"):
+            samples[build] = [153.6] * 5
+        self.assertEqual(workload.compare(samples, "bytes", "allocated by a loop")["status"], "regression")
 
     def test_report_keeps_raw_values_and_distinct_modes_and_scales(self):
         data = {"baseline": {"tag": "v0.2.3", "commit": "commit"}, "candidate_sha256": "candidate",

@@ -2,24 +2,29 @@
 --# selene: allow(empty_loop) -- benchmark loops iterate for their cost only
 --!optimize 2
 --[[
-    The performance suite of the reference workload: the tests P1–P9 of the release
-    requirements of a game that uses the library (section 2), over a model of its server world
-    (bench/workload_model.luau). Every release runs it against the previous release and against
-    itself: the columns are the previous release (after tools/previous.sh), the library and the
-    library again (the two runs of one build give the noise). Each run builds its worlds anew,
-    with one seed for all the columns, and takes the columns in another order (the first one
-    after a start is not favored); the report gives the median and the range of the runs.
+    The performance suite of the reference workload: the tests P1–P9 over a model of its server
+    world (bench/workload_model.luau). Every release runs it
+    against the previous release and against itself: the columns are the previous release (after
+    tools/previous.sh), the library and the library again (the two runs of one build give the
+    noise). Each run builds its worlds anew, with one seed for all the columns, and takes the
+    columns in another order (the first one after a start is not favored); the report gives the
+    median and the range of the runs.
 
     - P1 sparse walk: world:each over a tag whose members are spread evenly among 350 000
-      entities (16 / 256 / 2 048 / 16 384), in runs of 8, and the dense case (100 000 of 100 000).
-    - P2 intersection walks: 10 walks per frame over state tags with the members of a system tag,
-      with the state transitions of a frame between: world:each with a check, and one stored
-      query per system tag.
+      entities (16 / 256 / 2 048 / 16 384), in runs of 8, the 16 members after an emptied word,
+      and the dense case (100 000 of 100 000); and the small world: a tag with 4 members among
+      1 500 entities, each transition moving one member to another entity (it empties the word
+      the member leaves), before any transition, after 40 and after 3 000.
+    - P2 intersection walks: 10 walks per frame over the passing state with the members of a
+      system tag, with the state transitions of a frame between: world:each with a check, and one
+      stored query per system tag; with the members of the workload and in the stress case
+      (Scale.stress_members in the passing state).
     - P3 relation-target lookup: world:each over the holders of (Trigger_k, agent).
     - P4 stored queries under changes: the 25 stored queries at their periods while agents change
       and owned entities change state.
     - P5 messages: the messages of a frame handled (the P3 walks) and deleted, new ones made, the
-      deferred ones visited.
+      deferred ones visited: on average, and in a burst of activity (tens of messages a frame and
+      up to a few hundred deferred ones).
     - P6 lifecycle: the end of the activity of an agent, the removal of a retained agent (the
       cascade over its owned entities with removal listeners), a new agent with its owned
       entities (the median of the events of a run).
@@ -175,6 +180,9 @@ end
 
 local P1_ENTITIES = 350000
 local P1_MEMBERS = { 16, 256, 2048, 16384 }
+-- the small world: the owned entities and the members of a state tag
+local P1_SMALL_ENTITIES = 1500
+local P1_SMALL_MEMBERS = 4
 
 local function sparse_walks(impl: Impl)
     local world = impl.ecs.world()
@@ -204,8 +212,8 @@ local function sparse_walks(impl: Impl)
             world:add(entities[i], in_runs)
         end
     end
-    local function loop_time(w: any, tag: any, members: number): number
-        local loops = math.max(1, 2000000 // (members + 200))
+    local function loop_time(w: any, tag: any, members: number, count: number?): number
+        local loops = count or math.max(1, 2000000 // (members + 200))
         local best = math.huge
         for _ = 1, 3 do
             local t = os.clock()
@@ -242,6 +250,49 @@ local function sparse_walks(impl: Impl)
     world:add(entities[100], changed)
     world:remove(entities[100], changed)
     record("P1", "16 members after an emptied word", "350 000", "µs per loop", impl, loop_time(world, changed, 16))
+    -- The small world: a state tag with 4 members among 1 500 entities. A transition moves a
+    -- member to another entity and empties the word it leaves; after 40 the emptied words are
+    -- still in the record, after 3 000 they have been dropped.
+    local small = impl.ecs.world()
+    local owned = table.create(P1_SMALL_ENTITIES)
+    for i = 1, P1_SMALL_ENTITIES do
+        owned[i] = small:entity()
+    end
+    local state = small:entity()
+    local holders: { any } = {}
+    for m = 1, P1_SMALL_MEMBERS do
+        holders[m] = owned[(m - 1) * (P1_SMALL_ENTITIES // P1_SMALL_MEMBERS) + 1]
+        small:add(holders[m], state)
+    end
+    local seed = 1
+    local function rand(n: number): number
+        seed = seed * 16807 % 2147483647
+        return seed % n + 1
+    end
+    local moved = 0
+    for _, transitions in { 0, 40, 3000 } do
+        while moved < transitions do
+            local m = rand(P1_SMALL_MEMBERS)
+            local new = owned[rand(P1_SMALL_ENTITIES)]
+            while small:has(new, state) do
+                new = owned[rand(P1_SMALL_ENTITIES)]
+            end
+            small:remove(holders[m], state)
+            small:add(new, state)
+            holders[m] = new
+            moved += 1
+        end
+        record(
+            "P1",
+            if transitions == 0
+                then "4 members among 1 500, before any transition"
+                else `4 members among 1 500, after {transitions} transitions`,
+            "1 500",
+            "µs per loop",
+            impl,
+            loop_time(small, state, P1_SMALL_MEMBERS, 100000)
+        )
+    end
 end
 
 --------------------------------------------------------------------------------
@@ -273,21 +324,34 @@ local function model_tests(impl: Impl, scale: Scale, seed: number)
 
     if wanted("P2") then
         local frames = 300 * repeat_frames
-        local each_time, query_time = 0, 0
-        for _ = 1, frames do
-            m.transitions(scale.transitions)
-            each_time += elapsed(m.intersection_each)
-            query_time += elapsed(m.intersection_queries)
+        local function walks(case: string)
+            local each_time, query_time = 0, 0
+            for _ = 1, frames do
+                m.transitions(scale.transitions)
+                each_time += elapsed(m.intersection_each)
+                query_time += elapsed(m.intersection_queries)
+            end
+            record(
+                "P2",
+                `10 walks, {case}: world:each with a check`,
+                scale.name,
+                "µs per frame",
+                impl,
+                each_time / frames * 1e6
+            )
+            record(
+                "P2",
+                `10 walks, {case}: one stored query per system tag`,
+                scale.name,
+                "µs per frame",
+                impl,
+                query_time / frames * 1e6
+            )
         end
-        record("P2", "10 walks: world:each with a check", scale.name, "µs per frame", impl, each_time / frames * 1e6)
-        record(
-            "P2",
-            "10 walks: one stored query per system tag",
-            scale.name,
-            "µs per frame",
-            impl,
-            query_time / frames * 1e6
-        )
+        walks("the workload")
+        m.stress(true)
+        walks(`{scale.stress_members} members (stress)`)
+        m.stress(false)
     end
 
     if wanted("P4") then
@@ -308,11 +372,28 @@ local function model_tests(impl: Impl, scale: Scale, seed: number)
             m.messages()
             m.deferred_messages()
         end
-        local time = 0
-        for _ = 1, frames do
-            time += elapsed(work)
+        local function messages(case: string)
+            -- a frame first: the messages that the measured frames handle come at their rate
+            work()
+            local time = 0
+            for _ = 1, frames do
+                time += elapsed(work)
+            end
+            record(
+                "P5",
+                `messages and deferred messages, {case}`,
+                scale.name,
+                "µs per frame",
+                impl,
+                time / frames * 1e6
+            )
         end
-        record("P5", "messages and deferred messages", scale.name, "µs per frame", impl, time / frames * 1e6)
+        messages("on average")
+        m.burst(true)
+        messages("a burst of activity")
+        m.burst(false)
+        -- the messages of the burst handled before the next tests
+        work()
     end
 
     if wanted("P7") then

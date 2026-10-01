@@ -2,7 +2,7 @@
 --!optimize 2
 --!native
 --[[
-    Benchmarker: delete 1000 entities with 4 components and a tag each.
+    Benchmarker: delete 1000 entities with 4 components and a tag each (jecs, mErCS and ecr).
 ]]
 
 -- Benchmarker requires a clone of this module, which has no parent: relative requires cannot
@@ -40,9 +40,37 @@ local function despawn(s: Setup)
     end
 end
 
+-- ecr: the component types come before the registries that use them
+local EcrA, EcrB, EcrC, EcrD = libs.ecr.component(), libs.ecr.component(), libs.ecr.component(), libs.ecr.component()
+local EcrTag = libs.ecr.tag()
+
+type EcrSetup = { registry: any, entities: { any } }
+
+local function setup_ecr(): EcrSetup
+    local registry = libs.ecr.registry()
+    local entities = table.create(N)
+    for i = 1, N do
+        local e = registry:create()
+        registry:set(e, EcrA, i)
+        registry:set(e, EcrB, i)
+        registry:set(e, EcrC, i)
+        registry:set(e, EcrD, i)
+        registry:add(e, EcrTag)
+        entities[i] = e
+    end
+    return { registry = registry, entities = entities }
+end
+
+local function despawn_ecr(s: EcrSetup)
+    local registry = s.registry
+    for _, e in s.entities do
+        registry:destroy(e)
+    end
+end
+
 return {
     ParameterGenerator = function()
-        return setup(libs.jecs), setup(libs.lib)
+        return setup(libs.jecs), setup(libs.lib), setup_ecr()
     end,
 
     BeforeAll = function() end,
@@ -57,6 +85,10 @@ return {
 
         [libs.lib_label] = function(_Profiler: any, _jecs_setup: Setup, lib_setup: Setup)
             despawn(lib_setup)
+        end,
+
+        [libs.ecr_label] = function(_Profiler: any, _jecs_setup: Setup, _lib_setup: Setup, ecr_setup: EcrSetup)
+            despawn_ecr(ecr_setup)
         end,
     },
 }

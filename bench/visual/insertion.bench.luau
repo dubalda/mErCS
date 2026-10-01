@@ -3,7 +3,7 @@
 --!native
 --[[
     Benchmarker: insert 8 components into 500 existing entities that have none (the first
-    set of each component), in a fresh world per run.
+    set of each component), in a fresh world per run (jecs, mErCS and ecr).
 ]]
 
 -- Benchmarker requires a clone of this module, which has no parent: relative requires cannot
@@ -45,9 +45,41 @@ local function insert(s: Setup)
     end
 end
 
+-- ecr: the component types come before the registries that use them
+local EcrComponents = table.create(8)
+for i = 1, 8 do
+    EcrComponents[i] = libs.ecr.component()
+end
+
+type EcrSetup = { registry: any, entities: { any } }
+
+local function setup_ecr(): EcrSetup
+    local registry = libs.ecr.registry()
+    local entities = table.create(N)
+    for i = 1, N do
+        entities[i] = registry:create()
+    end
+    return { registry = registry, entities = entities }
+end
+
+local function insert_ecr(s: EcrSetup)
+    local registry, entities = s.registry, s.entities
+    local c1, c2, c3, c4, c5, c6, c7, c8 = table.unpack(EcrComponents, 1, 8)
+    for _, e in entities do
+        registry:set(e, c1, true)
+        registry:set(e, c2, true)
+        registry:set(e, c3, true)
+        registry:set(e, c4, true)
+        registry:set(e, c5, true)
+        registry:set(e, c6, true)
+        registry:set(e, c7, true)
+        registry:set(e, c8, true)
+    end
+end
+
 return {
     ParameterGenerator = function()
-        return setup(libs.jecs), setup(libs.lib)
+        return setup(libs.jecs), setup(libs.lib), setup_ecr()
     end,
 
     BeforeAll = function() end,
@@ -62,6 +94,10 @@ return {
 
         [libs.lib_label] = function(_Profiler: any, _jecs_setup: Setup, lib_setup: Setup)
             insert(lib_setup)
+        end,
+
+        [libs.ecr_label] = function(_Profiler: any, _jecs_setup: Setup, _lib_setup: Setup, ecr_setup: EcrSetup)
+            insert_ecr(ecr_setup)
         end,
     },
 }

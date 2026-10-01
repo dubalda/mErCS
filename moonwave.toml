@@ -1,7 +1,13 @@
 # The documentation site, built by Moonwave (see docs/development/README.md): the API reference
 # comes from the doc comments of src/, the pages from docs/ (docs/README.md is the index), the
-# home page from README.md.
+# home page from README.md. The navigation bar adds Comparison (docs/comparison/) to the Docs,
+# API and Changelog sections of Moonwave.
 title = "mErCS"
 gitRepoUrl = "https://github.com/dubalda/mErCS"
 gitSourceBranch = "main"
 classOrder = ["mErCS", "World", "Query", "jabby"]
+
+[[navbar.items]]
+to = "/docs/comparison"
+label = "Comparison"
+position = "left"

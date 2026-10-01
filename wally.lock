@@ -13,14 +13,19 @@ version = "0.2.0"
 dependencies = [["vide", "centau/vide@0.4.1"]]
 
 [[package]]
+name = "centau/ecr"
+version = "0.9.0"
+dependencies = []
+
+[[package]]
 name = "centau/vide"
 version = "0.4.1"
 dependencies = []
 
 [[package]]
 name = "dubalda/mercs"
-version = "0.2.4"
-dependencies = [["jabby", "alicesaidhi/jabby@0.6.1"], ["jecs", "ukendio/jecs@0.11.0"]]
+version = "1.0.0"
+dependencies = [["ecr", "centau/ecr@0.9.0"], ["jabby", "alicesaidhi/jabby@0.6.1"], ["jecs", "ukendio/jecs@0.11.0"]]
 
 [[package]]
 name = "ukendio/jecs"

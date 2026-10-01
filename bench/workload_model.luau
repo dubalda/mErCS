@@ -1,11 +1,9 @@
 --!strict
 --!optimize 2
 --[[
-    A model of the reference workload of a game that uses the library: its server world in the
-    terms of the release requirements of the game (the kinds of entities, their numbers, rates
-    and access patterns), for the performance suite of bench/workload.luau. It uses only calls
-    that the releases of the library since 0.2.2 have, so that a release is measured against
-    the previous one.
+    A model of the reference workload: its server world (the kinds of entities, their numbers,
+    rates and access patterns), for the performance suite of bench/workload.luau. It uses only calls that the releases of the library since 0.2.2 have,
+    so that a release is measured against the previous one.
 
     The world (Scale gives the numbers of the small and the target scale):
     - agents from a slot pool, active and retained (a retained tag), and a few agents of a
@@ -15,31 +13,39 @@
       life, 1–2 more tags; (Owner, agent), exclusive and deleted with the agent; one of 8
       (Trigger_k, agent) relations (owned entity j answers relation j % 8); (Extra, agent) on the
       first two; the third is the (Parent, ...) of the next three;
+    - the states: most owned entities rest in the idle state, and the other 6 state tags hold a
+      few owned entities of active agents each, scattered (Scale.members): the busiest state, the
+      passing state (its members enter and leave it within a frame or two, and the intersection
+      walks go over it) and four more;
     - groups (2 values, 1–2 tags, (ChildOf, anchor)) that hold (Expiry, agent) data pairs with an
       expiry time on 3 agents each; anchors (3 values, 2 tags);
     - short-lived messages (one component with a table value, handled and deleted the frame after
-      they are made), deferred messages in scattered slots (visited every frame, 2 replaced),
-      timed effects ((EffectOf, agent), 2 values, one replaced per frame), 2 modifiers per agent
-      ((ModifierOf, agent), 1 value), short-lived objects ((ChildOf, owned entity), 2 values, a
-      tag, one replaced every 10 frames);
+      they are made), deferred messages in scattered slots (visited every frame, each lives about
+      60 frames), timed effects ((EffectOf, agent), 2 values, one replaced per frame), 2 modifiers
+      per agent ((ModifierOf, agent), 1 value), short-lived objects ((ChildOf, owned entity), 2
+      values, a tag, one replaced every 10 frames);
     - a registry of about 85 components, 115 tags and 30 tags made at run time (the ids no kind
-      above uses are carried by anchors and groups), and 12 relations besides ChildOf;
+      above uses are carried by anchors and groups), and 14 relations besides ChildOf;
     - hooks on add and change of the state component move its mirror tag; removal listeners on
       the 7 state tags and on 3 ids that deleted entities carry.
 
-    A frame (Model.frame) does the work of section 1.3 of the requirements: state transitions,
-    walks over state tags and over the members of a state tag with a system tag, agents whose
-    tags and values change, 25 stored queries at periods of 1 to 60 frames (a loop over one of
-    them changes the state of its current entity), searches over a query of agents, messages
-    (each walks the holders of (Trigger_k, agent) and (Extra, agent) and reads 3 values of each),
-    deferred messages, a batch add_all and remove_all, a timed effect replaced, a few expiry
-    pairs refreshed; and the lifecycle events of section 1.4 at their rate: the end of the
-    activity of an agent, the removal of a retained agent (the cascade over its owned
-    entities, modifiers and effects) and a new agent with its owned entities.
+    A frame (Model.frame) does the work of one server frame at the averages of the reference workload:
+    state transitions, walks over state tags and over the members of the passing state with a
+    system tag, agents whose tags and values change, 25 stored queries at periods of 1 to 60
+    frames (a loop over one of them changes the state of its current entity), searches over a
+    query of agents, messages (each walks the holders of (Trigger_k, agent) and (Extra, agent) and
+    reads 3 values of each), deferred messages, a batch add_all and remove_all, a timed effect
+    replaced, a few expiry pairs refreshed; and the lifecycle events at their rate: the end of
+    the activity of an agent, the removal of a retained agent (the cascade over its owned
+    entities, modifiers and effects) and a new agent with its owned entities. Model.burst
+    switches the messages to a burst of activity (tens of messages a frame, up to a few hundred
+    deferred ones) and back; Model.stress fills the passing state to the stress case of the
+    intersection walks and back.
 
-    The choices the requirements leave open (the ids of each kind, the terms of the stored
-    queries, the rates within their ranges) are the ones above and in Scale; the numbers of the
-    model are close to those of the requirements, not the same.
+    The choices the workload leaves open (the ids of each kind, the terms of the stored queries,
+    the rates within their ranges, how the transitions move owned entities between the states)
+    are the ones above and in Scale; the numbers of the model are close to those of the
+    workload, not the same.
 
     Usage (from bench/workload.luau):
         local model = require("./workload_model")
@@ -60,16 +66,23 @@ export type Scale = {
     owned_second: number,
     groups: number,
     anchors: number,
-    -- per frame: messages made, state transitions, agents changed
+    -- per frame: messages made (on average and in a burst of activity), state transitions,
+    -- agents changed
     messages: number,
+    burst_messages: number,
     transitions: number,
     agent_changes: number,
-    -- alive at a time: deferred messages, timed effects, short-lived objects
+    -- alive at a time: deferred messages (on average and in a burst of activity), timed
+    -- effects, short-lived objects
     deferred: number,
+    burst_deferred: number,
     effects: number,
     objects: number,
-    -- owned entities out of the idle state
-    busy: number,
+    -- the members of the states out of idle on average, states 2 to 7: the busiest state, the
+    -- passing state (the one the intersection walks go over) and four more
+    members: { number },
+    -- the members of the passing state in the stress case of the intersection walks
+    stress_members: number,
     -- frames between two lifecycle events (the three kinds in turn)
     event_every: number,
 }
@@ -83,13 +96,18 @@ local SMALL: Scale = {
     owned_second = 20,
     groups = 30,
     anchors = 40,
-    messages = 7,
+    messages = 2,
+    burst_messages = 30,
     transitions = 10,
     agent_changes = 5,
-    deferred = 40,
+    deferred = 1,
+    burst_deferred = 60,
     effects = 30,
     objects = 10,
-    busy = 60,
+    -- the averages of the reference workload: 18 in the busiest state, 3.6 in the passing one and
+    -- 0.4–1.4 in each of the other four
+    members = { 18, 4, 1, 1, 1, 1 },
+    stress_members = 80,
     -- 0.6 events of each kind per second
     event_every = 33,
 }
@@ -103,18 +121,30 @@ local TARGET: Scale = {
     owned_second = 25,
     groups = 175,
     anchors = 100,
-    messages = 12,
+    messages = 5,
+    burst_messages = 30,
     transitions = 20,
     agent_changes = 10,
-    deferred = 300,
+    deferred = 3,
+    burst_deferred = 300,
     effects = 200,
     objects = 30,
-    busy = 480,
+    -- twice the members of the small scale
+    members = { 36, 8, 2, 2, 2, 2 },
+    stress_members = 80,
     -- 0.5 events of each kind per second
     event_every = 40,
 }
 
 local STATES = 7
+-- the idle state, the busiest state and the passing one (the intersection walks go over it)
+local IDLE, BUSIEST, PASSING = 1, 2, 3
+-- the states a transition takes a member out of when every state has its members: the passing
+-- state PASSING_SHARE times in 10, one of these otherwise
+local OTHER_STATES = { 2, 4, 5, 6, 7 }
+local PASSING_SHARE = 7
+-- the frames a deferred message lives on average
+local DEFERRED_FRAMES = 60
 local SYSTEM_TAGS = 10
 local TRIGGERS = 8
 local AGENT_COMPONENTS = 20
@@ -122,7 +152,7 @@ local AGENT_TAGS = 10
 local OWNED_COMPONENTS = 10
 local OWNED_TAGS = 4
 local RUNTIME_TAGS = 30
--- the registry of the game: components and tags in all
+-- the registry of the reference workload: components and tags in all
 local REGISTRY_COMPONENTS = 85
 local REGISTRY_TAGS = 115
 
@@ -130,7 +160,7 @@ export type Model = {
     world: any,
     scale: Scale,
     frame_count: number,
-    -- one frame of section 1.3, with the lifecycle events at their rate
+    -- one frame of the workload, with the lifecycle events at their rate
     frame: () -> (),
     -- the parts of a frame, for the tests of the suite
     transitions: (count: number) -> (),
@@ -150,6 +180,13 @@ export type Model = {
     end_activity: () -> (),
     remove_retained: () -> (),
     new_agent: () -> (),
+    -- a burst of activity of the messages, and the stress case of the intersection walks
+    -- (true switches to it, false back to the averages)
+    burst: (on: boolean) -> (),
+    stress: (on: boolean) -> (),
+    -- the members of a state out of idle, and the deferred messages alive
+    state_count: (state: number) -> number,
+    deferred_count: () -> number,
     -- a stored query and the id of a state tag, for the allocation checks
     sample_query: any,
     sample_tag: any,
@@ -289,9 +326,16 @@ local function new(ecs: any, scale: Scale, seed: number): Model
     local retained: { any } = {}
     -- the owned entities of each agent, in the order they were made
     local owned_of: { [any]: { any } } = {}
-    -- owned entities out of the idle state
-    local busy: { any } = {}
-    local busy_at: { [any]: number } = {}
+    -- the owned entities out of the idle state: the members of each state (2 to STATES), the
+    -- state of each and its place in the list; goals holds the members each state keeps
+    local in_state: { { any } } = {}
+    local state_of: { [any]: number } = {}
+    local state_at: { [any]: number } = {}
+    local goals: { number } = {}
+    for k = 2, STATES do
+        in_state[k] = {}
+        goals[k] = scale.members[k - 1]
+    end
     local effects: { any } = {}
     local objects: { any } = {}
     local deferred: { any } = {}
@@ -381,25 +425,29 @@ local function new(ecs: any, scale: Scale, seed: number): Model
         return a
     end
 
-    -- an owned entity leaves the list of those out of the idle state
-    local function forget_busy(e: any)
-        local at = busy_at[e]
-        if at then
-            local last = busy[#busy]
-            busy[at] = last
-            busy_at[last] = at
-            busy[#busy] = nil
-            busy_at[e] = nil
+    -- an owned entity leaves the list of its state
+    local function forget_state(e: any)
+        local k = state_of[e]
+        if k then
+            local list = in_state[k]
+            local at = state_at[e]
+            local last = list[#list]
+            list[at] = last
+            state_at[last] = at
+            list[#list] = nil
+            state_of[e] = nil
+            state_at[e] = nil
         end
     end
 
-    local function set_busy(e: any, state: number)
+    local function set_state(e: any, state: number)
         world:set(e, State, state)
-        if state == 1 then
-            forget_busy(e)
-        elseif busy_at[e] == nil then
-            table.insert(busy, e)
-            busy_at[e] = #busy
+        forget_state(e)
+        if state ~= IDLE then
+            local list = in_state[state]
+            table.insert(list, e)
+            state_of[e] = state
+            state_at[e] = #list
         end
     end
 
@@ -429,13 +477,22 @@ local function new(ecs: any, scale: Scale, seed: number): Model
             world:set(g, pair(Expiry, a), rand(1000))
         end
     end
-    -- owned entities of active agents out of the idle state
+    -- the states take their members among the owned entities of active agents
     local function random_owned(): any
         local list = owned_of[active[rand(#active)]]
         return list[rand(#list)]
     end
-    while #busy < scale.busy do
-        set_busy(random_owned(), 1 + rand(STATES - 1))
+    local function random_idle(): any
+        local e = random_owned()
+        while state_of[e] do
+            e = random_owned()
+        end
+        return e
+    end
+    for k = 2, STATES do
+        while #in_state[k] < goals[k] do
+            set_state(random_idle(), k)
+        end
     end
 
     local function make_effect(): any
@@ -471,6 +528,10 @@ local function new(ecs: any, scale: Scale, seed: number): Model
             world:entity()
         end
     end
+    -- the entities between the deferred messages of a burst of activity, deleted when it ends
+    local burst_gaps: { any } = {}
+    -- messages made per frame
+    local message_rate = scale.messages
     -- the tags made at run time, toggled on agents
     for i = 1, RUNTIME_TAGS do
         RuntimeTag[i] = world:entity()
@@ -497,7 +558,7 @@ local function new(ecs: any, scale: Scale, seed: number): Model
         { 12, world:query(AnchorC1, AnchorC2):with(AnchorT1):cached() },
         { 60, world:query(AnchorC3):cached() },
         -- owned entities in states
-        { 1, world:query(State, OwnedC[1]):with(StateTag[2]):cached() },
+        { 1, world:query(State, OwnedC[1]):with(StateTag[BUSIEST]):cached() },
         { 1, world:query(OwnedC[2]):with(StateTag[3], SystemTag[1]):cached() },
         { 3, world:query(OwnedC[3], OwnedC[4]):with(StateTag[4]):without(RetainedOwned):cached() },
         { 3, world:query(OwnedC[5]):with(StateTag[5]):cached() },
@@ -511,7 +572,8 @@ local function new(ecs: any, scale: Scale, seed: number): Model
         { 30, world:query(Deferred):cached() },
         { 1, world:query(Message):cached() },
     }
-    -- the loop over this one (owned entities in state 2) sends every 8th of them back to idle
+    -- the loop over this one (owned entities in the busiest state) sends every 8th of them back
+    -- to idle
     local changing_query = stored[14][2]
 
     ----------------------------------------------------------------------------
@@ -523,13 +585,29 @@ local function new(ecs: any, scale: Scale, seed: number): Model
     model.scale = scale
     model.frame_count = 0
 
+    -- A transition moves one owned entity of an active agent: into the state furthest below its
+    -- members, or, when every state has them, out of a state into idle (and the next transition
+    -- takes another one in). Most of these leave the passing state, whose members pass it
+    -- within a frame or two.
     function model.transitions(count: number)
         for _ = 1, count do
-            if #busy > scale.busy // 2 and rand(2) == 1 then
-                set_busy(busy[rand(#busy)], 1)
+            local refill, deficit = 0, 0
+            for k = 2, STATES do
+                local missing = goals[k] - #in_state[k]
+                if missing > deficit then
+                    refill, deficit = k, missing
+                end
+            end
+            if refill ~= 0 then
+                set_state(random_idle(), refill)
             else
-                local e = random_owned()
-                set_busy(e, if busy_at[e] then 1 else 1 + rand(STATES - 1))
+                local k = if rand(10) <= PASSING_SHARE then PASSING else OTHER_STATES[rand(#OTHER_STATES)]
+                local list = in_state[k]
+                if #list > 0 then
+                    set_state(list[rand(#list)], IDLE)
+                else
+                    set_state(random_idle(), k)
+                end
             end
         end
     end
@@ -548,11 +626,13 @@ local function new(ecs: any, scale: Scale, seed: number): Model
         return n
     end
 
-    -- the members of a state tag that have a system tag: world:each and a check
+    -- the members of the passing state that have a system tag, for each system tag: world:each
+    -- and a check
     function model.intersection_each(): number
         local n = 0
+        local state_tag = StateTag[PASSING]
         for s = 1, SYSTEM_TAGS do
-            local state_tag, system_tag = StateTag[s % 6 + 2], SystemTag[s]
+            local system_tag = SystemTag[s]
             for e in world:each(state_tag) do
                 if world:has(e, system_tag) then
                     n += 1
@@ -565,7 +645,7 @@ local function new(ecs: any, scale: Scale, seed: number): Model
     -- the same through one stored query per system tag
     local intersections: { any } = {}
     for s = 1, SYSTEM_TAGS do
-        intersections[s] = world:query():with(StateTag[s % 6 + 2], SystemTag[s]):cached()
+        intersections[s] = world:query():with(StateTag[PASSING], SystemTag[s]):cached()
     end
     function model.intersection_queries(): number
         local n = 0
@@ -631,7 +711,7 @@ local function new(ecs: any, scale: Scale, seed: number): Model
                     for e in q do
                         i += 1
                         if i % 8 == 0 then
-                            set_busy(e, 1) -- the current entity leaves the query
+                            set_state(e, IDLE) -- the current entity leaves the query
                         end
                     end
                     n += i
@@ -682,13 +762,16 @@ local function new(ecs: any, scale: Scale, seed: number): Model
             end
             world:delete(e)
         end
-        for _ = 1, scale.messages do
+        for _ = 1, message_rate do
             local e = world:entity()
             world:set(e, Message, { agent = active[rand(#active)], trigger = rand(TRIGGERS) })
         end
         return n
     end
 
+    -- the deferred messages visited; each lives about DEFERRED_FRAMES frames, so a frame
+    -- replaces #deferred / DEFERRED_FRAMES of them on average
+    local deferred_due = 0
     function model.deferred_messages(): number
         local n = 0
         for e in world:each(Deferred) do
@@ -697,7 +780,9 @@ local function new(ecs: any, scale: Scale, seed: number): Model
                 n += m.value
             end
         end
-        for _ = 1, 2 do
+        deferred_due += #deferred / DEFERRED_FRAMES
+        while deferred_due >= 1 do
+            deferred_due -= 1
             local k = rand(#deferred)
             world:delete(deferred[k])
             deferred[k] = make_deferred()
@@ -705,8 +790,45 @@ local function new(ecs: any, scale: Scale, seed: number): Model
         return n
     end
 
-    -- a batch over the owned entities in state 3, taken back the next frame
-    local batch_query = world:query(OwnedC[1]):with(StateTag[3]):cached()
+    -- A burst of activity: tens of messages a frame and up to a few hundred deferred messages,
+    -- made in scattered slots; false goes back to the averages.
+    function model.burst(on: boolean)
+        message_rate = if on then scale.burst_messages else scale.messages
+        local goal = if on then scale.burst_deferred else scale.deferred
+        while #deferred < goal do
+            table.insert(deferred, make_deferred())
+            for _ = 1, rand(8) do
+                local gap: any = world:entity()
+                table.insert(burst_gaps, gap)
+            end
+        end
+        while #deferred > goal do
+            world:delete(table.remove(deferred))
+        end
+        if not on then
+            for _, e in burst_gaps do
+                world:delete(e)
+            end
+            table.clear(burst_gaps)
+        end
+    end
+
+    -- The stress case of the intersection walks: the passing state filled to stress_members
+    -- members; false goes back to its average.
+    function model.stress(on: boolean)
+        local goal = if on then scale.stress_members else scale.members[PASSING - 1]
+        goals[PASSING] = goal
+        local list = in_state[PASSING]
+        while #list < goal do
+            set_state(random_idle(), PASSING)
+        end
+        while #list > goal do
+            set_state(list[rand(#list)], IDLE)
+        end
+    end
+
+    -- a batch over the owned entities in the passing state, taken back the next frame
+    local batch_query = world:query(OwnedC[1]):with(StateTag[PASSING]):cached()
     local flagged = false
     function model.batch(): number
         if flagged then
@@ -751,12 +873,12 @@ local function new(ecs: any, scale: Scale, seed: number): Model
         world:add(a, Retained)
         for _, e in owned_of[a] do
             if scale.retain_owned == false then
-                forget_busy(e)
+                forget_state(e)
                 world:delete(e)
             else
                 world:add(e, RetainedOwned)
-                if busy_at[e] then
-                    set_busy(e, 1)
+                if state_of[e] then
+                    set_state(e, IDLE)
                 end
             end
         end
@@ -777,7 +899,7 @@ local function new(ecs: any, scale: Scale, seed: number): Model
         retained[k] = retained[#retained]
         retained[#retained] = nil
         for _, e in owned_of[a] do
-            forget_busy(e)
+            forget_state(e)
         end
         owned_of[a] = nil
         world:delete(a)
@@ -826,7 +948,14 @@ local function new(ecs: any, scale: Scale, seed: number): Model
     end
 
     model.sample_query = stored[10][2]
-    model.sample_tag = StateTag[2]
+    model.sample_tag = StateTag[BUSIEST]
+
+    function model.state_count(state: number): number
+        return #in_state[state]
+    end
+    function model.deferred_count(): number
+        return #deferred
+    end
 
     function model.spare_relation(): any
         return world:entity()
@@ -864,4 +993,6 @@ return {
     new = new,
     SMALL = SMALL,
     TARGET = TARGET,
+    -- the state the intersection walks go over (Scale.members[PASSING - 1] on average)
+    PASSING = PASSING,
 }
