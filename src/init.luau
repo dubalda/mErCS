@@ -1355,14 +1355,37 @@ end
 -- The buffers of world:each and world:children (see iterate_record in world_new): a loop
 -- collects the members of the id into a buffer taken from here and gives it back when it ends
 -- (a loop left with break leaves its buffer to the collector). A buffer holds entity ids only.
--- At most EACH_POOL_MAX buffers are kept, of any size: a loop takes the buffer that the
--- previous one gave back, so only nested loops hold more than one. each_words holds the sorted
--- keys of the words of a record of at most EACH_FEW_WORDS words.
+-- At most EACH_POOL_MAX buffers and EACH_POOL_SLOTS array slots are kept. Index 0 of a buffer
+-- holds its capacity charge (the next power of two of its largest snapshot), including when
+-- a smaller loop reuses it. This bounds retained arrays without reallocating dense hot loops.
+-- each_words holds the sorted keys of a record with at most EACH_FEW_WORDS keys.
 local each_pool: { { number } } = {}
 local each_pool_n = 0
 local EACH_POOL_MAX = 16
+local each_pool_slots = 0
+local EACH_POOL_SLOTS = 262144 -- at most 4 MiB of array values (plus table headers)
 local each_words: { number } = {}
 local EACH_FEW_WORDS = 64
+
+local function each_take(): { number }
+    if each_pool_n == 0 then
+        return {}
+    end
+    local list = each_pool[each_pool_n]
+    each_pool[each_pool_n] = nil
+    each_pool_n -= 1
+    each_pool_slots -= list[0]
+    return list
+end
+
+local function each_release(list: { number })
+    local size = list[0]
+    if each_pool_n < EACH_POOL_MAX and each_pool_slots + size <= EACH_POOL_SLOTS then
+        each_pool_n += 1
+        each_pool[each_pool_n] = list
+        each_pool_slots += size
+    end
+end
 
 --------------------------------------------------------------------------------
 -- Id helpers
@@ -2203,8 +2226,8 @@ local function world_new(debug: boolean?): World
         records[id] = nil
         records_generation += 1
         changes_stamp += 1
-        -- the bitsets go empty in place, as after remove_all: a loop that still walks them
-        -- (world:each) returns no member that lost the id (a lazy (*, T) record has none)
+        -- The bitsets go empty in place: a pending cleanup cannot see members of a freed
+        -- record. world:each keeps its own snapshot; a lazy (*, T) record has no bitsets.
         local words: Words? = rec.words
         if words then
             table.clear(words)
@@ -3910,7 +3933,17 @@ local function world_new(debug: boolean?): World
         for _, member in members do
             local slot = member % ENTITY_MASK
             if on_remove then
-                on_remove(member, id, deleting)
+                -- An earlier member's hook may have removed this id or deleted the member
+                -- (and even reused its slot). Its removal was already reported there.
+                if alive[slot] ~= member or not bit_test(rec, slot) then
+                    continue
+                end
+                -- Disconnecting the last listener and reconnecting creates a new
+                -- dispatcher. The next member is a new event and must use that dispatcher.
+                local callback = rec.on_remove
+                if callback then
+                    callback(member, id, deleting)
+                end
                 if alive[slot] ~= member or not bit_test(rec, slot) then
                     continue
                 end
@@ -4287,8 +4320,8 @@ local function world_new(debug: boolean?): World
 
     -- world:each and world:children: the members of the id at the start of the loop, in
     -- ascending slot order, whatever their number and their layout, collected into a buffer of
-    -- each_pool that the loop reads: it allocates its closure only. A record of a few words
-    -- (at most EACH_FEW_WORDS, none emptied) has the keys of its words sorted (a sparse id, the
+    -- each_pool that the loop reads: a reused buffer costs only the iterator closure. A record of a few words
+    -- (at most EACH_FEW_WORDS keys, including emptied ones) has its non-empty keys sorted (a sparse id, the
     -- children of a parent: fewer steps than the levels of the bitset); a larger one is walked
     -- through its tops, its sums and its words, a full word copied at once. Nothing that changes
     -- during the loop changes what it returns: an entity that gets the id is not visited, one
@@ -4315,20 +4348,13 @@ local function world_new(debug: boolean?): World
                 end
             end
         end
-        local list: { i53 }
-        if each_pool_n > 0 then
-            list = each_pool[each_pool_n]
-            each_pool[each_pool_n] = nil
-            each_pool_n -= 1
-        else
-            list = {}
-        end
+        local list = each_take()
         local n = 0
         local sums = rec.sums
-        if word_count <= EACH_FEW_WORDS and rec.zeros == 0 then
+        if word_count <= EACH_FEW_WORDS and word_count + rec.zeros <= EACH_FEW_WORDS then
             local keys = each_words
             local k = word_count
-            if word_count <= 2 then
+            if word_count <= 2 and rec.zeros == 0 then
                 -- one or two words: in order without a sort
                 local w1 = (next(words)) :: number
                 keys[1] = w1
@@ -4343,9 +4369,19 @@ local function world_new(debug: boolean?): World
             else
                 table.clear(keys)
                 k = 0
-                for w in words do
-                    k += 1
-                    keys[k] = w
+                if rec.zeros == 0 then
+                    -- Clean records keep the branch-free key collection of 0.2.3.
+                    for w in words do
+                        k += 1
+                        keys[k] = w
+                    end
+                else
+                    for w, word in words do
+                        if word ~= 0 then
+                            k += 1
+                            keys[k] = w
+                        end
+                    end
                 end
                 table.sort(keys)
             end
@@ -4396,6 +4432,10 @@ local function world_new(debug: boolean?): World
         end
         -- the end of the members (a reused buffer holds older ones after it)
         list[n + 1] = nil
+        if n + 1 > (list[0] or 0) then
+            -- Include the terminating nil: assigning it can grow a full array.
+            list[0] = 2 ^ (32 - bit32.countlz(n))
+        end
         local i = 0
         return function(): i53?
             i += 1
@@ -4406,10 +4446,7 @@ local function world_new(debug: boolean?): World
             if i > 0 then
                 -- the end of the loop: the buffer goes back, once
                 i = -math.huge
-                if each_pool_n < EACH_POOL_MAX then
-                    each_pool_n += 1
-                    each_pool[each_pool_n] = list
-                end
+                each_release(list)
             end
             return nil
         end

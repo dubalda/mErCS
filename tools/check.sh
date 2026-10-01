@@ -24,6 +24,7 @@ elif [ -n "$extension_dir" ] && [ -x "$extension_dir/bin/server" ]; then
 else
     luau_lsp=luau-lsp
 fi
+luau_lsp=${MERCS_LUAU_LSP:-$luau_lsp}
 
 storage="${APPDATA:-$HOME/.config}/Code/User/globalStorage/johnnymorganz.luau-lsp"
 definitions="$storage/globalTypes.PluginSecurity.d.luau"
@@ -35,16 +36,19 @@ if [ ! -f "$definitions" ]; then
     fi
 fi
 
-stylua --check .
-selene .
+"${MERCS_STYLUA:-stylua}" --check .
+"${MERCS_SELENE:-selene}" .
 echo "luau-lsp: $("$luau_lsp" --version)"
 # Wally packages are third-party code: their own diagnostics are not ours to fix
+status=0
 output=$("$luau_lsp" analyze --flag:LuauSolverV2=true --platform roblox --definitions:@roblox="$definitions" \
     --ignore "Packages/**" --ignore "DevPackages/**" \
     src/*.luau test/*.luau test/jecs_compat/*.luau bench/*.luau bench/visual/*.luau examples/*.luau studio/*.luau \
-    2>&1 | grep -v '^\[INFO\]' || true)
-if [ -n "$output" ]; then
-    echo "$output"
-    exit 1
+    2>&1) || status=$?
+diagnostics=$(printf '%s\n' "$output" | grep -v '^\[INFO\]' || true)
+if [ -n "$diagnostics" ] || [ "$status" -ne 0 ]; then
+    printf '%s\n' "$diagnostics"
+    if [ "$status" -eq 0 ]; then status=1; fi
+    exit "$status"
 fi
 echo "luau-lsp: no errors"

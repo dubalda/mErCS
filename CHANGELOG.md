@@ -1,5 +1,119 @@
 # Changelog
 
+## v0.2.4 — 2026-09-30
+
+### Changed behavior
+
+- Deleting a pair's target or relation no longer calls `OnRemove` a second time for a holder
+  whose pair an earlier callback removed, or for a holder that callback deleted. In 0.2.3 the
+  cleanup snapshot dispatched again before checking whether the membership still existed.
+- A removal listener that disconnects the last listener and connects a replacement during
+  target/relation cleanup now gives subsequent holders' events to the replacement. 0.2.3 kept
+  the old dispatcher for the whole cleanup and missed these events. The listener list of the
+  event already in progress still stays fixed.
+
+### Iteration
+
+- The module's `each`/`children` pool retains at most 16 buffers and 262 144 charged array
+  slots (4 MiB of array values, plus table overhead). A buffer's charge follows its largest snapshot,
+  rounded up to include the terminating slot; reusing it for a smaller snapshot cannot hide
+  its retained storage. Oversized or excess buffers, and abandoned loops, are left to GC.
+  Live snapshots are not capped; a loop whose buffer exceeds the pool budget allocates that
+  buffer again on its next run. The reference dense case has 100 000 members and fits the budget.
+- Pool bookkeeping moved out of each iterator closure. Reusing a buffer now needs about
+  152 bytes per iterator instead of 176. No fields were added per entity, pair or query.
+- Records with at most 64 word keys, including emptied words, can use sorted non-empty keys
+  to collect a snapshot. Previously any emptied word forced the bitset hierarchy walk.
+
+### Tests and measurements
+
+- 27 boundary and reentrant-operation cases cover full-generation snapshots, word/page
+  boundaries, more than 16 held iterators across worlds, messages changed by hooks, overlapping
+  cascades, nested batches, signal replacement and query arities 0/1/3/8/9 with nil/false values.
+  Three cases fail on 0.2.3 and pass with the two cleanup fixes.
+- An independent snapshot model holds `each`/`children` iterators across mutations, cascades
+  and slot reuse. CI runs three seeds for 2 000 rounds in both modes. The test runner now
+  counts the actual shared-query warning, and the workload runner has eight validation tests.
+- Reference measurements load each build and control in a fresh process from a verified tag
+  or candidate snapshot. Reports preserve raw samples, seeds, source/tool hashes, medians and
+  ranges; incomplete release runs fail. The type-check script now preserves analyzer failures
+  even when no diagnostic text is printed.
+- The suite adds a client profile, retained agents without owned entities, sparse records
+  after an emptied word, longer memory checkpoints and buffers retained after world GC.
+  P1 uses the exact advertised member counts. Expiry refreshes keep at most three pairs per
+  group; the former model added new targets every frame and grew beyond the reference workload.
+  A regression test checks this bound during lifecycle churn.
+- P9 reports net heap growth with a weak GC witness, including a warmed frame and the first
+  large snapshot. This is an allocation proxy: it does not count all allocator traffic or
+  rule out an incomplete incremental collection.
+
+### Performance on the reference workload
+
+Both versions are measured with the corrected suite on Luau 0.740, `-O2`, in the interpreter
+and native code. Historical 0.2.3 figures below used a different model and are not the baseline
+for this comparison. The [full report](https://github.com/dubalda/mErCS/blob/main/bench/results/0.2.4.md)
+and [raw samples](https://github.com/dubalda/mErCS/blob/main/bench/results/0.2.4.json) contain
+194 comparison rows from 440 isolated processes: 20 improvements beyond the measured control
+noise and no regressions beyond it. Each build and its control have five repeats per profile
+and mode; P1 and the two small interpreter profiles have ten additional repeats. All initial
+flags and samples remain in the combined report, with the same baseline-only noise rule.
+
+The table gives pooled medians [min–max] for each version's two control columns. Full-frame
+time (P7), including the client profile, stays within noise. Frame heap growth (P9) falls
+by 9.2% / 9.4% at the small scale (native / interpreter) and 8.6% at the target scale;
+the empty-retained variants improve by 8.9–9.2%. These are heap-growth proxies, not counters
+of total allocator traffic.
+
+| Mode | Scale | P7, µs/frame: 0.2.3 → 0.2.4 | P9, bytes/frame: 0.2.3 → 0.2.4 |
+|---|---|---|---|
+| native | small | 149.45 [123.72–161.60] → 152.18 [125.03–156.72] | 7048.5 [6946.1–7185.1] → 6400.0 [6280.5–6519.5] |
+| native | target | 710.09 [642.27–763.08] → 721.77 [680.12–792.42] | 11315.2 [11025.1–11758.9] → 10342.4 [10035.2–10769.1] |
+| native | small-empty-retained | 151.32 [139.13–157.79] → 148.82 [139.55–161.03] | 7270.4 [7185.1–7475.2] → 6604.8 [6519.5–6809.6] |
+| native | target-empty-retained | 658.02 [600.08–699.29] → 670.73 [555.99–790.87] | 11144.5 [10820.3–11332.3] → 10154.7 [9830.4–10359.5] |
+| interpreter | small | 208.18 [193.50–281.97] → 204.93 [191.45–267.45] | 7099.7 [6946.1–7287.5] → 6434.1 [6280.5–6621.9] |
+| interpreter | target | 932.97 [881.16–966.59] → 934.41 [877.55–1044.82] | 11315.2 [11025.1–11758.9] → 10342.4 [10035.2–10769.1] |
+| interpreter | small-empty-retained | 210.24 [195.06–263.97] → 210.03 [196.40–322.20] | 7287.5 [7185.1–7475.2] → 6638.9 [6519.5–6809.6] |
+| interpreter | target-empty-retained | 928.02 [820.41–1154.70] → 902.27 [860.63–1019.31] | 11144.5 [10820.3–11332.3] → 10154.7 [9830.4–10359.5] |
+
+P1 with 16 members after an emptied word improves from 1.628 to 1.361 µs in native code
+(16.4%) and from 2.379 to 1.899 µs in the interpreter (20.2%). Reused `world:each` iterators
+need about 24 fewer bytes at both server scales. Other timing changes remain within noise;
+the report includes dense loops, lifecycle events and both retained-agent variants.
+
+### Memory
+
+After 17 concurrent snapshots of 100 000 members are exhausted and their world is collected,
+the module retains approximately 4.00 MiB instead of 32.00 MiB (87.5% less). The first snapshot
+still needs its array; the budget applies to returned buffers. There is no new per-entity,
+per-pair or per-query field. Long-session diagnostics also count live entities and allocated
+slots so population changes are visible alongside heap measurements.
+
+Target-world P8 medians [min–max] are unchanged to the precision below in both versions.
+MiB means 1024² bytes; pair/holder costs are incremental benchmark measurements. The
+100-lifecycle checkpoint follows the preceding benchmark phases and 100 additional rounds.
+
+| Target metric | Native, both versions | Interpreter, both versions |
+|---|---|---|
+| Heap after build, MiB | 137.86 [137.84–145.82] | 137.86 [137.84–145.82] |
+| Heap after 100 lifecycle rounds, MiB | 138.57 [138.48–146.49] | 138.57 [138.48–146.49] |
+| Heap after 3 000 more frames, MiB | 139.47 [139.42–147.41] | 139.47 [139.42–147.41] |
+| Heap after 6 000 more frames, MiB | 140.16 [140.09–148.10] | 140.16 [140.09–148.10] |
+| Heap after 9 000 more frames, MiB | 140.62 [140.54–148.57] | 140.62 [140.54–148.57] |
+| Bytes per distinct pair with one holder | 1528.83 [1526.78–1530.88] | 1528.83 [1526.78–1530.37] |
+| Bytes per additional holder | 168.53 [168.02–176.47] | 168.53 [168.02–176.47] |
+
+A separate 60 000-frame diagnostic (target/native, seed 1001, one run per build) has matching
+live-entity counts and heap checkpoints within 1 KiB. Allocated slots stop growing after
+10 000 frames at 354 819; the heap fluctuates between 147.12 and 149.50 MiB after warm-up
+and returns to 147.68 MiB at frame 60 000. Thus the early rise through the P8 checkpoints
+does not continue monotonically over this session. The full report includes every checkpoint
+and distinguishes this diagnostic from the repeated suite. No new retained-memory growth
+was observed in the candidate over this interval.
+
+Validation covers the full CLI test suite in both modes, extended fuzz runs, formatting,
+linting, type analysis and the Rojo/Wally/documentation builds. A fresh full Roblox Studio
+run remains pending; no new Studio timing claim is made for this release.
+
 ## v0.2.3 — 2026-09-29
 
 The reference workload of a game that uses the library is the priority from this release on: a

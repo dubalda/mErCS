@@ -25,22 +25,23 @@
       entities (the median of the events of a run).
     - P7 frame model: the frames of the model with the lifecycle events at their rate.
     - P8 memory: the heap of the world after it is built, after 100 lifecycle rounds and after a
-      long session of 3 000 more frames; bytes per distinct pair and per holder.
-    - P9 allocation: bytes allocated by a frame; by a loop over a stored query and over
-      world:each (their iterator).
+      3 000, 6 000 and 9 000 more frames; bytes per distinct pair and per holder.
+    - P9 allocation proxy: net heap growth with a GC witness for a warmed frame and a loop
+      over a stored query or world:each. It is not total allocator traffic (see gc.allocated).
 
     The heap includes the lists of the model (the same for every column).
 
     Run from the repository root, in the interpreter and in native code (the arguments are
-    optional: the number of runs, the tests, the scales, and previous=no to leave the previous
-    release out):
+    optional: runs, tests, scales, previous=no; implementation=<module> runs one build only,
+    seed=<n> selects a replayable model, raw=yes emits machine-readable samples. The release
+    runner tools/workload.py isolates builds, scales and control runs in separate processes.
+    retained=empty selects retained agents without owned entities):
         luau -O2 bench/workload.luau
         luau -O2 --codegen bench/workload.luau -a runs=5 tests=P1,P7 scales=target
 ]]
 
 local gc = require("./gc")
 local model = require("./workload_model")
-local previous = require("./previous")
 local versions = require("./versions")
 
 type Scale = model.Scale
@@ -59,6 +60,11 @@ local runs = 5
 local only: { [string]: boolean }? = nil
 local scales: { Scale } = { model.SMALL, model.TARGET }
 local with_previous = true
+local implementation: string? = nil
+local first_seed = 1001
+local raw = false
+local retained_empty = false
+local profile = "server"
 
 for _, argument in { ... } do
     local key, value = string.match(tostring(argument), "^(%w+)=(.*)$")
@@ -81,6 +87,26 @@ for _, argument in { ... } do
         end
     elseif key == "previous" then
         with_previous = value ~= "no"
+    elseif key == "implementation" then
+        implementation = value
+    elseif key == "seed" then
+        first_seed = assert(tonumber(value), "invalid seed")
+    elseif key == "raw" then
+        raw = value == "yes"
+    elseif key == "retained" then
+        retained_empty = value == "empty"
+    elseif key == "profile" then
+        profile = value or profile
+    end
+end
+
+assert(runs >= 1 and runs % 1 == 0, "runs must be a positive integer")
+if retained_empty then
+    for i, scale in scales do
+        local alternate = table.clone(scale)
+        alternate.retain_owned = false
+        alternate.name ..= "-empty-retained"
+        scales[i] = alternate
     end
 end
 
@@ -89,17 +115,27 @@ local function wanted(test: string): boolean
 end
 
 local impls: { Impl } = {}
-if with_previous and previous then
-    table.insert(impls, { key = "previous", label = `mErCS {previous.version}`, ecs = previous.ecs })
+if implementation then
+    table.insert(impls, { key = "single", label = implementation, ecs = (require :: any)(implementation) })
+else
+    if with_previous then
+        local previous = require("./previous")
+        assert(previous, "missing baseline: run tools/previous.sh, or select previous=no for exploration")
+        table.insert(impls, { key = "previous", label = `mErCS {previous.version}`, ecs = previous.ecs })
+    end
+    local lib = require("@lib")
+    table.insert(impls, { key = "lib", label = versions.library, ecs = lib })
+    table.insert(impls, { key = "again", label = `{versions.library} again`, ecs = lib })
 end
-local lib = require("@lib")
-table.insert(impls, { key = "lib", label = versions.library, ecs = lib })
-table.insert(impls, { key = "again", label = `{versions.library} again`, ecs = lib })
 
 local rows: { Row } = {}
 local row_at: { [string]: Row } = {}
 
 local function record(test: string, case: string, scale: string, unit: string, impl: Impl, value: number)
+    assert(value == value and math.abs(value) < math.huge, `non-finite measurement: {test} {case}`)
+    if raw then
+        print(string.format("SAMPLE\t%s\t%s\t%s\t%s\t%.17g", test, case, scale, unit, value))
+    end
     local key = `{test}|{case}|{scale}`
     local row = row_at[key]
     if row == nil then
@@ -151,7 +187,8 @@ local function sparse_walks(impl: Impl)
     for k, members in P1_MEMBERS do
         local tag = world:entity()
         local count = 0
-        for i = 1, P1_ENTITIES, P1_ENTITIES // members do
+        for member = 0, members - 1 do
+            local i = member * P1_ENTITIES // members + 1
             world:add(entities[i], tag)
             count += 1
         end
@@ -197,6 +234,14 @@ local function sparse_walks(impl: Impl)
         dense:add(dense:entity(), dense_tag)
     end
     record("P1", "100 000 of 100 000 (dense)", "100 000", "µs per loop", impl, loop_time(dense, dense_tag, 100000))
+    -- The same sparse layout, after words have been emptied by changes of state.
+    local changed = world:entity()
+    for i = 1, 16 do
+        world:add(entities[i * 21000], changed)
+    end
+    world:add(entities[100], changed)
+    world:remove(entities[100], changed)
+    record("P1", "16 members after an emptied word", "350 000", "µs per loop", impl, loop_time(world, changed, 16))
 end
 
 --------------------------------------------------------------------------------
@@ -204,7 +249,7 @@ end
 --------------------------------------------------------------------------------
 
 local function model_tests(impl: Impl, scale: Scale, seed: number)
-    local target = scale == model.TARGET
+    local target = scale.owned == model.TARGET.owned
     -- the small scale runs 5 times the frames: its frames are short
     local repeat_frames = if target then 1 else 5
     gc.full()
@@ -289,39 +334,35 @@ local function model_tests(impl: Impl, scale: Scale, seed: number)
     end
 
     if wanted("P9") then
-        -- the heap is counted in KB: many frames and loops after one full collection (they
-        -- allocate less than the growth that starts the next collection)
+        -- A weak witness rejects GC during the interval; see gc.allocated for the limits
+        -- of measuring allocation by net heap growth. Warm the reusable frame buffers first.
         local frames = 60
-        gc.full()
-        local kb = gc.kb()
         for _ = 1, frames do
             m.frame()
         end
-        record("P9", "allocated by a frame", scale.name, "bytes", impl, (gc.kb() - kb) * 1024 / frames)
+        local bytes = gc.allocated(function()
+            for _ = 1, frames do
+                m.frame()
+            end
+        end)
+        record("P9", "frame heap growth (GC checked)", scale.name, "bytes", impl, bytes / frames)
         local loops = 1000
         local query = m.sample_query
-        gc.full()
-        kb = gc.kb()
-        for _ = 1, loops do
-            for _ in query do
+        bytes = gc.allocated(function()
+            for _ = 1, loops do
+                for _ in query do
+                end
             end
-        end
-        record(
-            "P9",
-            "allocated by a loop over a stored query",
-            scale.name,
-            "bytes",
-            impl,
-            (gc.kb() - kb) * 1024 / loops
-        )
+        end)
+        record("P9", "allocated by a loop over a stored query", scale.name, "bytes", impl, bytes / loops)
         local tag = m.sample_tag
-        gc.full()
-        kb = gc.kb()
-        for _ = 1, loops do
-            for _ in world:each(tag) do
+        bytes = gc.allocated(function()
+            for _ = 1, loops do
+                for _ in world:each(tag) do
+                end
             end
-        end
-        record("P9", "allocated by a loop over world:each", scale.name, "bytes", impl, (gc.kb() - kb) * 1024 / loops)
+        end)
+        record("P9", "allocated by a loop over world:each", scale.name, "bytes", impl, bytes / loops)
     end
 
     if wanted("P6") then
@@ -354,13 +395,30 @@ local function model_tests(impl: Impl, scale: Scale, seed: number)
             m.remove_retained()
             m.new_agent()
         end
+        m.verify_expiry()
         gc.full()
         record("P8", "the heap after 100 lifecycle rounds", scale.name, "MB", impl, (gc.kb() - base_kb) / 1024)
         for _ = 1, 3000 do
             m.frame()
         end
+        m.verify_expiry()
         gc.full()
         record("P8", "the heap after 3 000 more frames", scale.name, "MB", impl, (gc.kb() - base_kb) / 1024)
+        for checkpoint = 2, 3 do
+            for _ = 1, 3000 do
+                m.frame()
+            end
+            m.verify_expiry()
+            gc.full()
+            record(
+                "P8",
+                `the heap after {checkpoint * 3000} more frames`,
+                scale.name,
+                "MB",
+                impl,
+                (gc.kb() - base_kb) / 1024
+            )
+        end
         -- pairs: new distinct pairs with one holder each (up to 2 000), then the holders of one
         -- pair (up to 4 000)
         local owned = m.owned_entities(4000)
@@ -411,12 +469,25 @@ local started = os.clock()
 for run = 1, runs do
     for k = 1, #impls do
         local impl = impls[(run + k - 2) % #impls + 1]
+        if profile ~= "server" then
+            local extra = require("./workload_extra")
+            extra.run(
+                impl.ecs,
+                profile,
+                function(test: string, case: string, scale: string, unit: string, value: number)
+                    if wanted(test) then
+                        record(test, case, scale, unit, impl, value)
+                    end
+                end
+            )
+            continue
+        end
         if wanted("P1") then
             sparse_walks(impl)
             gc.full()
         end
         for _, scale in scales do
-            model_tests(impl, scale, 1000 + run)
+            model_tests(impl, scale, first_seed + run - 1)
             gc.full()
         end
     end

@@ -1,26 +1,15 @@
 #!/usr/bin/env bash
-# Runs the performance suite of the reference workload (bench/workload.luau) in the interpreter
-# and in native code, against the previous release (run tools/previous.sh first) and the library
-# itself, and writes the report to tmp/workload-report.md (and to the output).
+# Runs the isolated reference workload suite. Python extracts and verifies the baseline tag,
+# runs both controls in fresh Luau processes, and writes tmp/workload/report.md and samples.json.
 #
-# Run from anywhere; the arguments go to bench/workload.luau:
+# Run from anywhere; the arguments go to tools/workload.py (Python 3.11+):
 #     bash tools/workload.sh
-#     bash tools/workload.sh runs=5 tests=P1,P7 scales=target
+#     bash tools/workload.sh release=yes
+#     bash tools/workload.sh runs=5 tests=P1,P7 scales=sparse,target
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-mkdir -p tmp
-report=tmp/workload-report.md
-{
-    echo "# The reference workload"
-    echo
-    echo "## Interpreter (luau -O2)"
-    echo
-    luau -O2 bench/workload.luau -a "$@"
-    echo
-    echo "## Native code (luau -O2 --codegen)"
-    echo
-    luau -O2 --codegen bench/workload.luau -a "$@"
-} | tee "$report"
-echo
-echo "report: $report"
+if command -v python3 >/dev/null 2>&1; then
+    exec python3 tools/workload.py "$@"
+fi
+exec python tools/workload.py "$@"

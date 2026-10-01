@@ -52,6 +52,8 @@ export type Scale = {
     -- agents: active, retained (they keep their owned entities), of a second kind
     active: number,
     retained: number,
+    -- false: retained agents keep no owned entities (the alternate lifecycle workload)
+    retain_owned: boolean?,
     second_kind: number,
     -- owned entities per agent, and per agent of the second kind
     owned: number,
@@ -155,6 +157,7 @@ export type Model = {
     spare_relation: () -> any,
     owned_entities: (count: number) -> { any },
     agents: () -> { any },
+    verify_expiry: () -> (),
 }
 
 local function new(ecs: any, scale: Scale, seed: number): Model
@@ -363,7 +366,13 @@ local function new(ecs: any, scale: Scale, seed: number): Model
             world:add(a, kind)
         end
         world:add(a, pair(ecs.ChildOf, groups[rand(#groups)]))
-        owned_of[a] = add_owned(a, if kind == SecondKind then scale.owned_second else scale.owned)
+        owned_of[a] = add_owned(
+            a,
+            if kind == SecondKind
+                then scale.owned_second
+                elseif kind == Retained and scale.retain_owned == false then 0
+                else scale.owned
+        )
         for _ = 1, 2 do
             local m = world:entity()
             world:set(m, ModifierC, rand(100))
@@ -407,10 +416,17 @@ local function new(ecs: any, scale: Scale, seed: number): Model
     for _ = 1, scale.second_kind do
         make_agent(SecondKind)
     end
-    -- the expiry pairs of the groups
+    -- Three target slots per group: frames refresh existing pairs. A target whose activity
+    -- ended loses its pair through remove_all, and its slot is refilled on the next refresh.
+    -- Choosing a new target on every set instead would grow the modeled world for minutes.
+    local expiry_targets: { [any]: { any } } = {}
     for _, g in groups do
-        for _ = 1, 3 do
-            world:set(g, pair(Expiry, active[rand(#active)]), rand(1000))
+        local targets: { any } = {}
+        expiry_targets[g] = targets
+        for i = 1, 3 do
+            local a = active[rand(#active)]
+            targets[i] = a
+            world:set(g, pair(Expiry, a), rand(1000))
         end
     end
     -- owned entities of active agents out of the idle state
@@ -592,7 +608,15 @@ local function new(ecs: any, scale: Scale, seed: number): Model
         end
         -- a few expiry pairs refreshed
         for _ = 1, 2 do
-            world:set(groups[rand(#groups)], pair(Expiry, active[rand(#active)]), rand(1000))
+            local g = groups[rand(#groups)]
+            local targets = expiry_targets[g]
+            local at = rand(3)
+            local a = targets[at]
+            if not world:contains(a) or not world:has(g, pair(Expiry, a)) then
+                a = active[rand(#active)]
+                targets[at] = a
+            end
+            world:set(g, pair(Expiry, a), rand(1000))
         end
     end
 
@@ -714,7 +738,8 @@ local function new(ecs: any, scale: Scale, seed: number): Model
     -- lifecycle events
     ----------------------------------------------------------------------------
 
-    -- an active agent ends its activity: it keeps its owned entities, back to idle
+    -- An active agent ends its activity: retain its owned entities, or delete them in the
+    -- alternate profile. Both profiles keep the same agents and the same event rates.
     function model.end_activity()
         if #active <= 1 then
             return
@@ -725,10 +750,18 @@ local function new(ecs: any, scale: Scale, seed: number): Model
         active[#active] = nil
         world:add(a, Retained)
         for _, e in owned_of[a] do
-            world:add(e, RetainedOwned)
-            if busy_at[e] then
-                set_busy(e, 1)
+            if scale.retain_owned == false then
+                forget_busy(e)
+                world:delete(e)
+            else
+                world:add(e, RetainedOwned)
+                if busy_at[e] then
+                    set_busy(e, 1)
+                end
             end
+        end
+        if scale.retain_owned == false then
+            owned_of[a] = {}
         end
         world:remove_all(pair(Expiry, a))
         table.insert(retained, a)
@@ -812,6 +845,16 @@ local function new(ecs: any, scale: Scale, seed: number): Model
     end
     function model.agents(): { any }
         return active
+    end
+
+    function model.verify_expiry()
+        for _, g in groups do
+            local count = 0
+            for _ in world:targets(g, Expiry) do
+                count += 1
+            end
+            assert(count <= 3, "the workload must keep at most three expiry pairs per group")
+        end
     end
 
     return model
