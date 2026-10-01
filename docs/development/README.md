@@ -46,28 +46,33 @@ wally-package-types --sourcemap sourcemap.json DevPackages/
 src/init.luau          the library (the specialized iterators are generated, see tools/) and its API reference (doc comments)
 src/jabby.luau         the adapter for the jabby debugger (a child module the library never requires)
 tools/generate.py      regenerates the iterator sections: python tools/generate.py && stylua src
-tools/check.sh         formatting, lints and types, checked like the editor does
+tools/check.sh         formatting, lints and types, checked like the editor does, and the type errors that must stay
+tools/typecheck.py     the misuses of test/typecheck/errors.luau: the analyzer must reject each marked line, nothing else
 tools/test.sh          every test, the example and a fuzz run (--codegen: with native code)
 tools/previous.sh      the previous release from its git tag into tmp/previous, for the benchmarks
 tools/workload.sh      the performance suite of the reference workload, interpreter and native code
 tools/workload.py      isolated runs against a verified release tag, controls, raw samples and release gates
 tools/test_workload.py tests of the report parser, controls and release selection
+tools/test_typecheck.py tests of the comparison of tools/typecheck.py
 test/core.luau         core semantics, run against jecs and this library
 test/lib.luau          library features, the model tests
 test/types.luau        typed API usage (must type-check)
+test/typecheck/errors.luau misuses of the public types, each marked with the error it must get (not run)
 test/fuzz.luau         random operations against a model (flags: wide, hooks, sparse, pool, verify, churn, shapes, monitors)
 test/jabby.luau        the jabby adapter: what jabby reads from its jecs module and a world
 test/jecs_compat/      the jecs test suite run against this library (125/125 applicable), and the tests of its addon modules/OB against the query monitors (ob.luau, 42/42 monitor cases)
 test/monitors_fuzz.luau random queries and changes of the world against query monitors
 test/queries_fuzz.luau random queries and changes of the world against brute force
 test/loops_fuzz.luau   loops that change the world (no entity twice, untouched ones once)
-test/workload_cases.luau the behavior cases of the reference workload
-test/edge_cases.luau   snapshot boundaries, reentrant cleanup, signal replacement and query return values
+test/behavior.luau     the behavior specification: the groups of cases in test/cases/ (a group per subject)
+test/cases/           the groups of the behavior specification and support.luau (the kit type, the helpers)
 test/snapshots_fuzz.luau independent model of exact each/children snapshots held across world changes
+test/reentrant_fuzz.luau nested changes from hooks, listeners and monitor callbacks, checked against invariants (flags: debug, pool, range)
 test/workload_model.luau verifies the model's bound of three expiry pairs per group during churn
 examples/basics.luau   a runnable tour of the API
 bench/run.luau         the benchmark matrix (harness.luau, scenarios.luau, shapes.luau, strengths.luau, monitors.luau, impls.luau, impl_defs.luau)
 bench/query_cases.luau query cases where an archetype ECS is at its best: jecs for-in against query:each
+bench/basic.luau       the four basic benchmarks of jecs (spawn, despawn, insertion, query) for this library, jecs and ecr
 bench/frame.luau       a synthetic game frame (frame_scene.luau)
 bench/leak.luau        a long session with changing relationship targets (memory growth)
 bench/workload.luau    the performance suite of the reference workload, P1–P9 (workload_model.luau: the model of the world)
@@ -77,11 +82,11 @@ bench/results/        release workload reports and raw samples
 bench/gc.luau          garbage collector access that works in the luau CLI and in Roblox
 bench/versions.luau    the versions of jecs and the library in the output of the benchmarks
 bench/previous.luau    the previous release (tmp/previous) when tools/previous.sh has extracted it
-bench/visual/          Benchmarker plugin files (*.bench.luau): jecs against this library
+bench/visual/          Benchmarker plugin files (*.bench.luau): jecs, ecr (the four basic ones) and this library
 benchmarker.project.json  a place with the libraries and bench/visual only, for the Benchmarker plugin
 studio/                a Roblox place that runs the fuzz test, the frame and the matrix (check.project.json: its tree)
 vendor/testkit.luau    the test kit of the jecs suite (MIT)
-docs/                  the index (README.md) and a folder per page: guide/, jecs-comparison/, development/
+docs/                  the index (README.md) and a folder per section: guide/, comparison/ (Benchmarker, previous release, jecs, ecr), development/
 moonwave.toml          the documentation site (Moonwave)
 .github/workflows/     CI, releases and the documentation site
 ```
@@ -96,21 +101,39 @@ bash tools/test.sh --codegen   # native code
 `tools/test.sh` runs `test/core.luau`, `test/lib.luau`, `test/types.luau`, `test/fuzz.luau`,
 `test/jabby.luau`, `test/jecs_compat/tests.luau`, `test/jecs_compat/ob.luau`,
 `test/monitors_fuzz.luau`, `test/queries_fuzz.luau`, `test/loops_fuzz.luau`,
-`test/workload_cases.luau`, `test/edge_cases.luau`, `test/snapshots_fuzz.luau`, `test/workload_model.luau` and
-`examples/basics.luau`, and stops at the first failure with a
-non-zero exit code (a failed case of the test kit fails its file).
-It also requires exactly one actual shared-query warning from `workload_cases.luau`.
+`test/snapshots_fuzz.luau`, `test/reentrant_fuzz.luau`, `test/workload_model.luau`,
+`test/behavior.luau` (twice: with the worlds the cases ask for, then with `-a debug`) and
+`examples/basics.luau`, and stops at the first failure with a non-zero exit code (a failed
+case of the test kit fails its file). It also requires exactly one actual shared-query
+warning from each run of `test/behavior.luau` (the last case of its `workload` group makes it).
 
-`test/workload_cases.luau` holds the behavior cases of the reference workload (the next
-section), one case per line of the requirements: ids and liveness, hooks and signals,
-relations, loops, debugging aids. A release passes all of them; a change of one is a changed
-behavior of the release notes.
+`test/behavior.luau` runs the behavior specification: one case per behavior that code using the
+library can observe, in groups by subject, one module per group in `test/cases/`:
 
-`test/edge_cases.luau` checks the snapshot word/page boundaries and generations, more than
-16 held iterators across two worlds, messages created and replaced by hooks, reentrant target
-and relation deletion, overlapping ownership cascades, nested batch operations, listener
-replacement, query return arities and callback errors. An optional module path runs it against
-a saved release (`luau test/edge_cases.luau -a ../tmp/release-024-baseline`).
+| Group | What it holds |
+|---|---|
+| `changes` | `world:toggle`, the `Component` trait after the first use of an id |
+| `queries` | the terms of a query through every way of reading it, a query without terms that select entities, `world:each` and `world:children` over disabled members, the arity and nil values of queries, several excluded ids |
+| `loops` | `world:each` and `world:children` snapshots at word, page and block boundaries, after emptied words and recycled slots, while a few members move between words; buffers of held, exhausted and abandoned iterators across two worlds; a frame of messages changed by hooks |
+| `hooks` | reentrant removal listeners during target and relation deletion, listener replacement, errors raised by hooks and the `world:tick` after them, the listeners that a signal reaches after others were disconnected, disconnected listeners and monitors that nothing keeps, listeners that delete the entity of their own event or take back an excluded id of a monitored query, a clear or a delete that notifies every id once, monitors and the changes made while an id is removed |
+| `relations` | relations kept in sync by their own hooks, a cascade that reaches an entity through ownership and `ChildOf`, listeners that give a changing exclusive relation, a deleted id or the entities of a cascade new uses, hooks that never stop giving new uses |
+| `tracking` | what one tick records, batch operations on tracked ids, the depth of the history, creation tracking, an entity that a listener of the change deletes |
+| `batches` | batch operations whose matches cascade or leave the query, nested batch operations, `toggle_all` |
+| `worlds` | two worlds in one process, `world:entity(id)` over a live slot, an old id of a slot that a new entity took (reads and changes, with and without debug), `world:range` with explicit ids and with a pool made before it |
+| `workload` | the behavior cases of the reference workload (the next section): ids and liveness, hooks and signals, relations, loops, debugging aids |
+
+A group returns a function
+that adds its tests to the kit of the run (`test/cases/support.luau` holds the kit type and
+the helpers); a new group is added to the list of the runner. Named groups run alone, and a
+module path runs the cases on a saved release, which shows a changed behavior between two
+releases:
+
+```sh
+luau test/behavior.luau -a tracking worlds
+luau test/behavior.luau -a ../tmp/previous/mercs
+```
+
+A release passes every case; a change of one is a changed behavior of the release notes.
 
 `test/snapshots_fuzz.luau` compares exact full-id snapshots with its own model of liveness,
 tags and parents, independent of library queries. It holds iterators across deletes, cascades,
@@ -118,11 +141,42 @@ slot reuse and nested loops, including abandoned loops. Failures include seed, r
 operation trace. The default runs seeds 1, 42 and 20260930 for 250 rounds each; CI runs each
 for 2 000 rounds (`luau test/snapshots_fuzz.luau -a 42 2000`).
 
-The workload runner has separate evidence-validation tests:
+`test/reentrant_fuzz.luau` makes hooks, signal listeners and monitor callbacks change the world
+while it changes: the entity of their event or others, the id of the event or others (adds,
+removals, toggles, values, pairs of a relation, of an exclusive relation and of `ChildOf`, an
+entity given to others as an id, clears and deletes, also of ids and targets being deleted,
+new entities, also in a slot freed a moment before, explicit ids over live entities, deleted
+ids made alive again, batch operations with ids and pairs that the callbacks may delete,
+`Disabled`), at most 3 levels deep and 12 times per operation; half of the entities used as
+ids are components. It has no model of
+their effects; after every operation the world must agree with itself: every addition and
+removal heard once (for every entity and id, the additions less the removals are 1 when the
+entity has the id, 0 otherwise; an id that the hooks give an entity during its own clear or
+delete goes unheard), no live entity with a dead id, one target of an exclusive
+relation, `has`, `world:each`, queries and counts in agreement, the members of the monitors
+(two made before the other callbacks, two after) equal to the matches of their queries, the
+change filters returning only live entities with that change in the tick, and with `range` the
+new ids inside the range. `debug` uses a debug world, `pool` makes half of the entities from a
+slot pool; an argument with a slash is the module of a saved release to run on (the toggles
+of an older release are made of add and remove). A failure prints the seed, the round and the
+last actions, nested ones indented. CI runs 3 seeds of 300 rounds in each mode
+(`luau test/reentrant_fuzz.luau -a 7 300 debug pool range`).
+
+The Python tools have tests of their own (the evidence validation of the workload runner and the
+comparison of the type check):
 
 ```sh
-python -B -m unittest discover -s tools -p 'test_workload.py'
+python -B -m unittest discover -s tools -p 'test_*.py'
 ```
+
+`test/typecheck/errors.luau` holds misuses of the public types, one per line, each marked with a
+trailing comment `error: <text>`: a value of another type than the component's (also `nil` for a
+component that does not allow it, and in data pairs), values read into variables of another type,
+callbacks and loops that take another type, a string or a number where an id goes, a typed id
+widened to accept any value. `tools/typecheck.py` (run by `tools/check.sh`) analyzes the file with
+the same analyzer and flags as the rest of the repository and requires an error containing
+`<text>` on every marked line and no error on any other line; the file is not run and not part of
+the analysis of `test/*.luau`. `test/types.luau` holds the uses that must type-check.
 
 `test/monitors_fuzz.luau` builds random queries (tags, components, pairs, relations with any
 target, an exclusive relation, `ChildOf`, `Disabled`, excluded ids and OR terms, sometimes a
@@ -183,18 +237,17 @@ Explicit executable paths can be supplied through `MERCS_LUAU_LSP`, `MERCS_STYLU
 
 ## The reference workload
 
-The priority of the library is the workload of a game that uses it, described in its release
-requirements by the kinds of its entities, their numbers, rates and access patterns, at a small
-scale (the test places) and a target scale (about 700 agents with 500 owned entities each,
-350 000 entities, a heap of about 140 MB). Every release runs the performance suite of that
-workload against the previous release and against itself, in the interpreter and in native
-code, and passes its gates: no test worse than on the previous release beyond the noise (first
-at the target scale in native code), the heap of the target world not larger, and the behavior
-cases passed. Its release notes list the changed behavior, the results of the suite and the
-memory of the target world.
+The priority of the library is its reference workload, described by the kinds of
+its entities, their numbers, rates and access patterns, at a small scale (the test places) and a
+target scale (about 700 agents with 500 owned entities each, 350 000 entities, a heap of about
+140 MB). Every release runs the performance suite of that workload against the previous release
+and against itself, in the interpreter and in native code, and passes its gates: no test worse
+than on the previous release beyond the noise (first at the target scale in native code), the
+heap of the target world not larger, and the behavior cases passed. Its release notes list the
+changed behavior, the results of the suite and the memory of the target world.
 
 ```sh
-bash tools/workload.sh baseline=v0.2.3 release=yes          # full acceptance, both modes, 5 runs
+bash tools/workload.sh baseline=v0.2.4 release=yes          # full acceptance, both modes, 5 runs
 python tools/workload.py runs=10 tests=P1,P7 scales=sparse,target modes=native
 python tools/workload.py --luau /path/to/luau output=tmp/workload-custom
 ```
@@ -209,10 +262,11 @@ rotates; corresponding repeats use identical seeds.
 every raw sample, seeds, source/tool hashes and environment; `logs/` holds process output.
 The noise allowance per row is the maximum of the baseline control median difference,
 three times the median paired absolute control difference and the heap measurement
-resolution. Candidate variation never enlarges it. A disputed row needs another 10–20
+resolution; a difference of exactly the allowance (one step of the heap resolution) is within
+it. Candidate variation never enlarges it. A disputed row needs another 10–20
 repeats and investigation; overlapping ranges alone do not settle it.
 
-The [0.2.4 report](https://github.com/dubalda/mErCS/blob/main/bench/results/0.2.4.md) keeps the
+The [1.0.0 report](https://github.com/dubalda/mErCS/blob/main/bench/results/1.0.0.md) keeps the
 primary measurements and additional repeats together. It includes every initial flag,
 the combined decision and commands to reproduce the runs or verify the saved comparisons.
 
@@ -229,23 +283,28 @@ evidence. The measured tests are:
 
 | Test | What is measured |
 |---|---|
-| P1 | `world:each` over a tag whose members are spread evenly among 350 000 entities (exactly 16, 256, 2 048, 16 384 members), in runs of 8, the dense case (100 000 of 100 000), and 16 members after an emptied word |
-| P2 | 10 walks per frame over state tags with the members of a system tag, with the state transitions of a frame between: `world:each` with a check, and one stored query per system tag |
+| P1 | `world:each` over a tag whose members are spread evenly among 350 000 entities (exactly 16, 256, 2 048, 16 384 members), in runs of 8, the dense case (100 000 of 100 000), and 16 members after an emptied word; the small world: a tag with 4 members among 1 500 entities, each transition moving a member to another entity, before any transition, after 40 (the emptied words still in the record) and after 3 000 |
+| P2 | 10 walks per frame over the passing state with the members of a system tag, with the state transitions of a frame between: `world:each` with a check, and one stored query per system tag; with the members of the workload (4 at the small scale, 8 at the target one) and in the stress case (80) |
 | P3 | `world:each` over the holders of `(Trigger_k, agent)`: about 60 at the target scale, 2 at the small one |
 | P4 | the 25 stored queries at their periods (1 to 60 frames) while agents change and owned entities change state |
-| P5 | the messages of a frame handled (the walks of P3 and of `(Extra, agent)`, 3 values read per holder) and deleted, new ones made, the deferred ones visited |
+| P5 | the messages of a frame handled (the walks of P3 and of `(Extra, agent)`, 3 values read per holder) and deleted, new ones made, the deferred ones visited: on average (2 / 5 messages a frame, 1 / 3 deferred ones at the small / target scale) and in a burst of activity (30 messages a frame, 60 / 300 deferred ones) |
 | P6 | the end of the activity of an agent, the removal of a retained agent (the cascade over its 500 owned entities, with removal listeners), a new agent with its owned entities; the median of the events of a run |
 | P7 | the frames of the model with the lifecycle events at their rate: µs per frame and ms of ECS work per second of server time |
 | P8 | the heap after build, after preceding measurement phases and 100 additional lifecycle rounds, then after 3 000, 6 000 and 9 000 more frames; bytes per distinct pair and per holder |
 | P9 | net heap growth during warmed frames and loops over a stored query or `world:each`; the first large snapshot in a fresh module |
 
 `bench/workload_model.luau` is the model of the world and of a frame: agents from a slot pool,
-owned entities created in one burst after their agent, groups and anchors in `ChildOf` trees,
-8 trigger relations and an ownership relation that deletes the owned entities with their agent,
-7 states (a value and a mirror tag moved by hooks), 10 system tags, messages, timed effects,
-modifiers, expiry data pairs removed with `remove_all`, about 85 components and 115 tags. Its
-header lists the choices that the requirements leave open. The heap it reports includes the
-lists of the model (the same for every column).
+owned entities created in one burst after their agent, groups and anchors in `ChildOf` trees, 8
+trigger relations and an ownership relation that deletes the owned entities with their agent, 7
+states (a value and a mirror tag moved by hooks), 10 system tags, messages, timed effects,
+modifiers, expiry data pairs removed with `remove_all`, about 85 components and 115 tags. The
+states out of idle hold a few owned entities each, as in the reference workload: at the small scale 18
+in the busiest state, 4 in the passing state that the intersection walks go over and 1 in each
+of the other four, twice as many at the target scale. A frame works at the averages of the
+reference workload; `burst` and `stress` switch the model to a burst of messages (P5) and to the
+stress case of the intersection walks (P2) and back. Its header lists the choices that the
+workload leaves open. The heap it reports includes the lists of the model (the same for every
+column).
 Each group keeps at most three expiry pairs: a refresh updates an existing pair or replaces
 one removed when its agent ended activity. The old model chose a new random target on every
 refresh, gradually increasing the number of pairs beyond the workload's bound.
@@ -276,6 +335,7 @@ luau -O2 bench/run.luau -a reps=9                           # the matrix, interp
 luau -O2 --codegen bench/run.luau -a filter=query,pair      # native code, some groups
 luau -O2 --codegen bench/run.luau -a "filter=query cases,sparse,state tags" # the query shapes (bench/shapes.luau)
 luau -O2 --codegen bench/query_cases.luau                   # the query cases, with the test kit of jecs
+luau -O2 --codegen bench/basic.luau -a ecr                  # the four basic benchmarks: lib, jecs or ecr
 luau -O2 bench/frame.luau                                   # the synthetic frame
 luau -O2 bench/leak.luau                                    # a long session
 ```
@@ -291,10 +351,10 @@ heap growth kept after the run and a full collection.
 
 In one process the implementations run in turn, and the ones that run first change the timings
 of the later ones: by up to 30 % in some rows. The numbers of
-[the comparison](../jecs-comparison/README.md#performance) run each implementation in a process
+[the comparison](../comparison/jecs.md#performance) run each implementation in a process
 of its own (`impls=jecs`, `impls=previous`, `impls=lib`), 5 times in each mode, and take the
 medians. The
-[0.2.4 comparison evidence](https://github.com/dubalda/mErCS/blob/main/bench/results/0.2.4-jecs.md)
+[1.0.0 comparison evidence](https://github.com/dubalda/mErCS/blob/main/bench/results/1.0.0-comparison.md)
 includes the full ranges, raw samples, source hashes and isolated entry points for reproducing
 the matrix, synthetic frame, long session and memory probes.
 
@@ -306,7 +366,7 @@ queries built per call (a concrete pair per parent, two queries per new caster w
 as a term), `world:each` and `world:children` over many entities, entities of eight kinds
 created in turn (with a slot pool too), deleting entities that have 100 targets of a relation,
 and the memory of sparse components in a large world. The results are in
-[the comparison](../jecs-comparison/README.md#the-strengths-of-jecs).
+[the comparison](../comparison/jecs.md#the-strengths-of-jecs).
 
 The group `query monitors` (`bench/monitors.luau`) times the changes that a query monitor
 watches, against jecs 0.11.0 with its addon `modules/OB` (the `jecs_ob` alias of `.luaurc`;
@@ -331,17 +391,20 @@ first loops included; the matrix takes the minimum of several runs.
 
 `bench/visual/*.bench.luau` follow the format of the Benchmarker plugin (the same as
 `jecs/test/benches/visual`): `ParameterGenerator`, `BeforeAll` / `AfterAll` /
-`BeforeEach` / `AfterEach` and `Functions` with an entry for jecs and one for mErCS, named with
-their versions (`jecs 0.11.0`, `mErCS 0.2.4`: `libs.luau` reads the version of jecs from its
-Wally package and holds the version of mErCS). The parameters are generated before every call
-and give each function its own fresh world.
+`BeforeEach` / `AfterEach` and `Functions` with an entry for jecs and one for mErCS, and one for
+ecr in the four basic benchmarks of jecs, named with their versions (`jecs 0.11.0`,
+`mErCS 1.0.0`, `ecr 0.9.0`: `libs.luau` reads the versions of jecs and ecr from their Wally
+packages and holds the version of mErCS). The parameters are generated before every call and
+give each function its own fresh world. ecr declares its component types before the registries
+that use them, so its files make them once, when they are required. `bench/basic.luau` runs the
+four basic benchmarks in the CLI, one library per process.
 
 | File | What |
 |---|---|
-| `spawn.bench.luau` | 1000 entities with 4 components |
-| `insertion.bench.luau` | 8 components into 500 existing entities |
-| `query.bench.luau` | 10 passes of a 4-component query over 4096 entities with random components (also `query:each`) |
-| `despawn.bench.luau` | delete 1000 entities with 4 components and a tag |
+| `spawn.bench.luau` | 1000 entities with 4 components (also ecr) |
+| `insertion.bench.luau` | 8 components into 500 existing entities (also ecr) |
+| `query.bench.luau` | 10 passes of a 4-component query over 4096 entities with random components (also `query:each`, and an ecr view) |
+| `despawn.bench.luau` | delete 1000 entities with 4 components and a tag (also ecr) |
 | `remove.bench.luau` | remove one of 5 components from 1000 entities |
 | `pairs.bench.luau` | 100 parents with 10 `ChildOf` children that also target a parent through a relation, then the parents are deleted |
 | `batch.bench.luau` | add and remove a tag on half of 2000 entities: batch operations against a jecs collect-and-change loop |
@@ -386,7 +449,7 @@ How the plugin runs a bench file, which matters when writing a new one:
 The results, including an error message, are stored in the `BenchResults` attribute of the
 bench module. Its "Average" is the midpoint of the minimum and the maximum, not the mean:
 compare the medians (50th percentile). The results of these files, with screenshots, are in
-[Roblox Studio: Benchmarker](../jecs-comparison/README.md#roblox-studio-benchmarker).
+[Benchmarker](../comparison/benchmarker.md).
 
 ## Roblox Studio
 
@@ -427,7 +490,7 @@ The workflows of `.github/workflows/` get the tools from `rokit.toml` (the
 
 | Workflow | When | What |
 |---|---|---|
-| `ci.yml` | every pull request and push to `main` | `tools/check.sh`; `tools/test.sh` in both modes; workload runner tests; 3 fuzz runs of 400 rounds (`wide hooks`), 2 with `sparse pool verify hooks wide churn shapes monitors`, and 3 exact-snapshot seeds of 2 000 rounds; model/package artifacts; documentation build |
+| `ci.yml` | every pull request and push to `main` | `tools/check.sh`; `tools/test.sh` in both modes; workload runner tests; 3 fuzz runs of 400 rounds (`wide hooks`), 2 with `sparse pool verify hooks wide churn shapes monitors`, 3 exact-snapshot seeds of 2 000 rounds and 3 nested-change seeds of 300 rounds; model/package artifacts; documentation build |
 | `release.yml` | a pushed tag `vX.Y.Z` | the tag must match `version` in `wally.toml`; checks and tests; `wally publish`; a GitHub release with `mercs.rbxm`, whose text is the section of the tag in `CHANGELOG.md` (generated notes when there is none) |
 | `docs.yml` | a push to `main` that changes `src/`, `docs/`, `README.md` or `moonwave.toml` | builds the documentation site and publishes it to GitHub Pages |
 
@@ -438,15 +501,15 @@ To release a version:
    shows `CHANGELOG.md` as its Changelog page.
 2. Set the version (without the `v`) in `wally.toml`, and in the output of the benchmarks:
    `library` in `bench/versions.luau` and `LIBRARY_VERSION` in `bench/visual/libs.luau`.
-3. Run `python tools/workload.py baseline=v0.2.3 release=yes` (select the actual previous tag
-   for later releases). Review performance and long-session memory, and save the report and
+3. Run `python tools/workload.py baseline=v0.2.4 release=yes` (the tag of the previous
+   release). Review performance and long-session memory, and save the report and
    raw samples under `bench/results/`. Summarize both modes/scales and every observable
    behavior change in the release notes.
 4. Commit, wait for a green CI, then push the tag:
 
 ```sh
-git tag -a v0.2.4 -m "mErCS v0.2.4"
-git push origin v0.2.4
+git tag -a v1.0.0 -m "mErCS v1.0.0"
+git push origin v1.0.0
 ```
 
 Settings of the GitHub repository:
@@ -506,12 +569,15 @@ npx moonwave@1.4.2 dev     # a local preview that reloads on changes
 npx moonwave@1.4.2 build   # the static site in build/
 ```
 
-- `docs/` has an index, `docs/README.md`, and a folder per page with a `README.md`, which
-  GitHub shows when the folder is opened. The index has `id: intro` in its front matter:
-  Moonwave links the navigation bar to the doc `intro`. The `_category_.json` of a folder
-  gives the label and the position of the page in the sidebar.
-- The workflows rewrite the README links `docs/x/README.md` to `docs/x` before the build
-  (the site serves a folder page at `docs/x`); a local preview shows these links as broken.
+- `docs/` has an index, `docs/README.md`, and a folder per section with a `README.md`, which
+  GitHub shows when the folder is opened; a section of several pages (`docs/comparison/`) has
+  a file per page beside it. The index has `id: intro` in its front matter: Moonwave links the
+  navigation bar to the doc `intro`. The `_category_.json` of a folder gives the label and the
+  position of the section in the sidebar.
+- The workflows rewrite the README links before the build: `docs/x/README.md` to `docs/x` (the
+  site serves a folder page at `docs/x`) and `docs/x/y.md` to `docs/x/y`. A local build fails
+  on these links, and a local preview shows them as broken, unless the `sed` of `docs.yml` is
+  applied to `README.md` first (and undone after).
 - The pages are MDX: `<https://...>` autolinks break the build, write `[text](url)`.
 - Generics in the name of a `@type` break its page: write `@type Pair Id<First | Second>` and
   give `Pair<First, Second>` in the text. Parameters and returns may use generics.

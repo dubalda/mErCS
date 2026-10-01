@@ -89,10 +89,15 @@ world:query(Health):without(Frozen):set_all(Health, 50)
 world:query(Position):add_all(Frozen)
 world:query(Frozen):remove_all(Frozen)
 
--- introspection and helpers
+-- introspection and helpers: they take any id, also straight from a call
 local _ids: { ecs.Id } = world:ids(e)
 local _slot: number = ecs.ECS_ID(e)
 local _generation: number = ecs.ECS_GENERATION(e)
+local _fresh_slot: number = ecs.ECS_ID(world:entity())
+local _fresh_generation: number = ecs.ECS_GENERATION(world:pool():entity())
+local _component_slot: number = ecs.ECS_ID(Health)
+local _first: number = ecs.ECS_PAIR_FIRST(ecs.pair(ecs.ChildOf, world:entity()))
+local _second: number = ecs.ECS_PAIR_SECOND(ecs.pair(ecs.ChildOf, world:entity()))
 
 -- slot pools: their entities are ordinary entities
 local npcs: ecs.Pool = world:pool()
@@ -115,6 +120,42 @@ world:set(walker, Position, { x = 0, y = 0 })
 world:set(walker, Health, 5)
 assert(entered == 1, "entered once")
 monitor.disconnect()
+
+-- optional and union component types: nil only where the type allows it
+local Maybe = world:component() :: ecs.Component<number?>
+local Either = world:component() :: ecs.Component<number | string>
+world:set(e, Maybe, nil)
+world:set(e, Maybe, 1)
+world:set(e, Either, 1)
+world:set(e, Either, "one")
+local _maybe: number? = world:get(e, Maybe)
+local _either: (number | string)? = world:get(e, Either)
+
+-- a typed wrapper keeps the type of the id it is given
+local function put<T>(id: ecs.Component<T>, value: T)
+    world:set(e, id, value)
+end
+put(Health, 5)
+put(Name, "wrapped")
+
+-- a pair whose relation is a tag carries the type of its target
+local Likes = world:entity()
+world:set(e, ecs.pair(Likes, Health), 3)
+local _liked: number? = world:get(e, ecs.pair(Likes, Health))
+
+-- mixed lists of ids for reading and filtering
+local mixed: { ecs.Id } = { Position, Frozen, ecs.pair(ecs.ChildOf, parent) }
+local _all: boolean = world:has_all(e, mixed)
+local _values: { any } = world:get_list(e, mixed)
+for _entity, _p in world:query(Position):with(Frozen, ecs.pair(ecs.ChildOf, parent)):without(Velocity) do
+end
+
+-- toggles and creation tracking
+local _added: boolean = world:toggle(e, Frozen)
+world:query(Position):toggle_all(Frozen)
+world:track_created()
+for _entity, _p in world:query(Position):created() do
+end
 
 world:delete(e)
 assert(not world:contains(e), "deleted")

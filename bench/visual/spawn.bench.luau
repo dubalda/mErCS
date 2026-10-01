@@ -2,7 +2,8 @@
 --!optimize 2
 --!native
 --[[
-    Benchmarker: spawn 1000 entities with 4 components each, in a fresh world per run.
+    Benchmarker: spawn 1000 entities with 4 components each, in a fresh world per run (jecs,
+    mErCS and ecr).
 ]]
 
 -- Benchmarker requires a clone of this module, which has no parent: relative requires cannot
@@ -32,9 +33,22 @@ local function spawn(s: Setup)
     end
 end
 
+-- ecr: the component types come before the registries that use them
+local EcrA, EcrB, EcrC, EcrD = libs.ecr.component(), libs.ecr.component(), libs.ecr.component(), libs.ecr.component()
+
+local function spawn_ecr(registry: any)
+    for i = 1, N do
+        local e = registry:create()
+        registry:set(e, EcrA, i)
+        registry:set(e, EcrB, i)
+        registry:set(e, EcrC, i)
+        registry:set(e, EcrD, i)
+    end
+end
+
 return {
     ParameterGenerator = function()
-        return setup(libs.jecs), setup(libs.lib)
+        return setup(libs.jecs), setup(libs.lib), libs.ecr.registry()
     end,
 
     BeforeAll = function() end,
@@ -49,6 +63,10 @@ return {
 
         [libs.lib_label] = function(_Profiler: any, _jecs_setup: Setup, lib_setup: Setup)
             spawn(lib_setup)
+        end,
+
+        [libs.ecr_label] = function(_Profiler: any, _jecs_setup: Setup, _lib_setup: Setup, registry: any)
+            spawn_ecr(registry)
         end,
     },
 }

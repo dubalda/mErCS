@@ -1,8 +1,9 @@
 # mErCS and jecs
 
-How mErCS 0.2.4 differs from [jecs](https://github.com/Ukendio/jecs) 0.11.0: the design,
-the behaviour, when jecs is the better choice, the numbers (with mErCS 0.2.3, the previous
-release, beside them), and how to move code over.
+How mErCS 1.0.0 differs from [jecs](https://github.com/Ukendio/jecs) 0.11.0: the design,
+the behaviour, when jecs is the better choice, the numbers, and how to move code over. The
+comparison of 1.0.0 with the previous release is on [its own page](previous-release.md), the
+Benchmarker screenshots on [Benchmarker](benchmarker.md).
 
 ## Contents
 
@@ -22,16 +23,14 @@ copies all its columns, every new combination of components creates an archetype
 until someone cleans it up, and relationships to many targets create an archetype per target.
 
 mErCS keeps, for every component, tag or pair, a bitset of the entities that have it,
-and the values in pages indexed by the entity slot (the model of the C# library
-[StaticEcs](https://github.com/Felid-Force-Studios/StaticEcs), adapted to Luau). A query ANDs
-the bitsets 32 entities at a time and walks the set bits.
+and the values in pages indexed by the entity slot. A query ANDs the bitsets 32 entities at a
+time and walks the set bits.
 
-| | jecs 0.11.0 | mErCS 0.2.4 |
+| | jecs 0.11.0 | mErCS 1.0.0 |
 |---|---|---|
 | add / remove a component | moves the entity, copies all its columns: O(components) | sets a bit and a value: O(1) |
 | new combination of components | creates an archetype (kept until `world:cleanup()`) | nothing to create |
 | pair with many targets | an archetype per target | one small record per pair, freed when unused (in batches) or with its target |
-| components per world | 256 via `world:component()` | no limit |
 | ids per `get` / `has` call | 4 | 8, any number with `get_list` / `has_all` |
 | memory per entity with 4 components | 320 B | 131 B |
 | deep hierarchies | the cascade recurses: stack overflow at about 6000 levels | any depth (past 100 levels the rest is queued) |
@@ -42,7 +41,7 @@ The API follows jecs: worlds, entities, components, tags, pairs, wildcards, `Exc
 cleanup policies, hooks, signals, `Name`, pre-registration (`jecs.component()` /
 `jecs.tag()` / `jecs.meta()`), the `ECS_*` helpers and the builtin ids.
 
-The 0.2.4 CLI check passes the jecs test suite (`test/jecs_compat/`) in both modes:
+The 1.0.0 CLI check passes the jecs test suite (`test/jecs_compat/`) in both modes:
 125 of 125 applicable cases pass (its `bulk_insert` / `bulk_remove` come from a test shim, as loops of `set` /
 `remove`). The cases that inspect jecs internals (archetype records, edges, the entity
 visualiser) are not applicable and are listed in `test/jecs_compat/README.md`.
@@ -91,6 +90,15 @@ visualiser) are not applicable and are listed in `test/jecs_compat/README.md`.
   deleted before the loop reaches it is returned as a dead id (jecs walks the rows of its
   archetypes backwards).
 - `world:exists(e)` is also true for a slot reserved by a slot pool and not handed out yet.
+- A query with excluded ids alone (`world:query():without(A)`) raises an error when it is used:
+  it would match nothing. A query needs a returned or required id, an OR term or a change
+  filter.
+- A removal that the hooks of the same removal start again (the same id removed from the same
+  entity) does nothing, so a relation kept in sync by its hooks runs the hook of each side once
+  (in jecs such hooks remove the pair back and forth until the stack overflows).
+- The `Component` trait added to an id used already, or removed from a used one, raises an
+  error and changes nothing. jecs also decides at the first use of an id whether it holds data,
+  and keeps that decision without an error when the trait changes later.
 - `world:remove(e, ecs.pair(R, ecs.Wildcard))` removes every pair `(R, *)` of the entity, and
   `ecs.pair(ecs.Wildcard, T)` every pair with the target `T`; `add` and `set` raise an error for
   a wildcard pair. jecs forbids a wildcard pair in all three: `jecs.world(true)` raises an
@@ -101,10 +109,11 @@ visualiser) are not applicable and are listed in `test/jecs_compat/README.md`.
 
 - `query:each(fn)` — a callback per match; see the measured [query loops](#queries-per-entity-or-match).
 - `query:any(...)` — OR terms.
-- Batch operations: `query:count`, `add_all`, `set_all`, `remove_all`, `delete_all`, and
-  `world:remove_all(id)`.
+- Batch operations: `query:count`, `add_all`, `set_all`, `remove_all`, `delete_all`,
+  `toggle_all`, and `world:remove_all(id)`.
+- `world:toggle(e, id)`: adds an absent id, removes a present one, and tells which it did.
 - Change tracking by ticks: `world:track`, `world:tick`, the `:added` / `:changed` /
-  `:removed` filters.
+  `:removed` filters, and new entities with `world:track_created` and `:created`.
 - `ecs.Disabled`: entities hidden from queries without removing their components.
 - Slot pools: `world:pool()` and `pool:entity()` keep a kind of entities created among many
   others (creatures among their skills) in slots of its own, so the bitsets and value pages of
@@ -116,7 +125,7 @@ visualiser) are not applicable and are listed in `test/jecs_compat/README.md`.
 
 jecs keeps the entities of one set of ids together, in the rows of an archetype; mErCS keeps a
 bitset per id and the values in pages indexed by the entity slot. Each layout has cases that
-the other cannot match. The numbers compare jecs 0.11.0 and mErCS 0.2.4: the time or memory of
+the other cannot match. The numbers compare jecs 0.11.0 and mErCS 1.0.0: the time or memory of
 mErCS divided by that of jecs, "interpreter / native" (see [Performance](#performance)).
 
 ### What only jecs has
@@ -140,38 +149,38 @@ can be allocated together. Ratios are interpreter / native; memory medians agree
 
 | Case | jecs | mErCS | mErCS / jecs |
 |---|---|---|---|
-| Cached queries over scattered entities, memory per query | 5803 B | 263 KiB | 46.38× |
-| Sparse components: 8 on 1 entity in 64, memory per entity | 170 B | 661 B | 3.90× |
-| Eight kinds created in turn, 3 values read | rows of each kind stay together | values follow slot layout | for-in 2.02× / 2.33×; `each` 1.57× / 1.55×; `each` with a pool 0.85× / 0.62× |
-| Delete entities with 100 targets of a relation | remove one archetype row | clear the bit of each pair record | 2.13× / 1.53× |
+| Cached queries over scattered entities, memory per query | 5803 B | 263 KiB | 46.37× |
+| Sparse components: 8 on 1 entity in 64, memory per entity | 170 B | 660 B | 3.90× |
+| Eight kinds created in turn, 3 values read | rows of each kind stay together | values follow slot layout | for-in 2.10× / 2.27×; `each` 1.46× / 1.57×; `each` with a pool 0.88× / 0.61× |
+| Delete entities with 100 targets of a relation | remove one archetype row | clear the bit of each pair record | 2.10× / 1.53× |
 
-### Where jecs is faster in mErCS 0.2.4
+### Where jecs is faster than mErCS 1.0.0
 
 The cases below compare measured medians. Consult the ranges in the full report for small
 differences; these ratios do not establish a statistically significant difference on their own.
 
-- Two inline queries per new caster: 2.42× / 1.98×;
+- Two inline queries per new caster: 2.37× / 2.11×;
   memory retained per caster: 376 B
   in mErCS, 0 B in jecs.
   Four inline queries using an entity term followed by its deletion:
-  2.97× / 2.77×.
+  2.97× / 3.04×.
 - A cached query over scattered entities, built and passed once:
-  2.52× / 1.44×.
-- For-in over a sparse match (1%): 1.70× / 1.69×;
+  2.52× / 1.20×.
+- For-in over a sparse match (1%): 1.65× / 1.74×;
   `query:each` against the jecs for-in: 1.01× / 0.87×.
 - For-in with `without`: 1.15× / 1.10×.
-- Adding the first component: 1.47× / 1.30×.
+- Adding the first component: 1.40× / 1.15×.
 - Moving a child to another parent without a monitor:
-  1.42× / 1.23×.
+  1.53× / 1.19×.
 - In the sparse world without a slot pool, `Run` toggled before a pass:
-  1.21× / 1.09×; a tag added and removed around passes:
-  1.75× / 1.22×.
+  1.35× / 1.04×; a tag added and removed around passes:
+  1.67× / 1.13×.
 
 Other interpreter costs, including multi-id access, entity deletion and query monitors,
 are listed in the operation tables. Queries with a reused shape avoid the cost of a new
-entity term: a concrete pair per call is 0.70× / 0.69×,
+entity term: a concrete pair per call is 0.79× / 0.73×,
 and `query(A, pair(ChildOf, parent))` per parent is
-0.60× / 0.60×.
+0.61× / 0.57×.
 
 ### When to choose jecs
 
@@ -192,30 +201,21 @@ per entity, see [Design](#design), [Beyond jecs](#beyond-jecs) and [Performance]
 ## Performance
 
 Benchmarks in `bench/`, measured on 2026-10-01 with Luau 0.740: jecs 0.11.0 (the pinned
-Wally dev package), mErCS 0.2.3 from its verified git tag, and the 0.2.4 candidate. All three
-columns were measured again. Cells read "interpreter / native": `-O2` / `-O2 --codegen`.
-Ratios are the median time of 0.2.4 divided by jecs; lower is better.
+Wally dev package) and mErCS 1.0.0. Cells read "interpreter / native": `-O2` / `-O2 --codegen`.
+Ratios are the median time of mErCS divided by that of jecs; lower is better.
 
-Each implementation runs in its own process, five times in each mode, with the order rotated.
-The tables show medians of those five runs. A matrix run takes the minimum of three timed
+Each library runs in its own process, five times in each mode, with the order rotated. The
+tables show medians of those five runs. A matrix run takes the minimum of three timed
 repetitions and the median retained-memory delta after full GC. The synthetic-frame helper
 runs three batches per query style and returns the frame median from the batch with the
 lowest minimum frame time. Small differences between medians should be read with their ranges.
 
-The [complete measurements](https://github.com/dubalda/mErCS/blob/main/bench/results/0.2.4-jecs.md)
+The [complete measurements](https://github.com/dubalda/mErCS/blob/main/bench/results/1.0.0-comparison.md)
 include min–max ranges, hashes, commands and
-[raw samples](https://github.com/dubalda/mErCS/blob/main/bench/results/0.2.4-jecs.json).
-These general comparisons supplement the separate
-[P1–P9 release acceptance](https://github.com/dubalda/mErCS/blob/main/bench/results/0.2.4.md):
-that suite measures the reference workload, paired controls and regressions against 0.2.3.
-
-In that reference workload, 0.2.4 reduces frame heap growth by 8.6–9.4% and retained snapshot
-buffers from about 32 to 4 MiB, while full-frame time stays within measured noise. P9 is a
-GC-checked net heap-growth proxy, not total allocator traffic. The snapshot semantics of
-`world:each` and `world:children` stay the same as in 0.2.3.
-
-[Roblox Studio: Benchmarker](#roblox-studio-benchmarker) contains historical 0.2.3 captures;
-the new 0.2.4 measurements here are from the standalone CLI.
+[raw samples](https://github.com/dubalda/mErCS/blob/main/bench/results/1.0.0-comparison.json),
+with the previous release, 0.2.4, measured in the same runs (see
+[1.0.0 and 0.2.4](previous-release.md)). The screenshots of the Benchmarker plugin in Roblox
+Studio are on [Benchmarker](benchmarker.md).
 
 ### A synthetic game frame
 
@@ -224,12 +224,12 @@ spawn and expire per frame, damage uses a one-frame tag, 5 % of the units switch
 tags; plain for-in loops, the same code for all three. The median frame time; the queries are
 written inline in every frame, or created once and `:cached()` (the recommended jecs style):
 
-| Mode / queries | jecs 0.11.0 | mErCS 0.2.3 | mErCS 0.2.4 | 0.2.4 / jecs |
-|---|---|---|---|---|
-| interpreter, inline queries | 7.42 ms | 2.82 ms | 2.69 ms | 0.36× |
-| interpreter, cached queries | 6.74 ms | 2.9 ms | 2.95 ms | 0.44× |
-| native, inline queries | 5.48 ms | 1.84 ms | 1.88 ms | 0.34× |
-| native, cached queries | 5.05 ms | 2.21 ms | 1.86 ms | 0.37× |
+| Mode / queries | jecs 0.11.0 | mErCS 1.0.0 | 1.0.0 / jecs |
+|---|---|---|---|
+| interpreter, inline queries | 4.82 ms | 2.2 ms | 0.46× |
+| interpreter, cached queries | 4.15 ms | 2.21 ms | 0.53× |
+| native, inline queries | 3.91 ms | 1.65 ms | 0.42× |
+| native, cached queries | 3.58 ms | 1.59 ms | 0.44× |
 
 ### A long session
 
@@ -238,14 +238,14 @@ a living enemy through a pair `(Targeting, enemy)` and switch a state tag. Each 
 median of five isolated runs: heap growth since the start, and time per frame in the preceding
 1000-frame window (including checkpoint GC). Both execution modes are measured:
 
-| Mode | Frame | jecs 0.11.0 | jecs 0.11.0 + cleanup every 600 frames | mErCS 0.2.3 | mErCS 0.2.4 |
-|---|---|---|---|---|---|
-| interpreter | 1000 | +3.57 MiB, 0.226 ms | +3.60 MiB, 0.236 ms | +0.33 MiB, 0.094 ms | +0.33 MiB, 0.095 ms |
-| interpreter | 3000 | +8.98 MiB, 0.243 ms | +8.80 MiB, 0.249 ms | +0.32 MiB, 0.097 ms | +0.32 MiB, 0.096 ms |
-| interpreter | 5000 | +15.38 MiB, 0.245 ms | +15.66 MiB, 0.251 ms | +0.32 MiB, 0.095 ms | +0.32 MiB, 0.096 ms |
-| native | 1000 | +3.57 MiB, 0.204 ms | +3.60 MiB, 0.202 ms | +0.33 MiB, 0.062 ms | +0.33 MiB, 0.064 ms |
-| native | 3000 | +8.98 MiB, 0.210 ms | +8.80 MiB, 0.214 ms | +0.32 MiB, 0.061 ms | +0.32 MiB, 0.062 ms |
-| native | 5000 | +15.38 MiB, 0.214 ms | +15.66 MiB, 0.221 ms | +0.32 MiB, 0.062 ms | +0.32 MiB, 0.060 ms |
+| Mode | Frame | jecs 0.11.0 | jecs 0.11.0 + cleanup every 600 frames | mErCS 1.0.0 |
+|---|---|---|---|---|
+| interpreter | 1000 | +3.57 MiB, 0.197 ms | +3.60 MiB, 0.211 ms | +0.33 MiB, 0.091 ms |
+| interpreter | 3000 | +8.98 MiB, 0.212 ms | +8.80 MiB, 0.229 ms | +0.32 MiB, 0.090 ms |
+| interpreter | 5000 | +15.38 MiB, 0.207 ms | +15.66 MiB, 0.220 ms | +0.32 MiB, 0.088 ms |
+| native | 1000 | +3.57 MiB, 0.178 ms | +3.60 MiB, 0.184 ms | +0.33 MiB, 0.061 ms |
+| native | 3000 | +8.98 MiB, 0.186 ms | +8.80 MiB, 0.191 ms | +0.32 MiB, 0.060 ms |
+| native | 5000 | +15.38 MiB, 0.192 ms | +15.66 MiB, 0.196 ms | +0.32 MiB, 0.062 ms |
 
 The jecs heap continues to grow in this 5000-frame session, including with cleanup every
 600 frames. The mErCS heap remains near its warmed checkpoint values. This describes the
@@ -258,14 +258,14 @@ and the `query cases` group of `bench/run.luau`). jecs runs for-in loops over ca
 mErCS builds the same worlds and runs the same loops through `query:each`, which replaces a
 for-in loop fully when it does not break early. Time of one pass:
 
-| Case | jecs 0.11.0 | mErCS 0.2.3 | mErCS 0.2.4 | 0.2.4 / jecs |
-|---|---|---|---|---|
-| Scattered after recycling | 129 / 110 µs | 107 / 64.1 µs | 97.1 / 63.9 µs | 0.75× / 0.58× |
-| Churn on a queried tag, 1 toggle per pass | 366 / 307 µs | 334 / 226 µs | 334 / 229 µs | 0.91× / 0.75× |
-| Churn on a queried tag, 100 toggles per pass | 286 / 243 µs | 321 / 208 µs | 312 / 203 µs | 1.09× / 0.83× |
-| Read 4 components | 2.01 / 1.5 ms | 1.42 ms / 741 µs | 1.43 ms / 716 µs | 0.71× / 0.48× |
-| `(*, T)` with churn | 844 / 730 µs | 567 / 343 µs | 561 / 342 µs | 0.67× / 0.47× |
-| Usually empty | 69.3 / 65.3 ns | 43 / 27.5 ns | 47 / 27.7 ns | 0.68× / 0.42× |
+| Case | jecs 0.11.0 | mErCS 1.0.0 | 1.0.0 / jecs |
+|---|---|---|---|
+| Scattered after recycling | 124 / 105 µs | 91.2 / 63.1 µs | 0.74× / 0.60× |
+| Churn on a queried tag, 1 toggle per pass | 336 / 291 µs | 282 / 208 µs | 0.84× / 0.72× |
+| Churn on a queried tag, 100 toggles per pass | 236 / 206 µs | 262 / 179 µs | 1.11× / 0.87× |
+| Read 4 components | 1.91 / 1.46 ms | 1.3 ms / 657 µs | 0.68× / 0.45× |
+| `(*, T)` with churn | 789 / 685 µs | 531 / 331 µs | 0.67× / 0.48× |
+| Usually empty | 66 / 61.3 ns | 43.9 / 27.7 ns | 0.67× / 0.45× |
 
 - Scattered after recycling: 50 000 entities with random subsets of 8 components, then
   100 000 deletes and respawns; a pass of a 4-component query (3125 matches).
@@ -292,15 +292,15 @@ creature sits alone in its value page, so a query over creatures reads a word pe
 in the "pool" columns the creatures come from a slot pool (`world:pool()`), which keeps them
 together. Time of one pass:
 
-| Pass | jecs 0.11.0 | mErCS 0.2.3 | mErCS 0.2.4 | 0.2.4 / jecs | mErCS 0.2.3, pool | mErCS 0.2.4, pool | pool / jecs |
-|---|---|---|---|---|---|---|---|
-| Alive creatures, nothing changed | 6.41 / 5.83 µs | 5.97 / 4.75 µs | 5.68 / 4.44 µs | 0.89× / 0.76× | 6.87 / 4.09 µs | 7.08 / 4.02 µs | 1.10× / 0.69× |
-| Alive creatures, `Dead` added to one and removed | 7.52 / 6.62 µs | 7.72 / 5.88 µs | 7.77 / 5.35 µs | 1.03× / 0.81× | 7.57 / 4.43 µs | 7.33 / 4.41 µs | 0.97× / 0.67× |
-| Running creatures, `Run` toggled on one | 4.04 / 3.28 µs | 5.18 / 3.84 µs | 4.9 / 3.57 µs | 1.21× / 1.09× | 3.14 / 1.87 µs | 2.91 / 1.86 µs | 0.72× / 0.57× |
-| A tag added to one creature, a pass, removed, a pass | 1.28 / 1.18 µs | 2 / 1.42 µs | 2.25 / 1.43 µs | 1.75× / 1.22× | 1.68 / 1.04 µs | 1.69 / 1.08 µs | 1.32× / 0.92× |
-| A tag nobody has | 69.9 / 64.9 ns | 48.8 / 35.2 ns | 47.3 / 34.7 ns | 0.68× / 0.53× | 45.1 / 30.9 ns | 44.3 / 30.9 ns | 0.63× / 0.48× |
-| All with `Model` (creatures and corpses) | 23 / 21.4 µs | 20.6 / 16.3 µs | 19.7 / 14.8 µs | 0.86× / 0.69× | 15.9 / 9.05 µs | 16 / 8.9 µs | 0.69× / 0.42× |
-| A skill changes state, 10 queries over skills in `Cast` | 151 / 123 µs | 129 / 79.7 µs | 117 / 79.5 µs | 0.78× / 0.65× | 121 / 75.1 µs | 115 / 71.9 µs | 0.76× / 0.59× |
+| Pass | jecs 0.11.0 | mErCS 1.0.0 | 1.0.0 / jecs | mErCS 1.0.0, pool | pool / jecs |
+|---|---|---|---|---|---|
+| Alive creatures, nothing changed | 6.25 / 5.54 µs | 5.44 / 4.07 µs | 0.87× / 0.74× | 6.54 / 3.9 µs | 1.05× / 0.70× |
+| Alive creatures, `Dead` added to one and removed | 7.27 / 6.5 µs | 7.23 / 5.18 µs | 0.99× / 0.80× | 7.01 / 4.31 µs | 0.96× / 0.66× |
+| Running creatures, `Run` toggled on one | 3.46 / 3.28 µs | 4.69 / 3.4 µs | 1.35× / 1.04× | 2.78 / 1.81 µs | 0.80× / 0.55× |
+| A tag added to one creature, a pass, removed, a pass | 1.24 / 1.16 µs | 2.06 / 1.31 µs | 1.67× / 1.13× | 1.63 µs / 984 ns | 1.31× / 0.85× |
+| A tag nobody has | 66.8 / 62.3 ns | 44.8 / 30.7 ns | 0.67× / 0.49× | 43 / 28 ns | 0.64× / 0.45× |
+| All with `Model` (creatures and corpses) | 21.6 / 19.1 µs | 19.1 / 14.1 µs | 0.88× / 0.74× | 15.2 / 8.58 µs | 0.70× / 0.45× |
+| A skill changes state, 10 queries over skills in `Cast` | 137 / 133 µs | 106 / 66.6 µs | 0.77× / 0.50× | 107 / 67.7 µs | 0.78× / 0.51× |
 
 Without a pool, a change of one creature before a pass (`Run` toggled, a tag added and
 removed) costs a list edit: the creature is a group of its own in the match list of the query,
@@ -313,11 +313,11 @@ The group `state tags` of `bench/run.luau` (`bench/shapes.luau`): 1200 skills in
 10, 200 or 800 of them move to the next state, then 5 queries written inline pass over the
 skills of each state (`query:each` in mErCS, for-in in jecs). Time per frame:
 
-| Frame of 1200 skills, 5 inline queries | jecs 0.11.0 | mErCS 0.2.3 | mErCS 0.2.4 | 0.2.4 / jecs |
-|---|---|---|---|---|
-| 10 skills change state | 55.7 / 48.9 µs | 41.3 / 25.1 µs | 40.5 / 24.4 µs | 0.73× / 0.50× |
-| 200 skills change state | 175 / 145 µs | 184 / 99.6 µs | 177 / 100 µs | 1.01× / 0.69× |
-| 800 skills change state | 546 / 474 µs | 405 / 228 µs | 392 / 231 µs | 0.72× / 0.49× |
+| Frame of 1200 skills, 5 inline queries | jecs 0.11.0 | mErCS 1.0.0 | 1.0.0 / jecs |
+|---|---|---|---|
+| 10 skills change state | 51.2 / 45.9 µs | 40 / 24.5 µs | 0.78× / 0.53× |
+| 200 skills change state | 156 / 138 µs | 162 / 95.2 µs | 1.04× / 0.69× |
+| 800 skills change state | 481 / 425 µs | 363 / 219 µs | 0.75× / 0.52× |
 
 ### The strengths of jecs
 
@@ -327,26 +327,26 @@ of one set of ids together, a query caches the archetypes it matches, and a wild
 resolved per archetype, while a bitset ECS pays per entity, per changed slot or per value page.
 Time of one pass or per unit; memory is what a unit keeps:
 
-| # | Case | jecs 0.11.0 | mErCS 0.2.3 | mErCS 0.2.4 | 0.2.4 / jecs |
-|---|---|---|---|---|---|
-| 1 | `(*, T)` values, 32 data relations, a pass over 20 000 | 776 / 625 µs | 590 / 316 µs | 577 / 311 µs | 0.74× / 0.50× |
-| 2 | `(R, *)` values, 8 targets, a pass over 20 000 | 778 / 627 µs | 589 / 314 µs | 555 / 317 µs | 0.71× / 0.51× |
-| 3 | 15 cached queries over scattered entities, per query | 314 / 255 µs | 776 / 329 µs | 792 / 368 µs | 2.52× / 1.44× |
-|  | the same, memory per query | 5803 B | 263 KiB | 263 KiB | 46.38× |
-| 4 | usually empty, 20 swaps per pass (100 000 entities) | 16.8 / 15.9 µs | 13.7 / 7.61 µs | 14.3 / 7.73 µs | 0.85× / 0.49× |
-|  | 5 queries, 100 matches each, 40 toggles per frame | 55.2 / 49.6 µs | 35.8 / 18.1 µs | 38.6 / 17.5 µs | 0.70× / 0.35× |
-| 5 | 20 small queries, a shared tag toggled on 30 per frame | 24.9 / 17.8 µs | 22.8 / 14.8 µs | 22.2 / 15 µs | 0.89× / 0.84× |
-| 6 | `query(A, pair(ChildOf, parent))` per parent (1000 × 5) | 979 / 860 ns | 586 / 485 ns | 587 / 520 ns | 0.60× / 0.60× |
-|  | 2 inline queries per new caster | 2 / 1.81 µs | 4.63 / 3.84 µs | 4.83 / 3.57 µs | 2.42× / 1.98× |
-|  | the same, memory per caster | 0 B | 376 B | 376 B | — |
-| 7 | `world:each` over 100 000, per entity | 30 / 24.9 ns | 33.1 / 24.5 ns | 33 / 24.5 ns | 1.10× / 0.99× |
-|  | `world:children`, 1000 children, per child | 29 / 24.9 ns | 38.1 / 25.5 ns | 32.9 / 25.5 ns | 1.13× / 1.02× |
-| 8 | 8 kinds in turn, 3 values, for-in, per match | 43 / 33.1 ns | 86.8 / 87 ns | 86.7 / 77.2 ns | 2.02× / 2.33× |
-|  | the same, `each` | 43 / 33.1 ns | 66 / 52.1 ns | 67.4 / 51.3 ns | 1.57× / 1.55× |
-|  | the same, `each`, the kind from a slot pool | 43 / 33.1 ns | 36.9 / 20.8 ns | 36.5 / 20.7 ns | 0.85× / 0.62× |
-| 9 | delete entities with 100 targets, per pair | 29.7 / 29.9 ns | 64 / 45.8 ns | 63.1 / 45.6 ns | 2.13× / 1.53× |
-| 10 | 8 components on 1 entity in 64 of 131 072, memory per entity | 170 B | 660 B | 661 B | 3.90× |
-|  | the same, time per entity | 2.81 / 2.26 µs | 2.61 / 1.69 µs | 2.74 / 1.81 µs | 0.97× / 0.80× |
+| # | Case | jecs 0.11.0 | mErCS 1.0.0 | 1.0.0 / jecs |
+|---|---|---|---|---|
+| 1 | `(*, T)` values, 32 data relations, a pass over 20 000 | 739 / 617 µs | 551 / 313 µs | 0.75× / 0.51× |
+| 2 | `(R, *)` values, 8 targets, a pass over 20 000 | 742 / 619 µs | 540 / 309 µs | 0.73× / 0.50× |
+| 3 | 15 cached queries over scattered entities, per query | 281 / 242 µs | 707 / 289 µs | 2.52× / 1.20× |
+|  | the same, memory per query | 5803 B | 263 KiB | 46.38× |
+| 4 | usually empty, 20 swaps per pass (100 000 entities) | 15.5 / 15.1 µs | 13.1 / 7.24 µs | 0.84× / 0.48× |
+|  | 5 queries, 100 matches each, 40 toggles per frame | 50.3 / 39.6 µs | 31 / 16.9 µs | 0.62× / 0.43× |
+| 5 | 20 small queries, a shared tag toggled on 30 per frame | 17.6 / 15.7 µs | 22 / 14.5 µs | 1.25× / 0.93× |
+| 6 | `query(A, pair(ChildOf, parent))` per parent (1000 × 5) | 927 / 846 ns | 568 / 482 ns | 0.61× / 0.57× |
+|  | 2 inline queries per new caster | 1.71 / 1.65 µs | 4.05 / 3.48 µs | 2.37× / 2.11× |
+|  | the same, memory per caster | 0 B | 376 B | inf× |
+| 7 | `world:each` over 100 000, per entity | 27.6 / 23.8 ns | 31 / 24.9 ns | 1.12× / 1.04× |
+|  | `world:children`, 1000 children, per child | 28.3 / 24.2 ns | 32.1 / 25.5 ns | 1.13× / 1.05× |
+| 8 | 8 kinds in turn, 3 values, for-in, per match | 39.9 / 32.5 ns | 83.9 / 73.8 ns | 2.10× / 2.27× |
+|  | the same, `each` | 39.9 / 32.5 ns | 58.3 / 51.2 ns | 1.46× / 1.57× |
+|  | the same, `each`, the kind from a slot pool | 39.9 / 32.5 ns | 34.9 / 19.9 ns | 0.88× / 0.61× |
+| 9 | delete entities with 100 targets, per pair | 28.9 / 29.1 ns | 60.9 / 44.5 ns | 2.10× / 1.53× |
+| 10 | 8 components on 1 entity in 64 of 131 072, memory per entity | 170 B | 660 B | 3.90× |
+|  | the same, time per entity | 2.75 / 2.15 µs | 2.38 / 1.53 µs | 0.86× / 0.71× |
 
 1. `(*, T)` values. jecs reads the column of the first pair of `T` in each archetype. mErCS
    keeps a mirror for a wildcard whose values a query returns: value pages with the value of one
@@ -354,8 +354,8 @@ Time of one pass or per unit; memory is what a unit keeps:
    `(R, *)`), updated by every change of its pairs; the query reads it like the column of a
    component. A mirror keeps about 17 B per member (a `(*, T)` mirror also notes the pair that
    gives the value of a slot with several pairs of `T`): the world of this case with its query
-   takes 254 B per entity (jecs: 315 B).
-2. `(R, *)` values: the same mirror; the world with its query takes 157 B per entity (jecs:
+   takes 255 B per entity (jecs: 315 B).
+2. `(R, *)` values: the same mirror; the world with its query takes 158 B per entity (jecs:
    312 B).
 3. The memory of cached queries. A query of an archetype ECS keeps a list of archetypes; a
    cached query of mErCS over scattered matches keeps a list of its matches (the entity and its
@@ -401,22 +401,24 @@ Time of one pass or per unit; memory is what a unit keeps:
 The group `query monitors` of `bench/run.luau` (`bench/monitors.luau`): jecs 0.11.0 with the
 monitors of its addon `modules/OB` against `query:monitor()` of mErCS, 10 000 entities:
 
-| Case | jecs 0.11.0 + OB | mErCS 0.2.3 | mErCS 0.2.4 | 0.2.4 / jecs |
-|---|---|---|---|---|
-| a tag of the query added and removed, per cycle (an entry and an exit) | 686 / 600 ns | 786 / 515 ns | 773 / 524 ns | 1.13× / 0.87× |
-| members of the query deleted, per entity | 545 / 541 ns | 585 / 344 ns | 595 / 344 ns | 1.09× / 0.64× |
-| children moved to another parent, `(ChildOf, *)` monitored, per move | 517 / 434 ns | 702 / 434 ns | 795 / 453 ns | 1.54× / 1.04× |
+| Case | jecs 0.11.0 + OB | mErCS 1.0.0 | 1.0.0 / jecs |
+|---|---|---|---|
+| a tag of the query added and removed, per cycle (an entry and an exit) | 643 / 598 ns | 794 / 540 ns | 1.23× / 0.90× |
+| members of the query deleted, per entity | 529 / 532 ns | 689 / 444 ns | 1.30× / 0.84× |
+| children moved to another parent, `(ChildOf, *)` monitored, per move | 496 / 423 ns | 734 / 457 ns | 1.48× / 1.08× |
 
 The monitor measurements include both the underlying changes and listener dispatch.
 For comparison, a child moved without a monitor takes
-411 / 256 ns in mErCS and
-289 / 209 ns in jecs
-(1.42× / 1.23×).
+423 / 244 ns in mErCS and
+277 / 205 ns in jecs
+(1.53× / 1.19×).
 
 A separate probe deletes entities with four components, with and without one `OnRemove`
-hook. The median additional cost is 173 / 88.3 ns in mErCS
-and 5.64 / 15.4 ns in jecs. Each sample subtracts two minima
-of nine batches, so small differences in this probe are sensitive to timing noise.
+hook. The median additional cost is 221 / 140 ns in mErCS
+and 2.67 / 12.6 ns in jecs. Each sample subtracts two minima
+of nine batches, so small differences in this probe are sensitive to timing noise. The hook of
+mErCS runs inside a frame that the hooks it starts consult (clears and removals of the same
+entity), which jecs does not keep.
 
 ### Single operations
 
@@ -425,184 +427,133 @@ jecs for-in loop over the same world.
 
 #### Entities
 
-| Scenario | jecs 0.11.0 | mErCS 0.2.3 | mErCS 0.2.4 | 0.2.4 / jecs |
-|---|---|---|---|---|
-| create an entity | 194 / 163 ns | 40.4 / 28.5 ns | 41.5 / 28.4 ns | 0.21× / 0.17× |
-| delete an entity with 4 components | 379 / 360 ns | 456 / 234 ns | 445 / 237 ns | 1.17× / 0.66× |
+| Scenario | jecs 0.11.0 | mErCS 1.0.0 | 1.0.0 / jecs |
+|---|---|---|---|
+| create an entity | 172 / 154 ns | 42.2 / 28 ns | 0.25× / 0.18× |
+| delete an entity with 4 components | 378 / 354 ns | 437 / 240 ns | 1.16× / 0.68× |
 
 #### Components
 
-| Scenario | jecs 0.11.0 | mErCS 0.2.3 | mErCS 0.2.4 | 0.2.4 / jecs |
-|---|---|---|---|---|
-| add a first component | 129 / 101 ns | 187 / 121 ns | 189 / 131 ns | 1.47× / 1.30× |
-| set an existing component | 66.9 / 58.9 ns | 67.3 / 43.9 ns | 67.4 / 44 ns | 1.01× / 0.75× |
-| remove a component | 184 / 161 ns | 116 / 58 ns | 117 / 57.9 ns | 0.64× / 0.36× |
-| add when the entity has 5 | 368 / 303 ns | 132 / 73.9 ns | 136 / 72.9 ns | 0.37× / 0.24× |
-| remove when the entity has 6 | 384 / 324 ns | 115 / 57.4 ns | 115 / 57.8 ns | 0.30× / 0.18× |
-| add when the entity has 20 | 1.57 / 1.24 µs | 136 / 71.9 ns | 133 / 73.5 ns | 0.08× / 0.06× |
-| remove when the entity has 21 | 1.69 / 1.4 µs | 114 / 57.3 ns | 114 / 57.8 ns | 0.07× / 0.04× |
-| add when the entity has 40 | 2.96 / 2.6 µs | 132 / 69.9 ns | 127 / 70.4 ns | 0.04× / 0.03× |
-| remove when the entity has 41 | 3 / 2.58 µs | 115 / 57.1 ns | 114 / 57.8 ns | 0.04× / 0.02× |
+| Scenario | jecs 0.11.0 | mErCS 1.0.0 | 1.0.0 / jecs |
+|---|---|---|---|
+| add a first component | 124 / 96.6 ns | 174 / 111 ns | 1.40× / 1.15× |
+| set an existing component | 62.9 / 56.9 ns | 64.3 / 42.9 ns | 1.02× / 0.75× |
+| remove a component | 184 / 162 ns | 115 / 58.1 ns | 0.62× / 0.36× |
+| add when the entity has 5 | 341 / 267 ns | 126 / 71.8 ns | 0.37× / 0.27× |
+| remove when the entity has 6 | 346 / 304 ns | 111 / 57 ns | 0.32× / 0.19× |
+| add when the entity has 20 | 1.38 / 1.16 µs | 127 / 69.8 ns | 0.09× / 0.06× |
+| remove when the entity has 21 | 1.45 / 1.19 µs | 110 / 56.3 ns | 0.08× / 0.05× |
+| add when the entity has 40 | 2.73 / 2.29 µs | 121 / 66.8 ns | 0.04× / 0.03× |
+| remove when the entity has 41 | 2.71 / 2.31 µs | 108 / 57 ns | 0.04× / 0.02× |
 
 #### Tags
 
-| Scenario | jecs 0.11.0 | mErCS 0.2.3 | mErCS 0.2.4 | 0.2.4 / jecs |
-|---|---|---|---|---|
-| add a tag | 389 / 288 ns | 98 / 59.4 ns | 101 / 59.7 ns | 0.26× / 0.21× |
-| remove a tag | 374 / 340 ns | 110 / 65.9 ns | 113 / 66.4 ns | 0.30× / 0.20× |
-| toggle a tag on 10 % of the entities per frame | 1.2 µs / 706 ns | 189 / 98.8 ns | 199 / 100 ns | 0.17× / 0.14× |
+| Scenario | jecs 0.11.0 | mErCS 1.0.0 | 1.0.0 / jecs |
+|---|---|---|---|
+| add a tag | 329 / 268 ns | 96.3 / 53.6 ns | 0.29× / 0.20× |
+| remove a tag | 324 / 293 ns | 109 / 65 ns | 0.34× / 0.22× |
+| toggle a tag on 10 % of the entities per frame | 991 / 652 ns | 160 / 96.1 ns | 0.16× / 0.15× |
 
 #### Access
 
-| Scenario | jecs 0.11.0 | mErCS 0.2.3 | mErCS 0.2.4 | 0.2.4 / jecs |
-|---|---|---|---|---|
-| `get` 1 id | 61.7 / 54.1 ns | 51.5 / 38.8 ns | 51.7 / 38.6 ns | 0.84× / 0.71× |
-| `get` 2 ids | 70.6 / 59 ns | 64.2 / 40.7 ns | 61.8 / 40.6 ns | 0.87× / 0.69× |
-| `get` 4 ids | 88.6 / 66.4 ns | 96.5 / 52.4 ns | 98 / 51.9 ns | 1.11× / 0.78× |
-| `get` 8 ids (jecs: at most 4) | — | 224 / 119 ns | 256 / 120 ns | — |
-| `has` 1 id | 59.9 / 42.5 ns | 52.4 / 30.7 ns | 51.4 / 31.1 ns | 0.86× / 0.73× |
-| `has` 4 ids | 82.1 / 47.7 ns | 102 / 44.9 ns | 104 / 43.9 ns | 1.26× / 0.92× |
-| `has` 8 ids (jecs: at most 4) | — | 185 / 72.1 ns | 175 / 72.3 ns | — |
+| Scenario | jecs 0.11.0 | mErCS 1.0.0 | 1.0.0 / jecs |
+|---|---|---|---|
+| `get` 1 id | 60.1 / 51.6 ns | 48.5 / 36.5 ns | 0.81× / 0.71× |
+| `get` 2 ids | 66.3 / 57.8 ns | 59.5 / 38.5 ns | 0.90× / 0.67× |
+| `get` 4 ids | 84.2 / 65.7 ns | 87.6 / 50.3 ns | 1.04× / 0.76× |
+| `get` 8 ids (jecs: at most 4) | — | 238 / 116 ns | — |
+| `has` 1 id | 57.4 / 39.8 ns | 49.2 / 29.9 ns | 0.86× / 0.75× |
+| `has` 4 ids | 70.3 / 46.7 ns | 100 / 42.9 ns | 1.42× / 0.92× |
+| `has` 8 ids (jecs: at most 4) | — | 186 / 70.5 ns | — |
 
 #### Pairs
 
-| Scenario | jecs 0.11.0 | mErCS 0.2.3 | mErCS 0.2.4 | 0.2.4 / jecs |
-|---|---|---|---|---|
-| `pair(R, T)` | 21 / 9.01 ns | 20.5 / 10.4 ns | 20.5 / 8.74 ns | 0.98× / 0.97× |
-| add a pair | 289 / 193 ns | 311 / 204 ns | 320 / 184 ns | 1.11× / 0.95× |
-| set the value of an existing pair | 80.8 / 68.1 ns | 76 / 54.5 ns | 74.8 / 53.4 ns | 0.93× / 0.78× |
-| remove a pair | 259 / 221 ns | 218 / 116 ns | 213 / 114 ns | 0.82× / 0.52× |
-| `target` (4 pairs) | 166 / 141 ns | 67.2 / 46.3 ns | 69.9 / 45.2 ns | 0.42× / 0.32× |
-| `ChildOf` children, per child (10 000 parents × 5) | 172 / 163 ns | 143 / 104 ns | 162 / 107 ns | 0.94× / 0.66× |
-| add a pair with a target of its own | 7.72 / 7.14 µs | 3.72 / 3.08 µs | 3.59 / 3.13 µs | 0.47× / 0.44× |
-| delete a target: `Remove` (1000 × 100 sources, per source) | 199 / 194 ns | 164 / 84.7 ns | 169 / 86.3 ns | 0.85× / 0.45× |
-| delete a parent: `ChildOf` cascade (per child) | 339 / 313 ns | 415 / 251 ns | 419 / 250 ns | 1.24× / 0.80× |
+| Scenario | jecs 0.11.0 | mErCS 1.0.0 | 1.0.0 / jecs |
+|---|---|---|---|
+| `pair(R, T)` | 19.9 / 8.65 ns | 20.5 / 10.2 ns | 1.03× / 1.18× |
+| add a pair | 264 / 183 ns | 274 / 175 ns | 1.04× / 0.95× |
+| set the value of an existing pair | 71.4 / 66.2 ns | 70.8 / 51.2 ns | 0.99× / 0.77× |
+| remove a pair | 230 / 206 ns | 195 / 113 ns | 0.85× / 0.55× |
+| `target` (4 pairs) | 155 / 137 ns | 66.7 / 42.2 ns | 0.43× / 0.31× |
+| `ChildOf` children, per child (10 000 parents × 5) | 144 / 146 ns | 132 / 92.5 ns | 0.92× / 0.63× |
+| add a pair with a target of its own | 6.6 / 6.29 µs | 3.01 / 2.66 µs | 0.46× / 0.42× |
+| delete a target: `Remove` (1000 × 100 sources, per source) | 173 / 172 ns | 147 / 80.1 ns | 0.85× / 0.47× |
+| delete a parent: `ChildOf` cascade (per child) | 293 / 293 ns | 384 / 255 ns | 1.31× / 0.87× |
 
 #### Queries (per entity or match)
 
-| Scenario | jecs 0.11.0 | mErCS 0.2.3 | mErCS 0.2.4 | 0.2.4 / jecs |
-|---|---|---|---|---|
-| for-in, 4 values, 8192 entities per archetype | 46 / 35.7 ns | 49.2 / 33 ns | 49.2 / 33.5 ns | 1.07× / 0.94× |
-| `query:each`, the same (ratio: against the jecs for-in) | — | 34.7 / 15.9 ns | 32.1 / 15.9 ns | 0.70× / 0.45× |
-| manual loop (`spans` / jecs archetypes), the same | 19.5 / 5.07 ns | 14.7 / 4.84 ns | 14 / 4.99 ns | 0.72× / 0.98× |
-| for-in, 4 values, 256 entities per archetype | 49.3 / 38.9 ns | 52.1 / 35.8 ns | 51.9 / 35.2 ns | 1.05× / 0.91× |
-| `query:each`, the same (against the jecs for-in) | — | 40.4 / 17.5 ns | 35.7 / 18.5 ns | 0.73× / 0.48× |
-| manual loop, the same | 24.5 / 7.18 ns | 19.2 / 6.58 ns | 17.9 / 6.36 ns | 0.73× / 0.89× |
-| for-in, 4 values, 16 entities per archetype | 69.1 / 56.7 ns | 69.6 / 42.3 ns | 71.8 / 41.9 ns | 1.04× / 0.74× |
-| `query:each`, the same (against the jecs for-in) | — | 50.9 / 21.3 ns | 49.8 / 21.2 ns | 0.72× / 0.37× |
-| manual loop, the same | 50.4 / 30.4 ns | 31.8 / 9.64 ns | 32.4 / 9.46 ns | 0.64× / 0.31× |
-| for-in, 4 values, 1 entity per archetype | 298 / 175 ns | 76.3 / 46.5 ns | 78.6 / 46.4 ns | 0.26× / 0.27× |
-| `query:each`, the same (against the jecs for-in) | — | 56.5 / 26.8 ns | 57 / 26.2 ns | 0.19× / 0.15× |
-| manual loop, the same | 188 / 98.8 ns | 39.5 / 14.4 ns | 37.3 / 14.4 ns | 0.20× / 0.15× |
-| a query created and iterated once | 44.6 / 34.6 ns | 52.2 / 33.7 ns | 48.7 / 33.6 ns | 1.09× / 0.97× |
-| for-in, 1 value of an entity with 4 | 33.6 / 29.2 ns | 38.9 / 27.7 ns | 37.5 / 27.9 ns | 1.11× / 0.95× |
-| for-in with `without` (half excluded) | 33.5 / 27.9 ns | 38 / 30.5 ns | 38.7 / 30.6 ns | 1.15× / 1.10× |
-| `query:each`, the same (against the jecs for-in) | — | 24.5 / 13 ns | 21.5 / 13.4 ns | 0.64× / 0.48× |
-| for-in over a sparse match (1 %) | 40.1 / 34.1 ns | 64.7 / 56.6 ns | 67.9 / 57.8 ns | 1.70× / 1.69× |
-| `query:each`, the same (against the jecs for-in) | — | 42.7 / 29.8 ns | 40.6 / 29.8 ns | 1.01× / 0.87× |
-| the first loop of a new query (2000 archetypes), per query | 139 / 129 µs | 523 / 333 ns | 504 / 348 ns | 0.004× / 0.003× |
-| a small query created on every call (15 of 1000), per query | 1.41 / 1.24 µs | 1.27 / 1.08 µs | 1.29 / 1.1 µs | 0.92× / 0.89× |
-| a query of a concrete pair created on every call (15 of 1000), per query | 1.56 / 1.36 µs | 1.1 µs / 901 ns | 1.09 µs / 937 ns | 0.70× / 0.69× |
-| the same, nothing matches (0 of 1000) | 344 / 303 ns | 178 / 159 ns | 181 / 160 ns | 0.53× / 0.53× |
-| an entity used as a term in 4 inline queries, then deleted, per entity | 2.12 / 1.9 µs | 6.11 / 5.27 µs | 6.29 / 5.25 µs | 2.97× / 2.77× |
-| a query with 10 terms | 99.6 / 64.9 ns | 98.9 / 59.4 ns | 105 / 60.5 ns | 1.06× / 0.93× |
+| Scenario | jecs 0.11.0 | mErCS 1.0.0 | 1.0.0 / jecs |
+|---|---|---|---|
+| for-in, 4 values, 8192 entities per archetype | 42.6 / 34.2 ns | 46.6 / 31.9 ns | 1.09× / 0.93× |
+| `query:each`, the same (ratio: against the jecs for-in) | — | 31 / 15.3 ns | 0.70× / 0.45× |
+| manual loop (`spans` / jecs archetypes), the same | 17.8 / 4.72 ns | 13 / 4.63 ns | 0.73× / 0.98× |
+| for-in, 4 values, 256 entities per archetype | 45.9 / 37.4 ns | 51.6 / 33.7 ns | 1.13× / 0.90× |
+| `query:each`, the same (against the jecs for-in) | — | 32.9 / 16.2 ns | 0.73× / 0.48× |
+| manual loop, the same | 16.3 / 6.89 ns | 16.4 / 5.92 ns | 1.01× / 0.86× |
+| for-in, 4 values, 16 entities per archetype | 62.7 / 51.3 ns | 66.3 / 39.9 ns | 1.06× / 0.78× |
+| `query:each`, the same (against the jecs for-in) | — | 45.9 / 20.8 ns | 0.72× / 0.37× |
+| manual loop, the same | 45.6 / 27.2 ns | 30.5 / 9.13 ns | 0.67× / 0.34× |
+| for-in, 4 values, 1 entity per archetype | 253 / 168 ns | 73 / 44.5 ns | 0.29× / 0.26× |
+| `query:each`, the same (against the jecs for-in) | — | 53.6 / 25.5 ns | 0.19× / 0.15× |
+| manual loop, the same | 169 / 98.5 ns | 35.2 / 13.8 ns | 0.21× / 0.14× |
+| a query created and iterated once | 43.5 / 32.5 ns | 46.6 / 31.9 ns | 1.07× / 0.98× |
+| for-in, 1 value of an entity with 4 | 31.9 / 27.7 ns | 35.4 / 26.3 ns | 1.11× / 0.95× |
+| for-in with `without` (half excluded) | 30.9 / 26.7 ns | 35.6 / 29.3 ns | 1.15× / 1.10× |
+| `query:each`, the same (against the jecs for-in) | — | 20.5 / 13 ns | 0.64× / 0.48× |
+| for-in over a sparse match (1 %) | 37.4 / 31.6 ns | 61.7 / 55.1 ns | 1.65× / 1.74× |
+| `query:each`, the same (against the jecs for-in) | — | 40.6 / 27.6 ns | 1.01× / 0.87× |
+| the first loop of a new query (2000 archetypes), per query | 116 / 116 µs | 388 / 328 ns | 0.003× / 0.003× |
+| a small query created on every call (15 of 1000), per query | 1.28 / 1.17 µs | 1.19 / 1.06 µs | 0.93× / 0.91× |
+| a query of a concrete pair created on every call (15 of 1000), per query | 1.33 / 1.22 µs | 1.05 µs / 895 ns | 0.79× / 0.73× |
+| the same, nothing matches (0 of 1000) | 319 / 290 ns | 171 / 152 ns | 0.54× / 0.52× |
+| an entity used as a term in 4 inline queries, then deleted, per entity | 1.86 / 1.65 µs | 5.53 / 5.02 µs | 2.97× / 3.04× |
+| a query with 10 terms | 95.7 / 63.7 ns | 95.4 / 58.8 ns | 1.00× / 0.92× |
 
 #### Batch operations (per match; jecs: a collect-and-change loop)
 
-| Scenario | jecs 0.11.0 | mErCS 0.2.3 | mErCS 0.2.4 | 0.2.4 / jecs |
-|---|---|---|---|---|
-| add a tag to the matches (half of the entities) | 341 / 272 ns | 37.9 / 13.1 ns | 37.9 / 13.2 ns | 0.11× / 0.05× |
-| set a component on the matches | 341 / 266 ns | 75.1 / 27.2 ns | 72.2 / 27 ns | 0.21× / 0.10× |
-| remove a component from the matches | 332 / 274 ns | 38.9 / 12.8 ns | 39.1 / 13 ns | 0.12× / 0.05× |
-| delete the matches | 531 / 478 ns | 478 / 260 ns | 473 / 250 ns | 0.89× / 0.52× |
-| count the matches | 33.7 / 28.2 ns | 7.05 / 2.53 ns | 7.24 / 2.5 ns | 0.21× / 0.09× |
+| Scenario | jecs 0.11.0 | mErCS 1.0.0 | 1.0.0 / jecs |
+|---|---|---|---|
+| add a tag to the matches (half of the entities) | 282 / 239 ns | 35.2 / 12.5 ns | 0.12× / 0.05× |
+| set a component on the matches | 300 / 246 ns | 69.7 / 26 ns | 0.23× / 0.11× |
+| remove a component from the matches | 277 / 257 ns | 36.4 / 11.6 ns | 0.13× / 0.05× |
+| delete the matches | 424 / 401 ns | 466 / 253 ns | 1.10× / 0.63× |
+| count the matches | 30.9 / 26.8 ns | 6.76 / 2.35 ns | 0.22× / 0.09× |
 
 #### Churn (per cycle)
 
-| Scenario | jecs 0.11.0 | mErCS 0.2.3 | mErCS 0.2.4 | 0.2.4 / jecs |
-|---|---|---|---|---|
-| spawn and despawn (10 components, 2 tags) | 4.56 / 3.86 µs | 2.56 / 1.36 µs | 2.66 / 1.38 µs | 0.58× / 0.36× |
-| a hierarchy of 1 + 5 `ChildOf`, spawned and deleted | 24.8 / 21.7 µs | 12.2 / 7.96 µs | 12.6 / 8.33 µs | 0.51× / 0.38× |
+| Scenario | jecs 0.11.0 | mErCS 1.0.0 | 1.0.0 / jecs |
+|---|---|---|---|
+| spawn and despawn (10 components, 2 tags) | 4.04 / 3.61 µs | 2.39 / 1.32 µs | 0.59× / 0.37× |
+| a hierarchy of 1 + 5 `ChildOf`, spawned and deleted | 19.9 / 18.6 µs | 10.3 / 7.44 µs | 0.52× / 0.40× |
 
 ### Memory and garbage
 
 Bytes kept per unit after full GC. Equal interpreter/native medians are shown once:
 
-| Kept per unit | jecs 0.11.0 | mErCS 0.2.3 | mErCS 0.2.4 |
-|---|---|---|---|
-| an empty entity | 240 B | 32 B | 32 B |
-| an entity with 4 components | 320 B | 131 B | 131 B |
-| an entity with 10 components and 5 tags | 417 B | 236 B | 236 B |
-| a `ChildOf` child (10 000 parents × 5) | 726 B | 344 B | 344 B |
-| an entity with a tag of its own | 1630 B | 978 B | 978 B |
-| a pair with a target of its own | 2264 B | 1457 B | 1457 B |
-| a component of 1000 on 100 entities each, per add | 398 B | 162 B | 162 B |
-| growth per hierarchy spawn / despawn cycle | 218 B | 0 B | 0 B |
-| an entity used in 4 inline queries, then deleted | 0 B | 1 B | 1 B |
+| Kept per unit | jecs 0.11.0 | mErCS 1.0.0 |
+|---|---|---|
+| an empty entity | 240 B | 32 B |
+| an entity with 4 components | 320 B | 131 B |
+| an entity with 10 components and 5 tags | 417 B | 236 B |
+| a `ChildOf` child (10 000 parents × 5) | 726 B | 344 B |
+| an entity with a tag of its own | 1630 B | 978 B |
+| a pair with a target of its own | 2264 B | 1457 B |
+| a component of 1000 on 100 entities each, per add | 398 B | 162 B |
+| growth per hierarchy spawn / despawn cycle | 218 B | 0 B |
+| an entity used in 4 inline queries, then deleted | 0 B | 1 B |
 
 Net heap growth per warmed loop over 200 entities, measured across 1000 loops after full GC:
 
-| Loop | jecs 0.11.0 | mErCS 0.2.3 | mErCS 0.2.4 |
-|---|---|---|---|
-| Inline two-component query | 921 B | 80 B | 80 B |
-| Stored query | 0 B | 0 B | 0 B |
-| `world:each` | 288 B | 176 B | 153 B |
+| Loop | jecs 0.11.0 | mErCS 1.0.0 |
+|---|---|---|
+| Inline two-component query | 921 B | 81 B |
+| Stored query | 0 B | 0 B |
+| `world:each` | 288 B | 152 B |
 
-The 0.2.4 iterator uses about 24 fewer bytes than 0.2.3 when its buffer is reused. A weak GC
-witness rejects a completed collection during the interval. This measures net heap growth,
-not all allocator traffic; a partial incremental collection may not clear the witness.
-The heap counter has 1 KiB resolution, or about 1 byte per loop in this batch, so the
-rounded 153-byte result is consistent with an iterator size of about 152 bytes.
-
-### Roblox Studio: Benchmarker
-
-The screenshots below were captured with jecs 0.11.0 and mErCS 0.2.3 in Roblox Studio:
-Benchmarker v7.3.1, Edit mode, native code, 1000 calls of each function. They remain
-historical results; a fresh 0.2.4 Studio run is pending. The current files in `bench/visual/`
-print the 0.2.4 version label when run again.
-
-The place of `benchmarker.project.json` holds the libraries and these files
-([Development](../development/README.md#benchmarker-roblox-studio)). Compare the medians
-(50th percentile): Benchmarker's "Average" is the midpoint of the minimum and maximum.
-
-| File | What |
-|---|---|
-| `batch.bench.luau` | add and remove a tag on 1000 of 2000 entities: batch operations against a jecs collect-and-change loop |
-| `despawn.bench.luau` | delete 1000 entities with 4 components and a tag |
-| `insertion.bench.luau` | 8 components into 500 existing entities |
-| `pairs.bench.luau` | 100 parents with 10 `ChildOf` children that also target a parent through a relation, then the parents are deleted |
-| `query.bench.luau` | 10 passes of a 4-component query over 4096 entities: for-in, and `query:each` for mErCS |
-| `query_churn.bench.luau` | a query case: a tag of the query toggled on 1 or 100 entities before each pass |
-| `query_empty.bench.luau` | a query case: 100 passes of a query that never matches |
-| `query_read4.bench.luau` | a query case: 4 values read per match (80 000 entities) |
-| `query_scattered.bench.luau` | a query case: a 4-component query over 50 000 entities scattered by churn |
-| `query_wildcard.bench.luau` | a query case: `(*, T)` with a pair toggled before each pass |
-| `remove.bench.luau` | remove one of 5 components from 1000 entities |
-| `spawn.bench.luau` | 1000 entities with 4 components |
-
-![Benchmarker: batch](benchmarker-batch.PNG)
-
-![Benchmarker: despawn](benchmarker-despawn.PNG)
-
-![Benchmarker: insertion](benchmarker-insertion.PNG)
-
-![Benchmarker: pairs](benchmarker-pairs.PNG)
-
-![Benchmarker: query](benchmarker-query.PNG)
-
-![Benchmarker: query_churn](benchmarker-query-churn.PNG)
-
-![Benchmarker: query_empty](benchmarker-query-empty.PNG)
-
-![Benchmarker: query_read4](benchmarker-query-read4.PNG)
-
-![Benchmarker: query_scattered](benchmarker-query-scattered.PNG)
-
-![Benchmarker: query_wildcard](benchmarker-query-wildcard.PNG)
-
-![Benchmarker: remove](benchmarker-remove.PNG)
-
-![Benchmarker: spawn](benchmarker-spawn.PNG)
+A weak GC witness rejects a completed collection during the interval. This measures net heap
+growth, not all allocator traffic; a partial incremental collection may not clear the witness.
+The heap counter has 1 KiB resolution, or about 1 byte per loop in this batch; the 152 bytes of
+`world:each` are its iterator, its buffer being reused.
 
 ## Migrating from jecs
 

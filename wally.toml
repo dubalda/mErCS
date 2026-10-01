@@ -1,6 +1,6 @@
 [package]
 name = "dubalda/mercs"
-version = "0.2.4"
+version = "1.0.0"
 registry = "https://github.com/UpliftGames/wally-index"
 realm = "shared"
 description = "ECS for Luau and Roblox built on inverted bitsets, with a jecs-like API"
@@ -16,3 +16,4 @@ include = ["default.project.json", "src", "src/**", "wally.toml", "README.md", "
 [dev-dependencies]
 jecs = "ukendio/jecs@0.11.0"
 jabby = "alicesaidhi/jabby@0.6.1"
+ecr = "centau/ecr@0.9.0"

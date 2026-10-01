@@ -9,7 +9,8 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-if command -v python3 >/dev/null 2>&1; then
+# python3, or python where python3 does not run (the Windows store alias)
+if python3 -c "" >/dev/null 2>&1; then
     exec python3 tools/workload.py "$@"
 fi
 exec python tools/workload.py "$@"

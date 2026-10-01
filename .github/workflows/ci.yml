@@ -40,7 +40,7 @@ jobs:
       - run: wally install
       - run: bash tools/test.sh $FLAGS
       - name: Workload report validation
-        run: python3 -B -m unittest discover -s tools -p 'test_workload.py'
+        run: python3 -B -m unittest discover -s tools -p 'test_*.py'
       - name: Longer fuzz runs
         run: |
           for seed in 1 2 3; do
@@ -55,6 +55,10 @@ jobs:
           for seed in 1 42 20260930; do
             luau $FLAGS test/snapshots_fuzz.luau -a "$seed" 2000
           done
+          # nested changes from hooks, listeners and monitor callbacks
+          luau $FLAGS test/reentrant_fuzz.luau -a 7 300
+          luau $FLAGS test/reentrant_fuzz.luau -a 8 300 debug pool
+          luau $FLAGS test/reentrant_fuzz.luau -a 9 300 range
 
   build:
     name: Model and Wally package
@@ -85,7 +89,9 @@ jobs:
         with:
           node-version: 22
       - name: README links for the site
-        # docs/x/README.md on GitHub is docs/x on the site (README.md becomes the home page)
+        # docs/x/README.md on GitHub is docs/x on the site, docs/x/y.md is docs/x/y (README.md
+        # becomes the home page)
         run: |
-          sed -i -E 's#\]\(docs/([a-z-]+)/README\.md(\#[a-z0-9-]+)?\)#](docs/\1\2)#g' README.md
+          sed -i -E -e 's#\]\(docs/([a-z-]+)/README\.md(\#[a-z0-9-]+)?\)#](docs/\1\2)#g' \
+            -e 's#\]\(docs/([a-z-]+)/([a-z-]+)\.md(\#[a-z0-9-]+)?\)#](docs/\1/\2\3)#g' README.md
       - run: npx --yes moonwave@1.4.2 build

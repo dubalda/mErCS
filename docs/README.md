@@ -11,7 +11,8 @@ reference, generated from the doc comments of `src/`, is on the
 
 - [Guide](guide/README.md) — worlds, components and tags, queries, batch operations,
   relationships, hooks and signals, change tracking, the jabby adapter, types.
-- [Comparison with jecs](jecs-comparison/README.md) — design, differences, performance (with
-  the Benchmarker screenshots), migrating from jecs.
+- [Comparison](comparison/README.md) — the Benchmarker screenshots, 1.0.0 against 0.2.4, and
+  [jecs](https://github.com/Ukendio/jecs) and [ecr](https://github.com/centau/ecr): design,
+  differences, performance, migrating.
 - [Development](development/README.md) — setup, layout, tests, checks, benchmarks, Roblox
   Studio, CI, releases and this site.
