@@ -15,7 +15,7 @@
 
     Usage:
         local frame_scene = require("./frame_scene")
-        local report = frame_scene({ { "jecs 0.11.0", jecs }, { "mErCS 1.0.0", lib } })
+        local report = frame_scene({ { "jecs 0.11.0", jecs }, { "mErCS 1.0.1", lib } })
 ]]
 
 local gc = require("./gc")

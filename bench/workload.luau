@@ -27,7 +27,9 @@
       up to a few hundred deferred ones).
     - P6 lifecycle: the end of the activity of an agent, the removal of a retained agent (the
       cascade over its owned entities with removal listeners), a new agent with its owned
-      entities (the median of the events of a run).
+      entities (the median of the events of a run); and the cascade of the removal of an agent
+      alone, in a world of its own (500 owned entities at the target scale, 15 at the small one,
+      each with a removal listener), where the rest of the event does not dilute its cost.
     - P7 frame model: the frames of the model with the lifecycle events at their rate.
     - P8 memory: the heap of the world after it is built, after 100 lifecycle rounds and after a
       3 000, 6 000 and 9 000 more frames; bytes per distinct pair and per holder.
@@ -296,6 +298,65 @@ local function sparse_walks(impl: Impl)
 end
 
 --------------------------------------------------------------------------------
+-- P6: the cascade of the removal of an agent, isolated (a world of its own)
+--------------------------------------------------------------------------------
+
+-- the agents that stay in the world while the measured ones come and go, and the measured ones
+local CASCADE_AGENTS = 50
+local CASCADE_ROUNDS = 41
+
+-- The removal of an agent in a world of its own: its owned entities (an exclusive ownership
+-- relation with a delete policy), each with a state value and an idle tag, an owned tag and two
+-- values, go with it in a cascade. Removal listeners on three ids, as in the reference workload:
+-- the state value of an owned entity, the death tag and the group component of an agent. Returns
+-- the median of the deletes in µs.
+local function isolated_cascade(ecs: any, owned: number): number
+    local world = ecs.world()
+    local OwnedBy = world:entity()
+    world:add(OwnedBy, ecs.Exclusive)
+    world:add(OwnedBy, ecs.pair(ecs.OnDeleteTarget, ecs.Delete))
+    local Owned, Idle, Dead = world:entity(), world:entity(), world:entity()
+    local State, A, B, Group, Health =
+        world:component(), world:component(), world:component(), world:component(), world:component()
+    local removals = 0
+    local function count_removal()
+        removals += 1
+    end
+    for _, id in { State, Dead, Group } do
+        world:removed(id, count_removal)
+    end
+    local function agent(): any
+        local a = world:entity()
+        world:set(a, Health, 100)
+        world:set(a, Group, 1)
+        for i = 1, owned do
+            local e = world:entity()
+            world:add(e, ecs.pair(OwnedBy, a))
+            world:add(e, Owned)
+            world:set(e, State, Idle)
+            world:add(e, Idle)
+            world:set(e, A, i)
+            world:set(e, B, i)
+        end
+        return a
+    end
+    for _ = 1, CASCADE_AGENTS do
+        agent()
+    end
+    local times = table.create(CASCADE_ROUNDS) :: { number }
+    for r = 1, CASCADE_ROUNDS do
+        local a = agent()
+        world:add(a, Dead)
+        times[r] = elapsed(function()
+            world:delete(a)
+        end)
+    end
+    -- the listeners of the agent and of each of its owned entities, once per deleted entity
+    assert(removals == CASCADE_ROUNDS * (owned + 2), "a removal listener did not run once per entity")
+    return median(times) * 1e6
+end
+
+--------------------------------------------------------------------------------
 -- P2–P9 over the model
 --------------------------------------------------------------------------------
 
@@ -468,6 +529,14 @@ local function model_tests(impl: Impl, scale: Scale, seed: number)
             median(removed) * 1e6
         )
         record("P6", "a new agent with its owned entities", scale.name, "µs per event", impl, median(made) * 1e6)
+        record(
+            "P6",
+            "the cascade of the removal of an agent, isolated",
+            scale.name,
+            "µs per event",
+            impl,
+            isolated_cascade(impl.ecs, if target then 500 else 15)
+        )
     end
 
     if wanted("P8") then

@@ -39,6 +39,9 @@ build/
 mercs.rbxm
 mercs.zip
 
+# Python bytecode that running the tools writes (python tools/*.py)
+__pycache__/
+
 .mcp.json
 
 AGENTS.md

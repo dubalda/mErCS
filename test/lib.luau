@@ -6,7 +6,8 @@
     after small changes (and passes over the bitsets after many), empty queries, changes during
     iteration, more than 4 ids in get/has, relationships and (*, T) targets (also before their
     first read), slot pools, large worlds, cleanup without leftovers, signals, hooks of ids
-    beyond the shared signature tables, cascades deeper than 100 levels, hooks and signals on
+    beyond the shared signature tables and of a word of them that loses its last hooked id,
+    cascades deeper than 100 levels, hooks and signals on
     builtin ids, pair records freed in batches, the shared query shapes of deleted entities,
     the iteration contexts that queries which are not cached reuse, the values of wildcard
     pairs (their mirrors), world:each and world:children over large records, query shapes
@@ -1401,6 +1402,10 @@ TEST("batch operations on query matches", function()
         (world:query(A) :: any):set_all(Marked, 1)
         return true
     end)
+    local ok, message = pcall(function()
+        (world:query(A) :: any):set_all(Marked, 1)
+    end)
+    CHECK(not ok and string.find(tostring(message), "cannot set a value on a tag", 1, true) ~= nil)
     world:remove_all(Marked)
     world:query(A):set_all(Marked, nil)
     CHECK(world:query(Marked):count() == 300)
@@ -2689,6 +2694,47 @@ TEST("on_remove hooks run once, whatever the signature index of the id", functio
     world:remove(Low, ecs.OnRemove)
     world:delete(hooked_entity())
     CHECK(calls.low == 2 and calls.high == 3 and calls.rel == 3)
+end)
+
+TEST("a word of the shared signature tables whose last hooked id loses its hook", function()
+    local world = ecs.world()
+    local ids: { any } = {}
+    for i = 1, 40 do
+        ids[i] = world:component()
+        world:add(world:entity(), ids[i]) -- the record of each id, in the order of the ids
+    end
+    -- the record of the last id is in the second word of the signatures, where no other id has
+    -- a hook
+    local Last = ids[40]
+    local calls = 0
+    local function entity_with_last(): any
+        local e = world:entity()
+        world:set(e, ids[1], 1)
+        world:set(e, Last, 1)
+        return e
+    end
+    local disconnect = world:removed(Last, function()
+        calls += 1
+    end)
+
+    CASE("the listener runs while the word has a hooked id")
+    world:delete(entity_with_last())
+    CHECK(calls == 1)
+
+    CASE("deletes and clears after the word lost its last hooked id")
+    disconnect()
+    local e = entity_with_last()
+    world:delete(e)
+    local f = entity_with_last()
+    world:clear(f)
+    CHECK(calls == 1 and not world:contains(e) and #world:ids(f) == 0)
+
+    CASE("a hook set again runs again")
+    world:set(Last, ecs.OnRemove, function()
+        calls += 1
+    end)
+    world:delete(entity_with_last())
+    CHECK(calls == 2)
 end)
 
 TEST("an entity that takes a slot inside an on_remove hook runs its own hooks", function()

@@ -1,6 +1,6 @@
 # mErCS and ecr
 
-How mErCS 1.0.0 differs from [ecr](https://github.com/centau/ecr) 0.9.0, a sparse-set ECS for
+How mErCS 1.0.1 differs from [ecr](https://github.com/centau/ecr) 0.9.0, a sparse-set ECS for
 Luau inspired by [EnTT](https://github.com/skypjack/entt): the design, the behaviour, the four
 basic benchmarks of jecs measured in both, and how to move code over.
 
@@ -26,7 +26,7 @@ mErCS keeps, for every component, tag or pair, a bitset of the entities that hav
 values in pages indexed by the entity slot. A query ANDs the bitsets 32 entities at a time and
 reads the values of the matches by slot.
 
-| | ecr 0.9.0 | mErCS 1.0.0 |
+| | ecr 0.9.0 | mErCS 1.0.1 |
 |---|---|---|
 | storage of a component | a pool: sparse array, dense entities, dense values | a bitset and value pages by entity slot |
 | add / remove a component | a swap inside the pool: O(1) | a bit and a value: O(1) |
@@ -87,18 +87,18 @@ reads the values of the matches by slot.
 ## Performance
 
 The four basic benchmarks that jecs ships with, in the luau CLI (`bench/basic.luau`, Luau 0.740,
-measured on 2026-10-01): every library in a process of its own, five times in each mode, the
+measured on 2026-10-02): every library in a process of its own, five times in each mode, the
 order of the libraries rotated; a case makes 300 calls, and a cell is the median of the five
 medians of a call. Cells read "interpreter / native": `-O2` / `-O2 --codegen`. The ratio is the
 time of mErCS divided by that of ecr; lower is better.
 
-| Benchmark | ecr 0.9.0 | mErCS 1.0.0 | jecs 0.11.0 | mErCS / ecr |
+| Benchmark | ecr 0.9.0 | mErCS 1.0.1 | jecs 0.11.0 | mErCS / ecr |
 |---|---|---|---|---|
-| spawn: 1000 entities with 4 components | 859 / 360 µs | 681 / 444 µs | 832 / 701 µs | 0.79× / 1.23× |
-| despawn: 1000 entities with 4 components and a tag | 884 / 345 µs | 486 / 262 µs | 364 / 365 µs | 0.55× / 0.76× |
-| insertion: 8 components into 500 entities | 620 / 292 µs | 695 / 468 µs | 909 / 789 µs | 1.12× / 1.60× |
-| query: 10 passes of a 4-component query over 4096 entities | 1.73 / 1.54 ms | 115 / 102 µs | 107 / 89.9 µs | 0.07× / 0.07× |
-| the same, `query:each` | — | 60 / 34.8 µs | — | 0.03× / 0.02× |
+| spawn: 1000 entities with 4 components | 844 / 369 µs | 679 / 440 µs | 867 / 706 µs | 0.80× / 1.19× |
+| despawn: 1000 entities with 4 components and a tag | 870 / 349 µs | 500 / 247 µs | 380 / 373 µs | 0.57× / 0.71× |
+| insertion: 8 components into 500 entities | 617 / 297 µs | 683 / 466 µs | 914 / 801 µs | 1.11× / 1.57× |
+| query: 10 passes of a 4-component query over 4096 entities | 1.73 / 1.56 ms | 113 / 109 µs | 107 / 92.4 µs | 0.07× / 0.07× |
+| the same, `query:each` | — | 59.2 / 34.8 µs | — | 0.03× / 0.02× |
 
 - In native code ecr makes entities and gives them components faster: a component added is an
   append to the dense arrays of its pool, where mErCS sets a bit, a value in a page and the
@@ -107,7 +107,7 @@ time of mErCS divided by that of ecr; lower is better.
   the smallest pool and checks the other pools for each of its entities, where mErCS ANDs the
   bitsets 32 entities at a time.
 
-The [complete measurements](https://github.com/dubalda/mErCS/blob/main/bench/results/1.0.0-comparison.md)
+The [complete measurements](https://github.com/dubalda/mErCS/blob/main/bench/results/1.0.1-comparison.md)
 include the ranges and the raw samples. The same four benchmarks in Roblox Studio are on
 [Benchmarker](benchmarker.md). There ecr runs as bytecode: Roblox compiles a script to native
 code only when it has the `--!native` comment, which the module of ecr 0.9.0 does not have and

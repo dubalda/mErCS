@@ -2,7 +2,7 @@
 
 The files of `bench/visual/` time the same work in each library with the
 [Benchmarker](https://devforum.roblox.com/t/benchmarker-plugin-compare-function-speeds-with-graphs-percentiles-and-more/829912)
-plugin in Roblox Studio: jecs 0.11.0 and mErCS 1.0.0 in every file, and ecr 0.9.0 in the four
+plugin in Roblox Studio: jecs 0.11.0 and mErCS in every file, and ecr 0.9.0 in the four
 basic benchmarks that jecs ships with (spawn, despawn, insertion, query). The place of
 `benchmarker.project.json` holds the libraries (the Wally dev packages and `src/`) and these
 files; [Development](../development/README.md#benchmarker-roblox-studio) explains how to open
@@ -11,7 +11,7 @@ it.
 Compare the medians (the 50th percentile): Benchmarker's "Average" is the midpoint of the
 minimum and the maximum. The numbers of the CLI, measured in isolated processes, are on the
 pages of [jecs](jecs.md#performance), [ecr](ecr.md#performance) and
-[1.0.0 and 0.2.4](previous-release.md).
+[1.0.1 and 1.0.0](previous-release.md).
 
 | File | What | Libraries |
 |---|---|---|
@@ -31,7 +31,9 @@ pages of [jecs](jecs.md#performance), [ecr](ecr.md#performance) and
 ## Screenshots
 
 Benchmarker v7.3.1, Edit mode, native code, 1000 calls of each function, with jecs 0.11.0,
-mErCS 1.0.0 and, in the four basic benchmarks, ecr 0.9.0. Roblox compiles a script to native
+mErCS 1.0.0 and, in the four basic benchmarks, ecr 0.9.0. They were captured with 1.0.0 and not
+again for 1.0.1, whose numbers come from the CLI (the pages of jecs, ecr and the previous
+release). Roblox compiles a script to native
 code only when it has the `--!native` comment: the modules of jecs and mErCS have it, the module
 of ecr does not, so ecr runs as bytecode here. The CLI numbers of [ecr](ecr.md#performance)
 compile all three to native code (`--codegen`) and also give the interpreter.

@@ -54,7 +54,7 @@ class WorkloadTests(unittest.TestCase):
         self.assertEqual(workload.expected_counts("client", selected), {"P4": 1, "P7": 1, "P8": 4, "P9": 1})
         self.assertEqual(workload.expected_counts("buffers", selected), {"P8": 2, "P9": 1})
         for group in ("small", "target", "small-empty-retained", "target-empty-retained"):
-            self.assertEqual(sum(workload.expected_counts(group, selected).values()), 23)
+            self.assertEqual(sum(workload.expected_counts(group, selected).values()), 24)
             self.assertEqual(workload.expected_counts(group, {"P7"}), {"P7": 2})
 
     def test_noise_uses_paired_baseline_controls_not_seed_variance_or_candidate_noise(self):
