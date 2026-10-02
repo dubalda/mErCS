@@ -29,7 +29,7 @@ ROOT = Path(__file__).resolve().parent.parent
 TESTS = tuple(f"P{i}" for i in range(1, 10))
 GROUPS = ("sparse", "small", "target", "small-empty-retained", "target-empty-retained", "client", "buffers")
 BUILDS = ("baseline", "baseline_again", "candidate", "candidate_again")
-COUNTS = {"P2": 4, "P3": 1, "P4": 1, "P5": 2, "P6": 3, "P7": 2, "P8": 7, "P9": 3}
+COUNTS = {"P2": 4, "P3": 1, "P4": 1, "P5": 2, "P6": 4, "P7": 2, "P8": 7, "P9": 3}
 
 
 def checked(*command: str) -> bytes:

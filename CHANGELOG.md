@@ -1,5 +1,120 @@
 # Changelog
 
+## v1.0.1 — 2026-10-02
+
+### Changed behavior
+
+None: what a call returns, in which order, what a loop sees and which errors are raised are
+those of 1.0.0.
+
+### Performance
+
+- A delete whose entities have removal hooks or listeners costs, in native code, what it cost in
+  0.2.4 again. 1.0.0 had made it slower with the bookkeeping that keeps nested removals and
+  clears of an entity from notifying an id twice: the cascade over the 500 owned entities of an
+  agent, each with a removal listener, took 261 µs in 0.2.4 and 292 µs in 1.0.0; it takes
+  262 µs now (the median of 8 processes per version, 121 deletes in each). The bookkeeping and
+  the behavior of nested removals stay those of 1.0.0; the way a delete reaches them changed:
+  - an entity with one hooked id, whose removal no running hook concerns, has its hook run
+    without the loops of the general case;
+  - the words of the signatures that have hooked ids are counted, and the loops over them stop
+    at the count: a read past the end of a list takes the slow path of a table read in native
+    code;
+  - after the removal hooks of a deleted entity, the flag that tells whether the entity is used
+    as an id is read again only when a hook marked an entity used meanwhile;
+  - a clear reads the signature words beyond the shared tables only in a world that has such
+    words (more than 256 ids), and a delete reads the changes recorded for its slot only in a
+    world that tracks an id;
+  - the signal dispatcher of an id without a hook keeps `false` as its hook, so that a dispatch
+    reads a field that is there.
+
+  In the interpreter part of the cost of 1.0.0 stays, the most where the deleted entities have
+  several hooked ids: the same cascade takes 437 µs in 0.2.4, 463 µs in 1.0.0 and 442 µs in
+  1.0.1 with one hooked id per entity, and 529, 574 and 558 µs with three (native code: 335,
+  375 and 337 µs).
+- Adds, sets and clears read only the fields that a record has: a component or a tag has its
+  `on_add` hook (`false` without one) and its value pages (`false` for a tag), a pair without
+  values its `on_add`, and an add of a pair without a value does not read its pages. A missing
+  field of a table takes the slow path of a table read in native code; the records keep the size
+  they had (16 fields at most for a pair).
+
+### Tests and tools
+
+- P6 has a case of its own: the cascade of the removal of an agent, in a world of its own (500
+  owned entities at the target scale, 15 at the small one, a removal listener on the state value
+  of each and on two ids of the agent), where the rest of the event does not dilute its cost.
+  `tools/workload.py` expects its row.
+- `test/lib.luau`: a word of the shared signature tables whose last hooked id loses its hook
+  (deletes and clears after that, and a hook set again); `set_all` of a value on a tag raises the
+  error of a value on a tag.
+- The Python bytecode of `tools/` (`__pycache__/`) is no longer in the repository and is
+  ignored: every run of the tools rewrote it.
+
+### Internals
+
+- The helpers of `world_new` that use no state of a world (the presence bits and change journals
+  of a record, value pages, the pairs of a slot, the loops over match lists and the query
+  objects) are defined before it. A Luau function has at most 200 registers; `world_new` had
+  used them all, and 22 are free now.
+
+### Performance on the reference workload
+
+Both versions are measured with the reference workload model of this release on Luau 0.740,
+`-O2`, in the interpreter and native code. The
+[full report](https://github.com/dubalda/mErCS/blob/main/bench/results/1.0.1.md) and
+[raw samples](https://github.com/dubalda/mErCS/blob/main/bench/results/1.0.1.json) contain 232
+comparison rows from 280 isolated processes: 4 improvements beyond the measured control noise and
+no timing regression beyond it; the memory row that the report flags is the constant heap of a
+world (see Memory).
+
+The improvements are rows of the new P6 case, the cascade of the removal of an agent alone:
+at the target scale in both modes and in native code in the small-empty-retained profile; its
+other rows are faster within the noise (µs per event, pooled medians [min–max] of each
+version's two control columns):
+
+| Mode | Scale | 1.0.0 → 1.0.1 |
+|---|---|---|
+| native | target | 294.8 [287.6–316.9] → 260.0 [249.0–261.6] |
+| native | target-empty-retained | 297.8 [292.2–399.4] → 255.7 [252.8–268.9] |
+| native | small | 11.05 [10.70–11.40] → 10.00 [9.30–12.00] |
+| native | small-empty-retained | 11.00 [10.70–11.30] → 9.80 [9.40–10.30] |
+| interpreter | target | 467.2 [457.4–507.5] → 441.0 [424.9–566.6] |
+| interpreter | target-empty-retained | 462.2 [444.0–469.7] → 439.6 [415.9–448.0] |
+| interpreter | small | 17.45 [16.40–18.70] → 16.60 [15.90–29.70] |
+| interpreter | small-empty-retained | 17.25 [16.60–20.00] → 16.65 [16.00–17.40] |
+
+The other rows stay within the noise, the frame model (P7) and the lifecycle events of P6
+included:
+
+| Mode | Scale | P7, µs/frame: 1.0.0 → 1.0.1 | P6, the removal of a retained agent, µs: 1.0.0 → 1.0.1 |
+|---|---|---|---|
+| native | small | 97.78 [94.07–106.50] → 95.45 [92.48–97.42] | 51.63 [42.40–69.00] → 44.10 [40.05–50.95] |
+| native | target | 336.23 [321.08–450.26] → 332.83 [324.37–377.05] | 1039.9 [1010.7–1274.0] → 1026.4 [982.9–1123.0] |
+| native | small-empty-retained | 98.36 [93.63–105.78] → 95.44 [92.60–106.73] | 15.45 [13.10–20.90] → 13.65 [12.90–21.65] |
+| native | target-empty-retained | 327.58 [315.20–404.65] → 313.93 [306.59–340.39] | 22.7 [18.2–31.3] → 23.3 [17.6–27.7] |
+| interpreter | small | 149.31 [145.53–180.86] → 151.80 [147.78–163.85] | 72.05 [65.80–85.50] → 70.72 [65.80–83.10] |
+| interpreter | target | 480.73 [473.96–515.11] → 483.99 [472.49–530.27] | 1612.4 [1553.8–1790.8] → 1596.0 [1554.0–1976.2] |
+| interpreter | small-empty-retained | 148.78 [145.93–161.07] → 148.29 [144.98–156.25] | 20.63 [19.75–29.15] → 22.23 [20.40–29.75] |
+| interpreter | target-empty-retained | 469.91 [463.22–508.19] → 465.49 [459.35–482.31] | 28.3 [25.9–33.9] → 28.2 [26.2–36.8] |
+
+Single operations ([1.0.1 and 1.0.0](https://github.com/dubalda/mErCS/blob/main/docs/comparison/previous-release.md),
+measured with the comparison with jecs) mostly stay within a few percent of 1.0.0, both ways.
+Deletes and removals are faster in native code: a member of a monitored query 0.92× / 0.85×, a
+`ChildOf` cascade 1.02× / 0.89× per child, a tag removed 0.98× / 0.92× (interpreter / native);
+the cost of an `OnRemove` hook on a delete is 190 / 103 ns instead of 205 / 127 ns. The
+interpreter rows of the eight kinds created in turn vary between the processes of one version
+(1.19× in the campaign, 1.02× with 24 more processes of each).
+
+### Memory
+
+A new world takes 318 bytes more: 54 856 instead of 54 538 bytes (200 worlds kept alive), the
+two counters that the deletes read and the closures that capture them. There is no new
+per-entity, per-pair or per-query field: a record keeps its size, and the bytes per distinct
+pair and per holder of P8 are unchanged. The heap rows of P8 measure whole worlds in KiB, so
+this constant moves them by 0 to 2 KiB; one row is flagged (native, target, the heap of the
+world after it is built: +2 KiB), and nothing accumulates over the lifecycle rounds and the long
+sessions.
+
 ## v1.0.0 — 2026-10-01
 
 ### Changed behavior

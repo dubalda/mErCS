@@ -24,7 +24,7 @@ dependencies = []
 
 [[package]]
 name = "dubalda/mercs"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [["ecr", "centau/ecr@0.9.0"], ["jabby", "alicesaidhi/jabby@0.6.1"], ["jecs", "ukendio/jecs@0.11.0"]]
 
 [[package]]

@@ -20,7 +20,7 @@
         -- Functions = { [libs.jecs_label] = ..., [libs.lib_label] = ..., [libs.ecr_label] = ... }
 ]]
 
-local LIBRARY_VERSION = "1.0.0"
+local LIBRARY_VERSION = "1.0.1"
 
 -- "<name> <version>" of a Wally package, from the index next to this folder
 -- (mErCSCheck.DevPackages._Index)

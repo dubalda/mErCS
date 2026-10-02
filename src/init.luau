@@ -83,8 +83,9 @@
     world:ids. A query must select entities (a required id, an OR term or a change filter);
     one with excluded ids alone raises an error when it is used (check: selects). A removal
     that the hooks of the same removal start again does nothing (see removing), so relations
-    kept in sync by hooks run the hook of each side once. world_new has used all 200
-    registers of a Luau function: new state goes into existing tables or locals declared
+    kept in sync by hooks run the hook of each side once. A Luau function has at most 200
+    registers, and world_new keeps them for the state of a world: the helpers that use no state
+    of the world are defined before it, new state goes into existing tables or locals declared
     before the functions that use it, and new methods are assigned to world and Query directly.
 
     Changes during iteration: the current entity may be changed or deleted. Changes of other
@@ -152,9 +153,13 @@ type Record = {
     -- false without one (a field that is present is read faster than a missing one)
     journal: { number } | false,
     journal_mask: number,
-    -- values (components only)
-    pages: Pages?,
-    on_add: Hook?,
+    -- values (components only); false for a plain id or a relation (R, *) without values, missing
+    -- for a pair without values (a field that is present is read faster than a missing one; a
+    -- pair record stays within 16 fields)
+    pages: Pages | false | nil,
+    -- hooks; on_add is false without a hook on a plain id and on a pair without values (every add
+    -- reads it), the others are missing without a hook
+    on_add: Hook | false | nil,
     on_change: Hook?,
     on_remove: Hook?,
     -- pair (R, T) records
@@ -1560,7 +1565,7 @@ end
 
 --------------------------------------------------------------------------------
 -- Helpers without world state (kept out of world_new: a Luau function has at most 200
--- local registers, and the locals of world_new are close to that)
+-- local registers, which world_new keeps for the state of a world)
 --------------------------------------------------------------------------------
 
 -- the hook component of each hook field of a record
@@ -1590,9 +1595,955 @@ local function new_bitset(): Record
     } :: any
 end
 
+-- Presence bits and change journals of a record (see "presence bitsets" in world_new): the
+-- helpers that touch nothing but the record.
+
+local function bit_test(rec: Record, slot: number): boolean
+    local word = rec.words[slot // 32 + 1]
+    return word ~= nil and band(word, lshift(1, slot % 32)) ~= 0
+end
+
+-- Rarer paths: summary word sw was empty and gets `sbit`, or lost its last bit (the top
+-- word tw is at sums[-tw]).
+local function sum_first(rec: Record, sw: number, sbit: number)
+    local sums = rec.sums
+    sums[sw] = sbit
+    local key = -((sw - 1) // 32 + 1)
+    local tbit = lshift(1, (sw - 1) % 32)
+    local top = sums[key]
+    sums[key] = if top then top + tbit else tbit
+end
+
+local function sum_last(rec: Record, sw: number)
+    local sums = rec.sums
+    local key = -((sw - 1) // 32 + 1)
+    sums[key] -= lshift(1, (sw - 1) % 32)
+end
+
+-- Rare path: word w was empty and gets `bits`. The caller increments the version.
+-- world_set and world_add inline it.
+local function word_first(rec: Record, w: number, bits: number)
+    rec.words[w] = bits
+    rec.word_count += 1
+    local sums = rec.sums
+    local sw = (w - 1) // 32 + 1
+    local sbit = lshift(1, (w - 1) % 32)
+    local sum = sums[sw]
+    if sum ~= nil and sum ~= 0 then
+        sums[sw] = sum + sbit
+    else
+        sum_first(rec, sw, sbit)
+    end
+end
+
+-- Drops the keys of the emptied words of a record (see word_last).
+local function drop_zeros(rec: Record)
+    local words = rec.words
+    for w, word in words do
+        if word == 0 then
+            words[w] = nil
+        end
+    end
+    local sums = rec.sums -- the summary words and the top words
+    for sw, sum in sums do
+        if sum == 0 then
+            sums[sw] = nil
+        end
+    end
+    rec.zeros = 0
+end
+
+-- Rare path: word w lost its last bit. The caller increments the version. The word stays
+-- as 0 until the emptied words outnumber the non-empty ones twice (and 1024). world_remove
+-- inlines it.
+local function word_last(rec: Record, w: number)
+    rec.words[w] = 0
+    local count = rec.word_count - 1
+    rec.word_count = count
+    local sums = rec.sums
+    local sw = (w - 1) // 32 + 1
+    local sum = sums[sw] - lshift(1, (w - 1) % 32)
+    sums[sw] = sum
+    if sum == 0 then
+        sum_last(rec, sw)
+    end
+    local zeros = rec.zeros + 1
+    rec.zeros = zeros
+    if zeros > 2 * count + 1024 then
+        drop_zeros(rec)
+    end
+end
+
+-- ORs bits into word w of a record built from other records (merged OR terms, change
+-- filters over several ticks); such records have no journal.
+local function merge_word(rec: Record, w: number, bits: number)
+    if bits == 0 then
+        return
+    end
+    local old = rec.words[w]
+    if old ~= nil and old ~= 0 then
+        rec.words[w] = bor(old, bits)
+    else
+        word_first(rec, w, bits)
+    end
+end
+
+-- Gives a record a change journal of `size` entries (a power of two). A new journal has
+-- no entries: a query that has not seen the latest changes of the record scans it again.
+local function journal_grow(rec: Record, size: number)
+    rec.journal = table.create(size * 2, 0)
+    rec.journal_mask = size - 1
+end
+
+-- Value pages of a record.
+
+-- Whether a new value page of a record is preallocated as an array: when the record is
+-- dense around it (at least a quarter of the slots of this and the previous page are
+-- members), as a page with 25-50 % of its slots used would otherwise stay in the hash part
+-- of the table, which is slower to read. Sparse records keep small hash pages.
+local function page_dense(rec: Record, page_index: number): boolean
+    -- the two pages are 16 aligned words inside one summary word (32 words)
+    local first_w = if page_index > 1 then (page_index - 2) * WORDS_PER_PAGE + 1 else 1
+    local sum = rec.sums[(first_w - 1) // 32 + 1]
+    if sum then
+        local nonempty = band(rshift(sum, (first_w - 1) % 32), 0xFFFF)
+        if popcount(nonempty) >= 8 then
+            local words = rec.words
+            local bits = 0
+            while nonempty ~= 0 do
+                bits += popcount(words[first_w + countrz(nonempty)])
+                nonempty = band(nonempty, nonempty - 1)
+            end
+            return bits >= PAGE_SIZE // 4
+        end
+    end
+    return false
+end
+
+-- Pairs of a slot in their relation record (see the pairs in world_new).
+
+-- Adds a second or later pair of a relation to the slot: the pairs of a slot are kept in
+-- a list ordered by target slot, and slot_pair holds the first one. Targets are mostly
+-- added in the order they were created: such a pair goes to the end at once, any other
+-- one finds its place by a binary search (an entity with many targets of a relation).
+local function pair_attach_more(rec: Record, wc_rel: Record, slot: number, first: Record)
+    local slot_pairs = wc_rel.slot_pairs :: { [number]: { Record } }
+    local list = slot_pairs[slot]
+    if list == nil then
+        list = { first }
+        slot_pairs[slot] = list
+    end
+    local target_slot = (rec.target :: i53) % ENTITY_MASK
+    local n = #list
+    if (list[n].target :: i53) % ENTITY_MASK < target_slot then
+        list[n + 1] = rec
+    else
+        -- the first pair with a higher target slot
+        local lo, hi = 1, n
+        while lo < hi do
+            local mid = (lo + hi) // 2
+            if (list[mid].target :: i53) % ENTITY_MASK > target_slot then
+                hi = mid
+            else
+                lo = mid + 1
+            end
+        end
+        table.insert(list, lo, rec)
+    end
+    (wc_rel.slot_pair :: { [number]: Record })[slot] = list[1]
+end
+
+-- Appends the pairs of a relation record (R, *) of a slot that have on_remove hooks to
+-- buffer (no table for a slot with one pair).
+local function collect_pairs(rec: Record, slot: number, buffer: { Record }, n: number): number
+    local list = (rec.slot_pairs :: { [number]: { Record } })[slot]
+    if list then
+        for _, pair_rec in list do
+            if pair_rec.on_remove then
+                n += 1
+                buffer[n] = pair_rec
+            end
+        end
+    else
+        local pair_rec = (rec.slot_pair :: { [number]: Record })[slot]
+        if pair_rec and pair_rec.on_remove then
+            n += 1
+            buffer[n] = pair_rec
+        end
+    end
+    return n
+end
+
+-- Queries: the word tests of their terms, the loops over their match lists and the query
+-- objects of world:query (see the queries in world_new). They work on the state of a query
+-- (QueryState), not on the world.
+
+-- Word tests of the general case (more than three other terms, or more than two excluded
+-- ids): the bits of word w that match every term, and whether all of them do.
+local function make_word_tests(
+    dwords: Words,
+    others: { Words },
+    without: { Words }
+): ((w: number) -> number, (w: number) -> boolean)
+    local n_others, n_without = #others, #without
+    local function word_mask(w: number): number
+        local m = dwords[w]
+        if m == nil then
+            return 0
+        end
+        for k = 1, n_others do
+            local o = others[k][w]
+            if o == nil then
+                return 0
+            end
+            m = band(m, o)
+        end
+        for k = 1, n_without do
+            local x = without[k][w]
+            if x ~= nil then
+                m = band(m, FULL_WORD - x)
+            end
+        end
+        return m
+    end
+    local function word_full(w: number): boolean
+        if dwords[w] ~= FULL_WORD then
+            return false
+        end
+        for k = 1, n_others do
+            if others[k][w] ~= FULL_WORD then
+                return false
+            end
+        end
+        for k = 1, n_without do
+            if (without[k][w] or 0) ~= 0 then
+                return false
+            end
+        end
+        return true
+    end
+    return word_mask, word_full
+end
+
+local function list_iter(query: QueryState): (() -> ...any, () -> ())
+    local gitems = query.list_items
+    local sizes = query.list_sizes
+    local firsts = query.list_firsts
+    local first_lis = query.list_first_lis
+    local pages_lists = query.list_pages
+    local epoch = query.list_epoch
+    local n = #query.ids
+
+    -- @generated list_iterators begin
+    if n == 0 then
+        local g, j, last = 0, 0, 0
+        local items = EMPTY
+        return function(): ...any
+            local k = j + 2
+            if k > last then
+                local next_g = g + 1
+                local size = sizes[next_g]
+                if size == nil then
+                    if g >= 0 then
+                        g = -1 -- the end is counted once
+                        if query.list_epoch == epoch then
+                            query.list_busy = false
+                            query.list_readers -= 1
+                        end
+                    end
+                    return nil
+                end
+                g = next_g
+                if size == 1 then
+                    -- a group of one match: its array is not read
+                    j, last = 0, 0
+                    return firsts[next_g]
+                end
+                last = size * 2
+                items = gitems[next_g]
+                k = 2
+            end
+            j = k
+            return items[k - 1]
+        end, function()
+            g, j, last = 0, 0, 0
+        end
+    elseif n == 1 then
+        local g, j, last = 0, 0, 0
+        local items = EMPTY
+        local g1 = pages_lists[1]
+        local p1 = EMPTY
+        return function(): ...any
+            local k = j + 2
+            if k > last then
+                local next_g = g + 1
+                local size = sizes[next_g]
+                if size == nil then
+                    if g >= 0 then
+                        g = -1 -- the end is counted once
+                        if query.list_epoch == epoch then
+                            query.list_busy = false
+                            query.list_readers -= 1
+                        end
+                    end
+                    return nil
+                end
+                g = next_g
+                p1 = g1[next_g]
+                if size == 1 then
+                    -- a group of one match: its array is not read
+                    j, last = 0, 0
+                    local li = first_lis[next_g]
+                    return firsts[next_g], p1[li]
+                end
+                last = size * 2
+                items = gitems[next_g]
+                k = 2
+            end
+            j = k
+            local li = items[k]
+            return items[k - 1], p1[li]
+        end, function()
+            g, j, last = 0, 0, 0
+        end
+    elseif n == 2 then
+        local g, j, last = 0, 0, 0
+        local items = EMPTY
+        local g1, g2 = pages_lists[1], pages_lists[2]
+        local p1, p2 = EMPTY, EMPTY
+        return function(): ...any
+            local k = j + 2
+            if k > last then
+                local next_g = g + 1
+                local size = sizes[next_g]
+                if size == nil then
+                    if g >= 0 then
+                        g = -1 -- the end is counted once
+                        if query.list_epoch == epoch then
+                            query.list_busy = false
+                            query.list_readers -= 1
+                        end
+                    end
+                    return nil
+                end
+                g = next_g
+                p1 = g1[next_g]
+                p2 = g2[next_g]
+                if size == 1 then
+                    -- a group of one match: its array is not read
+                    j, last = 0, 0
+                    local li = first_lis[next_g]
+                    return firsts[next_g], p1[li], p2[li]
+                end
+                last = size * 2
+                items = gitems[next_g]
+                k = 2
+            end
+            j = k
+            local li = items[k]
+            return items[k - 1], p1[li], p2[li]
+        end, function()
+            g, j, last = 0, 0, 0
+        end
+    elseif n == 3 then
+        local g, j, last = 0, 0, 0
+        local items = EMPTY
+        local g1, g2, g3 = pages_lists[1], pages_lists[2], pages_lists[3]
+        local p1, p2, p3 = EMPTY, EMPTY, EMPTY
+        return function(): ...any
+            local k = j + 2
+            if k > last then
+                local next_g = g + 1
+                local size = sizes[next_g]
+                if size == nil then
+                    if g >= 0 then
+                        g = -1 -- the end is counted once
+                        if query.list_epoch == epoch then
+                            query.list_busy = false
+                            query.list_readers -= 1
+                        end
+                    end
+                    return nil
+                end
+                g = next_g
+                p1 = g1[next_g]
+                p2 = g2[next_g]
+                p3 = g3[next_g]
+                if size == 1 then
+                    -- a group of one match: its array is not read
+                    j, last = 0, 0
+                    local li = first_lis[next_g]
+                    return firsts[next_g], p1[li], p2[li], p3[li]
+                end
+                last = size * 2
+                items = gitems[next_g]
+                k = 2
+            end
+            j = k
+            local li = items[k]
+            return items[k - 1], p1[li], p2[li], p3[li]
+        end, function()
+            g, j, last = 0, 0, 0
+        end
+    elseif n == 4 then
+        local g, j, last = 0, 0, 0
+        local items = EMPTY
+        local g1, g2, g3, g4 = pages_lists[1], pages_lists[2], pages_lists[3], pages_lists[4]
+        local p1, p2, p3, p4 = EMPTY, EMPTY, EMPTY, EMPTY
+        return function(): ...any
+            local k = j + 2
+            if k > last then
+                local next_g = g + 1
+                local size = sizes[next_g]
+                if size == nil then
+                    if g >= 0 then
+                        g = -1 -- the end is counted once
+                        if query.list_epoch == epoch then
+                            query.list_busy = false
+                            query.list_readers -= 1
+                        end
+                    end
+                    return nil
+                end
+                g = next_g
+                p1 = g1[next_g]
+                p2 = g2[next_g]
+                p3 = g3[next_g]
+                p4 = g4[next_g]
+                if size == 1 then
+                    -- a group of one match: its array is not read
+                    j, last = 0, 0
+                    local li = first_lis[next_g]
+                    return firsts[next_g], p1[li], p2[li], p3[li], p4[li]
+                end
+                last = size * 2
+                items = gitems[next_g]
+                k = 2
+            end
+            j = k
+            local li = items[k]
+            return items[k - 1], p1[li], p2[li], p3[li], p4[li]
+        end, function()
+            g, j, last = 0, 0, 0
+        end
+    elseif n == 5 then
+        local g, j, last = 0, 0, 0
+        local items = EMPTY
+        local g1, g2, g3, g4, g5 = pages_lists[1], pages_lists[2], pages_lists[3], pages_lists[4], pages_lists[5]
+        local p1, p2, p3, p4, p5 = EMPTY, EMPTY, EMPTY, EMPTY, EMPTY
+        return function(): ...any
+            local k = j + 2
+            if k > last then
+                local next_g = g + 1
+                local size = sizes[next_g]
+                if size == nil then
+                    if g >= 0 then
+                        g = -1 -- the end is counted once
+                        if query.list_epoch == epoch then
+                            query.list_busy = false
+                            query.list_readers -= 1
+                        end
+                    end
+                    return nil
+                end
+                g = next_g
+                p1 = g1[next_g]
+                p2 = g2[next_g]
+                p3 = g3[next_g]
+                p4 = g4[next_g]
+                p5 = g5[next_g]
+                if size == 1 then
+                    -- a group of one match: its array is not read
+                    j, last = 0, 0
+                    local li = first_lis[next_g]
+                    return firsts[next_g], p1[li], p2[li], p3[li], p4[li], p5[li]
+                end
+                last = size * 2
+                items = gitems[next_g]
+                k = 2
+            end
+            j = k
+            local li = items[k]
+            return items[k - 1], p1[li], p2[li], p3[li], p4[li], p5[li]
+        end, function()
+            g, j, last = 0, 0, 0
+        end
+    elseif n == 6 then
+        local g, j, last = 0, 0, 0
+        local items = EMPTY
+        local g1, g2, g3, g4, g5, g6 =
+            pages_lists[1], pages_lists[2], pages_lists[3], pages_lists[4], pages_lists[5], pages_lists[6]
+        local p1, p2, p3, p4, p5, p6 = EMPTY, EMPTY, EMPTY, EMPTY, EMPTY, EMPTY
+        return function(): ...any
+            local k = j + 2
+            if k > last then
+                local next_g = g + 1
+                local size = sizes[next_g]
+                if size == nil then
+                    if g >= 0 then
+                        g = -1 -- the end is counted once
+                        if query.list_epoch == epoch then
+                            query.list_busy = false
+                            query.list_readers -= 1
+                        end
+                    end
+                    return nil
+                end
+                g = next_g
+                p1 = g1[next_g]
+                p2 = g2[next_g]
+                p3 = g3[next_g]
+                p4 = g4[next_g]
+                p5 = g5[next_g]
+                p6 = g6[next_g]
+                if size == 1 then
+                    -- a group of one match: its array is not read
+                    j, last = 0, 0
+                    local li = first_lis[next_g]
+                    return firsts[next_g], p1[li], p2[li], p3[li], p4[li], p5[li], p6[li]
+                end
+                last = size * 2
+                items = gitems[next_g]
+                k = 2
+            end
+            j = k
+            local li = items[k]
+            return items[k - 1], p1[li], p2[li], p3[li], p4[li], p5[li], p6[li]
+        end, function()
+            g, j, last = 0, 0, 0
+        end
+    elseif n == 7 then
+        local g, j, last = 0, 0, 0
+        local items = EMPTY
+        local g1, g2, g3, g4, g5, g6, g7 =
+            pages_lists[1],
+            pages_lists[2],
+            pages_lists[3],
+            pages_lists[4],
+            pages_lists[5],
+            pages_lists[6],
+            pages_lists[7]
+        local p1, p2, p3, p4, p5, p6, p7 = EMPTY, EMPTY, EMPTY, EMPTY, EMPTY, EMPTY, EMPTY
+        return function(): ...any
+            local k = j + 2
+            if k > last then
+                local next_g = g + 1
+                local size = sizes[next_g]
+                if size == nil then
+                    if g >= 0 then
+                        g = -1 -- the end is counted once
+                        if query.list_epoch == epoch then
+                            query.list_busy = false
+                            query.list_readers -= 1
+                        end
+                    end
+                    return nil
+                end
+                g = next_g
+                p1 = g1[next_g]
+                p2 = g2[next_g]
+                p3 = g3[next_g]
+                p4 = g4[next_g]
+                p5 = g5[next_g]
+                p6 = g6[next_g]
+                p7 = g7[next_g]
+                if size == 1 then
+                    -- a group of one match: its array is not read
+                    j, last = 0, 0
+                    local li = first_lis[next_g]
+                    return firsts[next_g], p1[li], p2[li], p3[li], p4[li], p5[li], p6[li], p7[li]
+                end
+                last = size * 2
+                items = gitems[next_g]
+                k = 2
+            end
+            j = k
+            local li = items[k]
+            return items[k - 1], p1[li], p2[li], p3[li], p4[li], p5[li], p6[li], p7[li]
+        end, function()
+            g, j, last = 0, 0, 0
+        end
+    elseif n == 8 then
+        local g, j, last = 0, 0, 0
+        local items = EMPTY
+        local g1, g2, g3, g4, g5, g6, g7, g8 =
+            pages_lists[1],
+            pages_lists[2],
+            pages_lists[3],
+            pages_lists[4],
+            pages_lists[5],
+            pages_lists[6],
+            pages_lists[7],
+            pages_lists[8]
+        local p1, p2, p3, p4, p5, p6, p7, p8 = EMPTY, EMPTY, EMPTY, EMPTY, EMPTY, EMPTY, EMPTY, EMPTY
+        return function(): ...any
+            local k = j + 2
+            if k > last then
+                local next_g = g + 1
+                local size = sizes[next_g]
+                if size == nil then
+                    if g >= 0 then
+                        g = -1 -- the end is counted once
+                        if query.list_epoch == epoch then
+                            query.list_busy = false
+                            query.list_readers -= 1
+                        end
+                    end
+                    return nil
+                end
+                g = next_g
+                p1 = g1[next_g]
+                p2 = g2[next_g]
+                p3 = g3[next_g]
+                p4 = g4[next_g]
+                p5 = g5[next_g]
+                p6 = g6[next_g]
+                p7 = g7[next_g]
+                p8 = g8[next_g]
+                if size == 1 then
+                    -- a group of one match: its array is not read
+                    j, last = 0, 0
+                    local li = first_lis[next_g]
+                    return firsts[next_g], p1[li], p2[li], p3[li], p4[li], p5[li], p6[li], p7[li], p8[li]
+                end
+                last = size * 2
+                items = gitems[next_g]
+                k = 2
+            end
+            j = k
+            local li = items[k]
+            return items[k - 1], p1[li], p2[li], p3[li], p4[li], p5[li], p6[li], p7[li], p8[li]
+        end, function()
+            g, j, last = 0, 0, 0
+        end
+    end
+    -- @generated list_iterators end
+    error("list mode supports at most 8 values") -- choose_mode never picks it for more
+end
+
+-- Gives a query copies of its list tables and of every group array: a loop over the
+-- current list has not finished and keeps the old ones. The copies are the query's alone,
+-- so the updates after this one change them in place, until a loop over them does not
+-- finish before an update.
+local function detach_list(query: QueryState)
+    query.list_gpages = table.clone(query.list_gpages)
+    local gitems = table.clone(query.list_items)
+    for g = 1, query.list_groups do
+        gitems[g] = table.clone(gitems[g])
+    end
+    query.list_items = gitems
+    query.list_sizes = table.clone(query.list_sizes)
+    query.list_firsts = table.clone(query.list_firsts)
+    query.list_first_lis = table.clone(query.list_first_lis)
+    local pages_lists = table.clone(query.list_pages)
+    for k, list in pages_lists do
+        pages_lists[k] = table.clone(list)
+    end
+    query.list_pages = pages_lists
+    query.list_step = nil
+    query.list_reset = nil
+    query.list_epoch += 1
+    query.list_readers = 0
+end
+
+-- Callback loop over the match list of a cached query (see build_list).
+local function list_each(query: QueryState, callback: (...any) -> ())
+    local n = #query.ids
+    local gitems = query.list_items
+    local sizes = query.list_sizes
+    local firsts = query.list_firsts
+    local first_lis = query.list_first_lis
+    local groups = query.list_groups
+    local pages_lists = query.list_pages
+
+    -- @generated list_each begin
+    if n == 0 then
+        for g = 1, groups do
+            local size = sizes[g]
+            if size == 1 then
+                callback(firsts[g])
+            else
+                local items = gitems[g]
+                for k = 1, size * 2, 2 do
+                    callback(items[k])
+                end
+            end
+        end
+        return
+    elseif n == 1 then
+        local g1 = pages_lists[1]
+        for g = 1, groups do
+            local size = sizes[g]
+            local p1 = g1[g]
+            if size == 1 then
+                local li = first_lis[g]
+                callback(firsts[g], p1[li])
+            else
+                local items = gitems[g]
+                for k = 2, size * 2, 2 do
+                    local li = items[k]
+                    callback(items[k - 1], p1[li])
+                end
+            end
+        end
+        return
+    elseif n == 2 then
+        local g1, g2 = pages_lists[1], pages_lists[2]
+        for g = 1, groups do
+            local size = sizes[g]
+            local p1, p2 = g1[g], g2[g]
+            if size == 1 then
+                local li = first_lis[g]
+                callback(firsts[g], p1[li], p2[li])
+            else
+                local items = gitems[g]
+                for k = 2, size * 2, 2 do
+                    local li = items[k]
+                    callback(items[k - 1], p1[li], p2[li])
+                end
+            end
+        end
+        return
+    elseif n == 3 then
+        local g1, g2, g3 = pages_lists[1], pages_lists[2], pages_lists[3]
+        for g = 1, groups do
+            local size = sizes[g]
+            local p1, p2, p3 = g1[g], g2[g], g3[g]
+            if size == 1 then
+                local li = first_lis[g]
+                callback(firsts[g], p1[li], p2[li], p3[li])
+            else
+                local items = gitems[g]
+                for k = 2, size * 2, 2 do
+                    local li = items[k]
+                    callback(items[k - 1], p1[li], p2[li], p3[li])
+                end
+            end
+        end
+        return
+    elseif n == 4 then
+        local g1, g2, g3, g4 = pages_lists[1], pages_lists[2], pages_lists[3], pages_lists[4]
+        for g = 1, groups do
+            local size = sizes[g]
+            local p1, p2, p3, p4 = g1[g], g2[g], g3[g], g4[g]
+            if size == 1 then
+                local li = first_lis[g]
+                callback(firsts[g], p1[li], p2[li], p3[li], p4[li])
+            else
+                local items = gitems[g]
+                for k = 2, size * 2, 2 do
+                    local li = items[k]
+                    callback(items[k - 1], p1[li], p2[li], p3[li], p4[li])
+                end
+            end
+        end
+        return
+    elseif n == 5 then
+        local g1, g2, g3, g4, g5 = pages_lists[1], pages_lists[2], pages_lists[3], pages_lists[4], pages_lists[5]
+        for g = 1, groups do
+            local size = sizes[g]
+            local p1, p2, p3, p4, p5 = g1[g], g2[g], g3[g], g4[g], g5[g]
+            if size == 1 then
+                local li = first_lis[g]
+                callback(firsts[g], p1[li], p2[li], p3[li], p4[li], p5[li])
+            else
+                local items = gitems[g]
+                for k = 2, size * 2, 2 do
+                    local li = items[k]
+                    callback(items[k - 1], p1[li], p2[li], p3[li], p4[li], p5[li])
+                end
+            end
+        end
+        return
+    elseif n == 6 then
+        local g1, g2, g3, g4, g5, g6 =
+            pages_lists[1], pages_lists[2], pages_lists[3], pages_lists[4], pages_lists[5], pages_lists[6]
+        for g = 1, groups do
+            local size = sizes[g]
+            local p1, p2, p3, p4, p5, p6 = g1[g], g2[g], g3[g], g4[g], g5[g], g6[g]
+            if size == 1 then
+                local li = first_lis[g]
+                callback(firsts[g], p1[li], p2[li], p3[li], p4[li], p5[li], p6[li])
+            else
+                local items = gitems[g]
+                for k = 2, size * 2, 2 do
+                    local li = items[k]
+                    callback(items[k - 1], p1[li], p2[li], p3[li], p4[li], p5[li], p6[li])
+                end
+            end
+        end
+        return
+    elseif n == 7 then
+        local g1, g2, g3, g4, g5, g6, g7 =
+            pages_lists[1],
+            pages_lists[2],
+            pages_lists[3],
+            pages_lists[4],
+            pages_lists[5],
+            pages_lists[6],
+            pages_lists[7]
+        for g = 1, groups do
+            local size = sizes[g]
+            local p1, p2, p3, p4, p5, p6, p7 = g1[g], g2[g], g3[g], g4[g], g5[g], g6[g], g7[g]
+            if size == 1 then
+                local li = first_lis[g]
+                callback(firsts[g], p1[li], p2[li], p3[li], p4[li], p5[li], p6[li], p7[li])
+            else
+                local items = gitems[g]
+                for k = 2, size * 2, 2 do
+                    local li = items[k]
+                    callback(items[k - 1], p1[li], p2[li], p3[li], p4[li], p5[li], p6[li], p7[li])
+                end
+            end
+        end
+        return
+    elseif n == 8 then
+        local g1, g2, g3, g4, g5, g6, g7, g8 =
+            pages_lists[1],
+            pages_lists[2],
+            pages_lists[3],
+            pages_lists[4],
+            pages_lists[5],
+            pages_lists[6],
+            pages_lists[7],
+            pages_lists[8]
+        for g = 1, groups do
+            local size = sizes[g]
+            local p1, p2, p3, p4, p5, p6, p7, p8 = g1[g], g2[g], g3[g], g4[g], g5[g], g6[g], g7[g], g8[g]
+            if size == 1 then
+                local li = first_lis[g]
+                callback(firsts[g], p1[li], p2[li], p3[li], p4[li], p5[li], p6[li], p7[li], p8[li])
+            else
+                local items = gitems[g]
+                for k = 2, size * 2, 2 do
+                    local li = items[k]
+                    callback(items[k - 1], p1[li], p2[li], p3[li], p4[li], p5[li], p6[li], p7[li], p8[li])
+                end
+            end
+        end
+        return
+    end
+    -- @generated list_each end
+end
+
+-- A query state for the ids; `copy`, a query with the same ids, gives the flags of the ids.
+local function new_query(ids: { i53 }, copy: QueryState?): QueryState
+    local wild_values, skip_disabled
+    if copy then
+        wild_values, skip_disabled = copy.wild_values, copy.skip_disabled
+    else
+        wild_values = false
+        for _, id in ids do
+            if id > PAIR_OFFSET and is_wildcard(id) then
+                wild_values = true
+            end
+        end
+        skip_disabled = table.find(ids, EcsDisabled) == nil
+    end
+    -- only the fields that a query which is not cached reads: the first request of a shape
+    -- written inline is made on every call (make_cached adds the state of a cached query)
+    return {
+        ids = ids,
+        filter_with = ids,
+        is_cached = false,
+        listable = false,
+        mode = 0,
+        list_count = 0,
+        list_groups = 0,
+        scan_words = 0,
+        skip_disabled = skip_disabled,
+        wild_values = wild_values,
+    } :: any
+end
+
+-- Whether a query names Disabled in any of its terms.
+local function names_disabled(query: QueryState): boolean
+    if
+        table.find(query.filter_with, EcsDisabled)
+        or (query.filter_without and table.find(query.filter_without, EcsDisabled))
+    then
+        return true
+    end
+    local groups = query.any_groups
+    if groups then
+        for _, group in groups do
+            if table.find(group, EcsDisabled) then
+                return true
+            end
+        end
+    end
+    return false
+end
+
+-- The terms of a query changed in place: what a cached query observed no longer covers
+-- them (the next iteration observes the records of the new terms and plans again).
+local function forget_plan(query: QueryState)
+    query.mode = 0
+    -- (a nil assigned to a missing field would add the field)
+    if query.list_stamp ~= nil then
+        query.list_stamp = nil
+    end
+    if query.observed_generation ~= nil then
+        query.observed_generation = nil
+    end
+    if query.terms then
+        query.terms = nil
+    end
+end
+
+local function apply_with(query: QueryState, ...: i53): QueryState
+    local ids = query.ids
+    local n_ids, n_with = #ids, select("#", ...)
+    local with: { i53 } = table.create(n_ids + n_with) :: { i53 }
+    table.move(ids, 1, n_ids, 1, with)
+    for i = 1, n_with do
+        with[n_ids + i] = (select(i, ...))
+    end
+    query.filter_with = with
+    query.skip_disabled = not names_disabled(query)
+    forget_plan(query)
+    return query
+end
+
+local function apply_without(query: QueryState, ...: i53): QueryState
+    query.filter_without = { ... }
+    query.skip_disabled = not names_disabled(query)
+    forget_plan(query)
+    return query
+end
+
+-- A new, unshared copy of the terms of a query.
+local function copy_query(query: QueryState): QueryState
+    local copy = new_query(query.ids, query)
+    if query.filter_with ~= query.ids then
+        copy.filter_with = table.clone(query.filter_with)
+    end
+    if query.filter_without then
+        copy.filter_without = table.clone(query.filter_without :: { i53 })
+    end
+    if query.any_groups then
+        copy.any_groups = table.clone(query.any_groups :: { { i53 } })
+    end
+    copy.skip_disabled = query.skip_disabled
+    return copy
+end
+
+local function apply_any(query: QueryState, ...: i53): QueryState
+    local groups = query.any_groups
+    if groups == nil then
+        groups = {}
+        query.any_groups = groups
+    end
+    table.insert(groups :: { { i53 } }, { ... })
+    query.skip_disabled = not names_disabled(query)
+    forget_plan(query)
+    return query
+end
+
 -- The checks of a debug world (see the end of world_new): they take the alive table of the
--- world, so that they take no registers of world_new, which has used all 200 of them. `level`
--- is the level of the error, as for error(): 3 when a wrapper of a world method calls them.
+-- world, so that they take no registers of world_new (see the helpers without world state).
+-- `level` is the level of the error, as for error(): 3 when a wrapper of a world method calls
+-- them.
 local function debug_check_entity(alive: { number }, entity: i53, level: number)
     if type(entity) ~= "number" or alive[entity % ENTITY_MASK] ~= entity then
         error(`entity {entity} is not alive: an outdated handle or a deleted entity`, level)
@@ -1829,8 +2780,8 @@ local function world_new(debug: boolean?): World
     local free_count = 0
     local max_slot = 0
     -- world:range: the new ids of this world come after range[1] and stay below range[2]
-    -- (math.huge without a last one); nil without a range. One table, not two locals: world_new
-    -- has used all its registers.
+    -- (math.huge without a last one); nil without a range. One table, not two locals: a register
+    -- of world_new less (see the helpers without world state).
     local range: { number }? = nil
     -- The floors of the generations of slots (see world:entity): an older generation of a slot
     -- made alive again over newer ones keeps here the generation after the newest one, which
@@ -1868,6 +2819,9 @@ local function world_new(debug: boolean?): World
     -- ascending order (hooked_delete has bits in these words only): a clear looks for hooked
     -- ids in these words of the signature only.
     local hooked_list: { number } = {}
+    -- the number of words in hooked_list: the loops over it stop there (a read past its end
+    -- takes the slow path of a table read)
+    local hooked_count = 0
 
     -- The entities whose on_remove hooks run (see run_remove_hooks), innermost last:
     -- clearing[1..clear_depth], each with the records of its hooks in clear_buffers[depth].
@@ -1921,6 +2875,9 @@ local function world_new(debug: boolean?): World
     -- or a term of a shared query shape, or it has a floor of its generation (world_delete
     -- cleans up after such an entity; false while it does)
     local id_used: { [number]: boolean } = {}
+    -- counts the marks of id_used (an entity marked used): world_delete reads the flag of the
+    -- entity again after its removal hooks only when one was made meanwhile
+    local used_stamp = 0
     -- the query states shared by shape (see query_state)
     local shapes: Shapes = { roots = {}, count = 0, marks = 0, keys = {}, warned = false }
 
@@ -1958,7 +2915,9 @@ local function world_new(debug: boolean?): World
 
     -- The helpers below are split into a short common path and a separate rare path, so that
     -- the compiler inlines the common path at their call sites (functions above its inlining
-    -- cost threshold are called, which costs more than the work itself).
+    -- cost threshold are called, which costs more than the work itself). The helpers that touch
+    -- nothing but the record (bit_test, word_first, word_last, merge_word, their rare paths and
+    -- journal_grow) are defined before world_new, among the helpers without world state.
     --
     -- A record has three levels of presence bits: words (32 slots each), sums (a bit per
     -- non-empty word, 1024 slots each) and tops (a bit per non-empty summary word, 32768 slots
@@ -1978,82 +2937,6 @@ local function world_new(debug: boolean?): World
     -- many slots) makes the queries that observe the record scan it again, so noting is only an
     -- optimization. A version increment of a record with a journal also changes changes_stamp
     -- (journal_write does it for the noted changes).
-
-    local function bit_test(rec: Record, slot: number): boolean
-        local word = rec.words[slot // 32 + 1]
-        return word ~= nil and band(word, lshift(1, slot % 32)) ~= 0
-    end
-
-    -- Rarer paths: summary word sw was empty and gets `sbit`, or lost its last bit (the top
-    -- word tw is at sums[-tw]).
-    local function sum_first(rec: Record, sw: number, sbit: number)
-        local sums = rec.sums
-        sums[sw] = sbit
-        local key = -((sw - 1) // 32 + 1)
-        local tbit = lshift(1, (sw - 1) % 32)
-        local top = sums[key]
-        sums[key] = if top then top + tbit else tbit
-    end
-
-    local function sum_last(rec: Record, sw: number)
-        local sums = rec.sums
-        local key = -((sw - 1) // 32 + 1)
-        sums[key] -= lshift(1, (sw - 1) % 32)
-    end
-
-    -- Rare path: word w was empty and gets `bits`. The caller increments the version.
-    -- world_set and world_add inline it.
-    local function word_first(rec: Record, w: number, bits: number)
-        rec.words[w] = bits
-        rec.word_count += 1
-        local sums = rec.sums
-        local sw = (w - 1) // 32 + 1
-        local sbit = lshift(1, (w - 1) % 32)
-        local sum = sums[sw]
-        if sum ~= nil and sum ~= 0 then
-            sums[sw] = sum + sbit
-        else
-            sum_first(rec, sw, sbit)
-        end
-    end
-
-    -- Drops the keys of the emptied words of a record (see word_last).
-    local function drop_zeros(rec: Record)
-        local words = rec.words
-        for w, word in words do
-            if word == 0 then
-                words[w] = nil
-            end
-        end
-        local sums = rec.sums -- the summary words and the top words
-        for sw, sum in sums do
-            if sum == 0 then
-                sums[sw] = nil
-            end
-        end
-        rec.zeros = 0
-    end
-
-    -- Rare path: word w lost its last bit. The caller increments the version. The word stays
-    -- as 0 until the emptied words outnumber the non-empty ones twice (and 1024). world_remove
-    -- inlines it.
-    local function word_last(rec: Record, w: number)
-        rec.words[w] = 0
-        local count = rec.word_count - 1
-        rec.word_count = count
-        local sums = rec.sums
-        local sw = (w - 1) // 32 + 1
-        local sum = sums[sw] - lshift(1, (w - 1) % 32)
-        sums[sw] = sum
-        if sum == 0 then
-            sum_last(rec, sw)
-        end
-        local zeros = rec.zeros + 1
-        rec.zeros = zeros
-        if zeros > 2 * count + 1024 then
-            drop_zeros(rec)
-        end
-    end
 
     -- Changes whenever a record with a change journal changes (every record that a cached query
     -- observes has one) and when a record is created or freed: a cached query in list mode that
@@ -2134,27 +3017,6 @@ local function world_new(debug: boolean?): World
         end
     end
 
-    -- ORs bits into word w of a record built from other records (merged OR terms, change
-    -- filters over several ticks); such records have no journal.
-    local function merge_word(rec: Record, w: number, bits: number)
-        if bits == 0 then
-            return
-        end
-        local old = rec.words[w]
-        if old ~= nil and old ~= 0 then
-            rec.words[w] = bor(old, bits)
-        else
-            word_first(rec, w, bits)
-        end
-    end
-
-    -- Gives a record a change journal of `size` entries (a power of two). A new journal has
-    -- no entries: a query that has not seen the latest changes of the record scans it again.
-    local function journal_grow(rec: Record, size: number)
-        rec.journal = table.create(size * 2, 0)
-        rec.journal_mask = size - 1
-    end
-
     -- Rare paths of sig_add / sig_remove: records beyond the shared signature tables.
     local function sig_more_add(rec: Record, slot: number)
         local more = sig_more[slot]
@@ -2190,29 +3052,6 @@ local function world_new(debug: boolean?): World
         else
             sig_more_remove(rec, slot)
         end
-    end
-
-    -- Whether a new value page of a record is preallocated as an array: when the record is
-    -- dense around it (at least a quarter of the slots of this and the previous page are
-    -- members), as a page with 25-50 % of its slots used would otherwise stay in the hash part
-    -- of the table, which is slower to read. Sparse records keep small hash pages.
-    local function page_dense(rec: Record, page_index: number): boolean
-        -- the two pages are 16 aligned words inside one summary word (32 words)
-        local first_w = if page_index > 1 then (page_index - 2) * WORDS_PER_PAGE + 1 else 1
-        local sum = rec.sums[(first_w - 1) // 32 + 1]
-        if sum then
-            local nonempty = band(rshift(sum, (first_w - 1) % 32), 0xFFFF)
-            if popcount(nonempty) >= 8 then
-                local words = rec.words
-                local bits = 0
-                while nonempty ~= 0 do
-                    bits += popcount(words[first_w + countrz(nonempty)])
-                    nonempty = band(nonempty, nonempty - 1)
-                end
-                return bits >= PAGE_SIZE // 4
-            end
-        end
-        return false
     end
 
     -- Creates the value page of a record (see page_dense).
@@ -2255,9 +3094,10 @@ local function world_new(debug: boolean?): World
         return if page then page[slot % PAGE_SIZE + 1] else nil
     end
 
-    -- signal dispatchers per hook field and id, and for each of them the hook it calls, its
+    -- signal dispatchers per hook field and id, and for each of them the hook it calls (false
+    -- for none: a field that is always there costs no slow read in every dispatch), its
     -- listeners and the number of them that need to run when an entity is deleted (see connect)
-    type Dispatch = { hook: Hook?, listeners: { Hook }, loud: number }
+    type Dispatch = { hook: Hook | false, listeners: { Hook }, loud: number }
     local dispatchers: { [string]: { [i53]: Hook } } = { on_add = {}, on_change = {}, on_remove = {} }
     local dispatched_hooks: { [string]: { [i53]: Dispatch } } = { on_add = {}, on_change = {}, on_remove = {} }
 
@@ -2363,6 +3203,8 @@ local function world_new(debug: boolean?): World
         } :: any
         if with_values then
             rec.pages = {}
+        elseif kind ~= KIND_PAIR then
+            rec.pages = false
         end
         records[id] = rec
         records_generation += 1
@@ -2402,12 +3244,14 @@ local function world_new(debug: boolean?): World
                     at += 1
                 end
                 table.insert(hooked_list, at, k)
+                hooked_count += 1
             else
                 table.remove(hooked_list, table.find(hooked_list, k))
+                hooked_count -= 1
             end
         end
         local cell = dispatched_hooks.on_remove[if rec.kind == KIND_RELATION then rec.relation :: i53 else rec.id]
-        local loud = on and (cell == nil or cell.hook ~= nil or cell.loud > 0)
+        local loud = on and (cell == nil or cell.hook ~= false or cell.loud > 0)
         mask = hooked_delete[k] or 0
         if band(mask, bit) ~= 0 then
             mask -= bit
@@ -2557,12 +3401,11 @@ local function world_new(debug: boolean?): World
     local function record_create(id: i53): Record
         local slot = id % ENTITY_MASK
         id_used[slot] = true
+        used_stamp += 1
         local rec = new_record(id, KIND_PLAIN, has_component_trait(slot))
-        -- only hooks that exist are stored: a nil assigned to a new field of a full table grows it
-        local on_add = hook_for("on_add", EcsOnAdd, id)
-        if on_add then
-            rec.on_add = on_add
-        end
+        -- on_add is there, false without a hook (every add reads it); the other hooks only when
+        -- they exist: a nil assigned to a new field of a full table grows it
+        rec.on_add = hook_for("on_add", EcsOnAdd, id) or false
         local on_change = hook_for("on_change", EcsOnChange, id)
         if on_change then
             rec.on_change = on_change
@@ -2656,7 +3499,7 @@ local function world_new(debug: boolean?): World
     -- The value of a pair record for a slot.
     function mirror.value(rec: Record, slot: number): any
         local pages = rec.pages
-        if pages == nil then
+        if not pages then
             return nil
         end
         local page = pages[slot // PAGE_SIZE + 1]
@@ -2941,12 +3784,14 @@ local function world_new(debug: boolean?): World
             records_generation += 1
             changes_stamp += 1
             id_used[(target :: i53) % ENTITY_MASK] = true
+            used_stamp += 1
             return rec
         end
         rec = new_record(id, KIND_RELATION, false)
         rec.pairs = {}
         rec.relation = relation
         id_used[relation % ENTITY_MASK] = true
+        used_stamp += 1
         rec.slot_pair = {}
         rec.slot_pairs = {}
         if relation == EcsChildOf then
@@ -2989,10 +3834,14 @@ local function world_new(debug: boolean?): World
             wc_tgt.version += 1
             changes_stamp += 1
         end
-        -- only hooks that exist are stored: a nil assigned to a new field of a full table grows it
+        -- only hooks that exist are stored: a nil assigned to a new field of a full table grows it.
+        -- A pair without values also has on_add as false (every add reads it), which keeps it
+        -- within 16 fields; a pair with values has no room for it.
         local on_add = hook_for("on_add", EcsOnAdd, relation)
         if on_add then
             rec.on_add = on_add
+        elseif not rec.pages then
+            rec.on_add = false
         end
         local on_change = hook_for("on_change", EcsOnChange, relation)
         if on_change then
@@ -3003,37 +3852,6 @@ local function world_new(debug: boolean?): World
             rec.on_remove = on_remove
         end
         return rec
-    end
-
-    -- Adds a second or later pair of a relation to the slot: the pairs of a slot are kept in
-    -- a list ordered by target slot, and slot_pair holds the first one. Targets are mostly
-    -- added in the order they were created: such a pair goes to the end at once, any other
-    -- one finds its place by a binary search (an entity with many targets of a relation).
-    local function pair_attach_more(rec: Record, wc_rel: Record, slot: number, first: Record)
-        local slot_pairs = wc_rel.slot_pairs :: { [number]: { Record } }
-        local list = slot_pairs[slot]
-        if list == nil then
-            list = { first }
-            slot_pairs[slot] = list
-        end
-        local target_slot = (rec.target :: i53) % ENTITY_MASK
-        local n = #list
-        if (list[n].target :: i53) % ENTITY_MASK < target_slot then
-            list[n + 1] = rec
-        else
-            -- the first pair with a higher target slot
-            local lo, hi = 1, n
-            while lo < hi do
-                local mid = (lo + hi) // 2
-                if (list[mid].target :: i53) % ENTITY_MASK > target_slot then
-                    hi = mid
-                else
-                    lo = mid + 1
-                end
-            end
-            table.insert(list, lo, rec)
-        end
-        (wc_rel.slot_pair :: { [number]: Record })[slot] = list[1]
     end
 
     -- Removes a pair record from the relation record (R, *) and the target record (*, T) of the slot.
@@ -3216,8 +4034,10 @@ local function world_new(debug: boolean?): World
         if rec.journal then
             journal_write(rec, version, slot)
         end
-        local pages = rec.pages
-        if pages and with_value then
+        -- (an add without a value does not read the pages: a pair without values has no such field,
+        -- and a missing field is read slower than one that is there)
+        local pages = if with_value then rec.pages else nil
+        if pages then
             set_value(rec, slot, value)
         end
         -- attach to the relation record (R, *) and the target record (*, T)
@@ -3789,27 +4609,6 @@ local function world_new(debug: boolean?): World
     -- clear / delete
     ----------------------------------------------------------------------------
 
-    -- Appends the pairs of a relation record (R, *) of a slot that have on_remove hooks to
-    -- buffer (no table for a slot with one pair).
-    local function collect_pairs(rec: Record, slot: number, buffer: { Record }, n: number): number
-        local list = (rec.slot_pairs :: { [number]: { Record } })[slot]
-        if list then
-            for _, pair_rec in list do
-                if pair_rec.on_remove then
-                    n += 1
-                    buffer[n] = pair_rec
-                end
-            end
-        else
-            local pair_rec = (rec.slot_pair :: { [number]: Record })[slot]
-            if pair_rec and pair_rec.on_remove then
-                n += 1
-                buffer[n] = pair_rec
-            end
-        end
-        return n
-    end
-
     -- Appends the records with on_remove hooks among the ids of word k of a signature (rare
     -- path of run_remove_hooks: records beyond the shared signature tables).
     local function collect_hooked(slot: number, buffer: { Record }, n: number, k: number, mask: number): number
@@ -3873,10 +4672,10 @@ local function world_new(debug: boolean?): World
             end
             -- the next word with hooked bits, until the end of the list
             j0 += 1
-            k = hooked_list[j0]
-            if k == nil then
+            if j0 > hooked_count then
                 break
             end
+            k = hooked_list[j0]
             mask = band(sig_flat[k][slot] or 0, masks[k])
         end
         if more then
@@ -3900,6 +4699,21 @@ local function world_new(debug: boolean?): World
                     break
                 end
             end
+        end
+        if n == 1 and not check then
+            -- One hooked id, which no running removal concerns: nothing ran since it was collected
+            -- (its hook is there, the entity lives). Its hook runs at place 1, as in the loop below.
+            local rec = buffer[1]
+            local word = rec.words[slot // 32 + 1]
+            if word ~= nil and band(word, lshift(1, slot % 32)) ~= 0 then
+                frame.at = 1
+                local on_remove = rec.on_remove :: Hook
+                on_remove(entity, rec.id, deleting)
+            end
+            buffer[1] = nil :: any
+            clearing[depth] = nil :: any
+            clear_depth = depth - 1
+            return alive[slot] == entity
         end
         if check then
             frame.at = 0
@@ -3975,12 +4789,14 @@ local function world_new(debug: boolean?): World
     -- the signature again, because hooks may change the entity. Returns whether hooks ran:
     -- without them no code outside the library ran, and the entity lives as it did.
     local function clear_slot(entity: i53, slot: number, deleting: boolean?): boolean
-        local more = sig_more[slot]
+        -- (sig_more is empty while no record index went beyond the shared signature tables)
+        local more = if max_index > SIG_FLAT * 32 then sig_more[slot] else nil
         local masks = if deleting then hooked_delete else hooked
         -- the first word with hooked ids (see run_remove_hooks), among the words of the world
         -- that have hooked bits
         local k0, mask0, j0 = 0, 0, 0
-        for j, k in hooked_list do
+        for j = 1, hooked_count do
+            local k = hooked_list[j]
             local mask = sig_flat[k][slot]
             if mask then
                 mask = band(mask, masks[k])
@@ -3995,7 +4811,7 @@ local function world_new(debug: boolean?): World
             for k, mask in more do
                 if band(mask, masks[k] or 0) ~= 0 then
                     hooks = true
-                    j0 = #hooked_list -- only `more` has hooked ids
+                    j0 = hooked_count -- only `more` has hooked ids
                     break
                 end
             end
@@ -4004,7 +4820,7 @@ local function world_new(debug: boolean?): World
             if not run_remove_hooks(entity, slot, deleting, more, k0, mask0, j0) then
                 return true
             end
-            more = sig_more[slot]
+            more = if max_index > SIG_FLAT * 32 then sig_more[slot] else nil
         end
         -- The ids of the entity go now. Within the hooks of a clear or of a removal (both stacks
         -- are empty otherwise, see removing): the removals of them that run (whose hooks cleared
@@ -4266,7 +5082,8 @@ local function world_new(debug: boolean?): World
     -- words, and the last tick a change of each slot was recorded in
     local current_tick = 1
     local track_rings: { Record } = {}
-    local track_words: { Words } = {}
+    -- (made with an array part: every delete tests track_words[1], see world_delete)
+    local track_words: { Words } = table.create(1) :: { Words }
     local last_marked: { [number]: number } = {}
 
     -- Removes the id of a record from its members (members_of) before the record is freed:
@@ -4477,14 +5294,18 @@ local function world_new(debug: boolean?): World
         local delete_policy = used ~= nil and world_has_pair(entity, ECS_PAIR(EcsOnDelete, EcsDelete))
         -- the floor of the generations of the slot, taken with the uses (see floors)
         local floor: number? = nil
+        local stamp = used_stamp
         if clear_slot(entity, slot, true) then
             if alive[slot] ~= entity then
                 return -- deleted by a hook
             end
             -- The hooks may have used the entity as an id for the first time (giving it to another
             -- entity): those uses go by the default policy, its own ids being gone. A used entity
-            -- stays used while it lives (only the end of its delete clears the flag).
-            used = id_used[slot]
+            -- stays used while it lives (only the end of its delete clears the flag), so the flag
+            -- changes only with a mark made by the hooks (see used_stamp).
+            if used_stamp ~= stamp then
+                used = id_used[slot]
+            end
         end
         if used ~= nil then
             -- The uses of the entity as an id go. The hooks that run meanwhile may use it as an id
@@ -4526,7 +5347,7 @@ local function world_new(debug: boolean?): World
             for _, cells in dispatched_hooks do
                 local cell = cells[entity]
                 if cell then
-                    cell.hook = nil
+                    cell.hook = false
                 end
             end
             floor = floors[slot]
@@ -4536,7 +5357,8 @@ local function world_new(debug: boolean?): World
         end
         -- (the rounds above end with the entity alive and its uses gone: query shapes that a
         -- hook made with the entity marked it used again, and went with the next round)
-        local marked = last_marked[slot]
+        -- (only a world that tracks an id marks the changes of a slot)
+        local marked = if track_words[1] ~= nil then last_marked[slot] else nil
         if marked then
             last_marked[slot] = nil
         end
@@ -4676,6 +5498,7 @@ local function world_new(debug: boolean?): World
             if id // ENTITY_MASK + 1 < next_generation then
                 floors[slot] = next_generation
                 id_used[slot] = true -- (its delete takes the floor, see world_delete)
+                used_stamp += 1
             end
         end
         alive[slot] = id
@@ -5052,7 +5875,8 @@ local function world_new(debug: boolean?): World
         local rec = records[entity]
         if rec then
             local callback = chain_hooks(internal_hooks[field][entity], value);
-            (rec :: any)[field] = callback
+            -- (on_add stays there, false without a hook: see Record)
+            (rec :: any)[field] = if callback == nil and field == "on_add" then false else callback
             if field == "on_remove" then
                 set_hooked(rec, callback ~= nil)
             end
@@ -5060,7 +5884,11 @@ local function world_new(debug: boolean?): World
         local wc = records[ECS_PAIR(entity, EcsWildcard)]
         if wc and wc.pairs then
             for _, pair_rec in wc.pairs :: { [i53]: Record } do
-                (pair_rec :: any)[field] = value
+                (pair_rec :: any)[field] = if value == nil
+                        and field == "on_add"
+                        and not pair_rec.pages
+                    then false
+                    else value
             end
             if field == "on_remove" then
                 set_hooked(wc, value ~= nil)
@@ -5089,9 +5917,10 @@ local function world_new(debug: boolean?): World
     local function apply_hook(entity: i53, field: string, value: Hook?)
         local cell = dispatched_hooks[field][entity]
         if cell then
-            cell.hook = value
+            cell.hook = value or false
             if value ~= nil then
                 id_used[entity % ENTITY_MASK] = true -- (its delete drops the hook, see world_delete)
+                used_stamp += 1
             end
             if field == "on_remove" then
                 refresh_hooked(entity)
@@ -5114,8 +5943,9 @@ local function world_new(debug: boolean?): World
             local own_hook = if alive[id % ENTITY_MASK] == id then hook_of(HOOK_IDS[field], id % ENTITY_MASK) else nil
             if own_hook ~= nil then
                 id_used[id % ENTITY_MASK] = true -- (its delete drops the hook, see world_delete)
+                used_stamp += 1
             end
-            local created: Dispatch = { hook = own_hook, listeners = {}, loud = 0 }
+            local created: Dispatch = { hook = own_hook or false, listeners = {}, loud = 0 }
             cell = created
             local function dispatch(entity: i53, component: i53, value: any?)
                 local hook = created.hook
@@ -5156,7 +5986,7 @@ local function world_new(debug: boolean?): World
                 -- install_hook). A dispatch that is running keeps the listeners it started with.
                 dispatchers[field][id] = nil
                 dispatched_hooks[field][id] = nil
-                install_hook(id, field, dispatch_cell.hook)
+                install_hook(id, field, dispatch_cell.hook or nil)
             elseif not quiet and field == "on_remove" then
                 refresh_hooked(id)
             end
@@ -5481,53 +6311,6 @@ local function world_new(debug: boolean?): World
             query.scan_words = driver.word_count
         end
         return driver, others, without
-    end
-
-    -- Word tests of the general case (more than three other terms, or more than two excluded
-    -- ids): the bits of word w that match every term, and whether all of them do.
-    local function make_word_tests(
-        dwords: Words,
-        others: { Words },
-        without: { Words }
-    ): ((w: number) -> number, (w: number) -> boolean)
-        local n_others, n_without = #others, #without
-        local function word_mask(w: number): number
-            local m = dwords[w]
-            if m == nil then
-                return 0
-            end
-            for k = 1, n_others do
-                local o = others[k][w]
-                if o == nil then
-                    return 0
-                end
-                m = band(m, o)
-            end
-            for k = 1, n_without do
-                local x = without[k][w]
-                if x ~= nil then
-                    m = band(m, FULL_WORD - x)
-                end
-            end
-            return m
-        end
-        local function word_full(w: number): boolean
-            if dwords[w] ~= FULL_WORD then
-                return false
-            end
-            for k = 1, n_others do
-                if others[k][w] ~= FULL_WORD then
-                    return false
-                end
-            end
-            for k = 1, n_without do
-                if (without[k][w] or 0) ~= 0 then
-                    return false
-                end
-            end
-            return true
-        end
-        return word_mask, word_full
     end
 
     -- Span generator: each call gives (first, last, mask) or nil when done. A span never
@@ -6819,402 +7602,6 @@ local function world_new(debug: boolean?): World
         query.list_missing = missing
     end
 
-    local function list_iter(query: QueryState): (() -> ...any, () -> ())
-        local gitems = query.list_items
-        local sizes = query.list_sizes
-        local firsts = query.list_firsts
-        local first_lis = query.list_first_lis
-        local pages_lists = query.list_pages
-        local epoch = query.list_epoch
-        local n = #query.ids
-
-        -- @generated list_iterators begin
-        if n == 0 then
-            local g, j, last = 0, 0, 0
-            local items = EMPTY
-            return function(): ...any
-                local k = j + 2
-                if k > last then
-                    local next_g = g + 1
-                    local size = sizes[next_g]
-                    if size == nil then
-                        if g >= 0 then
-                            g = -1 -- the end is counted once
-                            if query.list_epoch == epoch then
-                                query.list_busy = false
-                                query.list_readers -= 1
-                            end
-                        end
-                        return nil
-                    end
-                    g = next_g
-                    if size == 1 then
-                        -- a group of one match: its array is not read
-                        j, last = 0, 0
-                        return firsts[next_g]
-                    end
-                    last = size * 2
-                    items = gitems[next_g]
-                    k = 2
-                end
-                j = k
-                return items[k - 1]
-            end, function()
-                g, j, last = 0, 0, 0
-            end
-        elseif n == 1 then
-            local g, j, last = 0, 0, 0
-            local items = EMPTY
-            local g1 = pages_lists[1]
-            local p1 = EMPTY
-            return function(): ...any
-                local k = j + 2
-                if k > last then
-                    local next_g = g + 1
-                    local size = sizes[next_g]
-                    if size == nil then
-                        if g >= 0 then
-                            g = -1 -- the end is counted once
-                            if query.list_epoch == epoch then
-                                query.list_busy = false
-                                query.list_readers -= 1
-                            end
-                        end
-                        return nil
-                    end
-                    g = next_g
-                    p1 = g1[next_g]
-                    if size == 1 then
-                        -- a group of one match: its array is not read
-                        j, last = 0, 0
-                        local li = first_lis[next_g]
-                        return firsts[next_g], p1[li]
-                    end
-                    last = size * 2
-                    items = gitems[next_g]
-                    k = 2
-                end
-                j = k
-                local li = items[k]
-                return items[k - 1], p1[li]
-            end, function()
-                g, j, last = 0, 0, 0
-            end
-        elseif n == 2 then
-            local g, j, last = 0, 0, 0
-            local items = EMPTY
-            local g1, g2 = pages_lists[1], pages_lists[2]
-            local p1, p2 = EMPTY, EMPTY
-            return function(): ...any
-                local k = j + 2
-                if k > last then
-                    local next_g = g + 1
-                    local size = sizes[next_g]
-                    if size == nil then
-                        if g >= 0 then
-                            g = -1 -- the end is counted once
-                            if query.list_epoch == epoch then
-                                query.list_busy = false
-                                query.list_readers -= 1
-                            end
-                        end
-                        return nil
-                    end
-                    g = next_g
-                    p1 = g1[next_g]
-                    p2 = g2[next_g]
-                    if size == 1 then
-                        -- a group of one match: its array is not read
-                        j, last = 0, 0
-                        local li = first_lis[next_g]
-                        return firsts[next_g], p1[li], p2[li]
-                    end
-                    last = size * 2
-                    items = gitems[next_g]
-                    k = 2
-                end
-                j = k
-                local li = items[k]
-                return items[k - 1], p1[li], p2[li]
-            end, function()
-                g, j, last = 0, 0, 0
-            end
-        elseif n == 3 then
-            local g, j, last = 0, 0, 0
-            local items = EMPTY
-            local g1, g2, g3 = pages_lists[1], pages_lists[2], pages_lists[3]
-            local p1, p2, p3 = EMPTY, EMPTY, EMPTY
-            return function(): ...any
-                local k = j + 2
-                if k > last then
-                    local next_g = g + 1
-                    local size = sizes[next_g]
-                    if size == nil then
-                        if g >= 0 then
-                            g = -1 -- the end is counted once
-                            if query.list_epoch == epoch then
-                                query.list_busy = false
-                                query.list_readers -= 1
-                            end
-                        end
-                        return nil
-                    end
-                    g = next_g
-                    p1 = g1[next_g]
-                    p2 = g2[next_g]
-                    p3 = g3[next_g]
-                    if size == 1 then
-                        -- a group of one match: its array is not read
-                        j, last = 0, 0
-                        local li = first_lis[next_g]
-                        return firsts[next_g], p1[li], p2[li], p3[li]
-                    end
-                    last = size * 2
-                    items = gitems[next_g]
-                    k = 2
-                end
-                j = k
-                local li = items[k]
-                return items[k - 1], p1[li], p2[li], p3[li]
-            end, function()
-                g, j, last = 0, 0, 0
-            end
-        elseif n == 4 then
-            local g, j, last = 0, 0, 0
-            local items = EMPTY
-            local g1, g2, g3, g4 = pages_lists[1], pages_lists[2], pages_lists[3], pages_lists[4]
-            local p1, p2, p3, p4 = EMPTY, EMPTY, EMPTY, EMPTY
-            return function(): ...any
-                local k = j + 2
-                if k > last then
-                    local next_g = g + 1
-                    local size = sizes[next_g]
-                    if size == nil then
-                        if g >= 0 then
-                            g = -1 -- the end is counted once
-                            if query.list_epoch == epoch then
-                                query.list_busy = false
-                                query.list_readers -= 1
-                            end
-                        end
-                        return nil
-                    end
-                    g = next_g
-                    p1 = g1[next_g]
-                    p2 = g2[next_g]
-                    p3 = g3[next_g]
-                    p4 = g4[next_g]
-                    if size == 1 then
-                        -- a group of one match: its array is not read
-                        j, last = 0, 0
-                        local li = first_lis[next_g]
-                        return firsts[next_g], p1[li], p2[li], p3[li], p4[li]
-                    end
-                    last = size * 2
-                    items = gitems[next_g]
-                    k = 2
-                end
-                j = k
-                local li = items[k]
-                return items[k - 1], p1[li], p2[li], p3[li], p4[li]
-            end, function()
-                g, j, last = 0, 0, 0
-            end
-        elseif n == 5 then
-            local g, j, last = 0, 0, 0
-            local items = EMPTY
-            local g1, g2, g3, g4, g5 = pages_lists[1], pages_lists[2], pages_lists[3], pages_lists[4], pages_lists[5]
-            local p1, p2, p3, p4, p5 = EMPTY, EMPTY, EMPTY, EMPTY, EMPTY
-            return function(): ...any
-                local k = j + 2
-                if k > last then
-                    local next_g = g + 1
-                    local size = sizes[next_g]
-                    if size == nil then
-                        if g >= 0 then
-                            g = -1 -- the end is counted once
-                            if query.list_epoch == epoch then
-                                query.list_busy = false
-                                query.list_readers -= 1
-                            end
-                        end
-                        return nil
-                    end
-                    g = next_g
-                    p1 = g1[next_g]
-                    p2 = g2[next_g]
-                    p3 = g3[next_g]
-                    p4 = g4[next_g]
-                    p5 = g5[next_g]
-                    if size == 1 then
-                        -- a group of one match: its array is not read
-                        j, last = 0, 0
-                        local li = first_lis[next_g]
-                        return firsts[next_g], p1[li], p2[li], p3[li], p4[li], p5[li]
-                    end
-                    last = size * 2
-                    items = gitems[next_g]
-                    k = 2
-                end
-                j = k
-                local li = items[k]
-                return items[k - 1], p1[li], p2[li], p3[li], p4[li], p5[li]
-            end, function()
-                g, j, last = 0, 0, 0
-            end
-        elseif n == 6 then
-            local g, j, last = 0, 0, 0
-            local items = EMPTY
-            local g1, g2, g3, g4, g5, g6 =
-                pages_lists[1], pages_lists[2], pages_lists[3], pages_lists[4], pages_lists[5], pages_lists[6]
-            local p1, p2, p3, p4, p5, p6 = EMPTY, EMPTY, EMPTY, EMPTY, EMPTY, EMPTY
-            return function(): ...any
-                local k = j + 2
-                if k > last then
-                    local next_g = g + 1
-                    local size = sizes[next_g]
-                    if size == nil then
-                        if g >= 0 then
-                            g = -1 -- the end is counted once
-                            if query.list_epoch == epoch then
-                                query.list_busy = false
-                                query.list_readers -= 1
-                            end
-                        end
-                        return nil
-                    end
-                    g = next_g
-                    p1 = g1[next_g]
-                    p2 = g2[next_g]
-                    p3 = g3[next_g]
-                    p4 = g4[next_g]
-                    p5 = g5[next_g]
-                    p6 = g6[next_g]
-                    if size == 1 then
-                        -- a group of one match: its array is not read
-                        j, last = 0, 0
-                        local li = first_lis[next_g]
-                        return firsts[next_g], p1[li], p2[li], p3[li], p4[li], p5[li], p6[li]
-                    end
-                    last = size * 2
-                    items = gitems[next_g]
-                    k = 2
-                end
-                j = k
-                local li = items[k]
-                return items[k - 1], p1[li], p2[li], p3[li], p4[li], p5[li], p6[li]
-            end, function()
-                g, j, last = 0, 0, 0
-            end
-        elseif n == 7 then
-            local g, j, last = 0, 0, 0
-            local items = EMPTY
-            local g1, g2, g3, g4, g5, g6, g7 =
-                pages_lists[1],
-                pages_lists[2],
-                pages_lists[3],
-                pages_lists[4],
-                pages_lists[5],
-                pages_lists[6],
-                pages_lists[7]
-            local p1, p2, p3, p4, p5, p6, p7 = EMPTY, EMPTY, EMPTY, EMPTY, EMPTY, EMPTY, EMPTY
-            return function(): ...any
-                local k = j + 2
-                if k > last then
-                    local next_g = g + 1
-                    local size = sizes[next_g]
-                    if size == nil then
-                        if g >= 0 then
-                            g = -1 -- the end is counted once
-                            if query.list_epoch == epoch then
-                                query.list_busy = false
-                                query.list_readers -= 1
-                            end
-                        end
-                        return nil
-                    end
-                    g = next_g
-                    p1 = g1[next_g]
-                    p2 = g2[next_g]
-                    p3 = g3[next_g]
-                    p4 = g4[next_g]
-                    p5 = g5[next_g]
-                    p6 = g6[next_g]
-                    p7 = g7[next_g]
-                    if size == 1 then
-                        -- a group of one match: its array is not read
-                        j, last = 0, 0
-                        local li = first_lis[next_g]
-                        return firsts[next_g], p1[li], p2[li], p3[li], p4[li], p5[li], p6[li], p7[li]
-                    end
-                    last = size * 2
-                    items = gitems[next_g]
-                    k = 2
-                end
-                j = k
-                local li = items[k]
-                return items[k - 1], p1[li], p2[li], p3[li], p4[li], p5[li], p6[li], p7[li]
-            end, function()
-                g, j, last = 0, 0, 0
-            end
-        elseif n == 8 then
-            local g, j, last = 0, 0, 0
-            local items = EMPTY
-            local g1, g2, g3, g4, g5, g6, g7, g8 =
-                pages_lists[1],
-                pages_lists[2],
-                pages_lists[3],
-                pages_lists[4],
-                pages_lists[5],
-                pages_lists[6],
-                pages_lists[7],
-                pages_lists[8]
-            local p1, p2, p3, p4, p5, p6, p7, p8 = EMPTY, EMPTY, EMPTY, EMPTY, EMPTY, EMPTY, EMPTY, EMPTY
-            return function(): ...any
-                local k = j + 2
-                if k > last then
-                    local next_g = g + 1
-                    local size = sizes[next_g]
-                    if size == nil then
-                        if g >= 0 then
-                            g = -1 -- the end is counted once
-                            if query.list_epoch == epoch then
-                                query.list_busy = false
-                                query.list_readers -= 1
-                            end
-                        end
-                        return nil
-                    end
-                    g = next_g
-                    p1 = g1[next_g]
-                    p2 = g2[next_g]
-                    p3 = g3[next_g]
-                    p4 = g4[next_g]
-                    p5 = g5[next_g]
-                    p6 = g6[next_g]
-                    p7 = g7[next_g]
-                    p8 = g8[next_g]
-                    if size == 1 then
-                        -- a group of one match: its array is not read
-                        j, last = 0, 0
-                        local li = first_lis[next_g]
-                        return firsts[next_g], p1[li], p2[li], p3[li], p4[li], p5[li], p6[li], p7[li], p8[li]
-                    end
-                    last = size * 2
-                    items = gitems[next_g]
-                    k = 2
-                end
-                j = k
-                local li = items[k]
-                return items[k - 1], p1[li], p2[li], p3[li], p4[li], p5[li], p6[li], p7[li], p8[li]
-            end, function()
-                g, j, last = 0, 0, 0
-            end
-        end
-        -- @generated list_iterators end
-        error("list mode supports at most 8 values") -- choose_mode never picks it for more
-    end
-
     -- Set by observe_record when a record of the query is not the one observed before.
     local observed_changed = false
 
@@ -7364,31 +7751,6 @@ local function world_new(debug: boolean?): World
 
     -- The arrays of removed groups, reused for new ones (patch_list), at most SPARE_ITEMS.
     local spare_items: { { number } } = {}
-
-    -- Gives a query copies of its list tables and of every group array: a loop over the
-    -- current list has not finished and keeps the old ones. The copies are the query's alone,
-    -- so the updates after this one change them in place, until a loop over them does not
-    -- finish before an update.
-    local function detach_list(query: QueryState)
-        query.list_gpages = table.clone(query.list_gpages)
-        local gitems = table.clone(query.list_items)
-        for g = 1, query.list_groups do
-            gitems[g] = table.clone(gitems[g])
-        end
-        query.list_items = gitems
-        query.list_sizes = table.clone(query.list_sizes)
-        query.list_firsts = table.clone(query.list_firsts)
-        query.list_first_lis = table.clone(query.list_first_lis)
-        local pages_lists = table.clone(query.list_pages)
-        for k, list in pages_lists do
-            pages_lists[k] = table.clone(list)
-        end
-        query.list_pages = pages_lists
-        query.list_step = nil
-        query.list_reset = nil
-        query.list_epoch += 1
-        query.list_readers = 0
-    end
 
     -- The words of the terms of a query for patch_list: a record keeps its words table while
     -- it lives, so the lists hold until a record is created or freed.
@@ -8064,186 +8426,6 @@ local function world_new(debug: boolean?): World
             return step, nil, nil
         end
         return direct_iter(query)
-    end
-
-    -- Callback loop over the match list of a cached query (see build_list).
-    local function list_each(query: QueryState, callback: (...any) -> ())
-        local n = #query.ids
-        local gitems = query.list_items
-        local sizes = query.list_sizes
-        local firsts = query.list_firsts
-        local first_lis = query.list_first_lis
-        local groups = query.list_groups
-        local pages_lists = query.list_pages
-
-        -- @generated list_each begin
-        if n == 0 then
-            for g = 1, groups do
-                local size = sizes[g]
-                if size == 1 then
-                    callback(firsts[g])
-                else
-                    local items = gitems[g]
-                    for k = 1, size * 2, 2 do
-                        callback(items[k])
-                    end
-                end
-            end
-            return
-        elseif n == 1 then
-            local g1 = pages_lists[1]
-            for g = 1, groups do
-                local size = sizes[g]
-                local p1 = g1[g]
-                if size == 1 then
-                    local li = first_lis[g]
-                    callback(firsts[g], p1[li])
-                else
-                    local items = gitems[g]
-                    for k = 2, size * 2, 2 do
-                        local li = items[k]
-                        callback(items[k - 1], p1[li])
-                    end
-                end
-            end
-            return
-        elseif n == 2 then
-            local g1, g2 = pages_lists[1], pages_lists[2]
-            for g = 1, groups do
-                local size = sizes[g]
-                local p1, p2 = g1[g], g2[g]
-                if size == 1 then
-                    local li = first_lis[g]
-                    callback(firsts[g], p1[li], p2[li])
-                else
-                    local items = gitems[g]
-                    for k = 2, size * 2, 2 do
-                        local li = items[k]
-                        callback(items[k - 1], p1[li], p2[li])
-                    end
-                end
-            end
-            return
-        elseif n == 3 then
-            local g1, g2, g3 = pages_lists[1], pages_lists[2], pages_lists[3]
-            for g = 1, groups do
-                local size = sizes[g]
-                local p1, p2, p3 = g1[g], g2[g], g3[g]
-                if size == 1 then
-                    local li = first_lis[g]
-                    callback(firsts[g], p1[li], p2[li], p3[li])
-                else
-                    local items = gitems[g]
-                    for k = 2, size * 2, 2 do
-                        local li = items[k]
-                        callback(items[k - 1], p1[li], p2[li], p3[li])
-                    end
-                end
-            end
-            return
-        elseif n == 4 then
-            local g1, g2, g3, g4 = pages_lists[1], pages_lists[2], pages_lists[3], pages_lists[4]
-            for g = 1, groups do
-                local size = sizes[g]
-                local p1, p2, p3, p4 = g1[g], g2[g], g3[g], g4[g]
-                if size == 1 then
-                    local li = first_lis[g]
-                    callback(firsts[g], p1[li], p2[li], p3[li], p4[li])
-                else
-                    local items = gitems[g]
-                    for k = 2, size * 2, 2 do
-                        local li = items[k]
-                        callback(items[k - 1], p1[li], p2[li], p3[li], p4[li])
-                    end
-                end
-            end
-            return
-        elseif n == 5 then
-            local g1, g2, g3, g4, g5 = pages_lists[1], pages_lists[2], pages_lists[3], pages_lists[4], pages_lists[5]
-            for g = 1, groups do
-                local size = sizes[g]
-                local p1, p2, p3, p4, p5 = g1[g], g2[g], g3[g], g4[g], g5[g]
-                if size == 1 then
-                    local li = first_lis[g]
-                    callback(firsts[g], p1[li], p2[li], p3[li], p4[li], p5[li])
-                else
-                    local items = gitems[g]
-                    for k = 2, size * 2, 2 do
-                        local li = items[k]
-                        callback(items[k - 1], p1[li], p2[li], p3[li], p4[li], p5[li])
-                    end
-                end
-            end
-            return
-        elseif n == 6 then
-            local g1, g2, g3, g4, g5, g6 =
-                pages_lists[1], pages_lists[2], pages_lists[3], pages_lists[4], pages_lists[5], pages_lists[6]
-            for g = 1, groups do
-                local size = sizes[g]
-                local p1, p2, p3, p4, p5, p6 = g1[g], g2[g], g3[g], g4[g], g5[g], g6[g]
-                if size == 1 then
-                    local li = first_lis[g]
-                    callback(firsts[g], p1[li], p2[li], p3[li], p4[li], p5[li], p6[li])
-                else
-                    local items = gitems[g]
-                    for k = 2, size * 2, 2 do
-                        local li = items[k]
-                        callback(items[k - 1], p1[li], p2[li], p3[li], p4[li], p5[li], p6[li])
-                    end
-                end
-            end
-            return
-        elseif n == 7 then
-            local g1, g2, g3, g4, g5, g6, g7 =
-                pages_lists[1],
-                pages_lists[2],
-                pages_lists[3],
-                pages_lists[4],
-                pages_lists[5],
-                pages_lists[6],
-                pages_lists[7]
-            for g = 1, groups do
-                local size = sizes[g]
-                local p1, p2, p3, p4, p5, p6, p7 = g1[g], g2[g], g3[g], g4[g], g5[g], g6[g], g7[g]
-                if size == 1 then
-                    local li = first_lis[g]
-                    callback(firsts[g], p1[li], p2[li], p3[li], p4[li], p5[li], p6[li], p7[li])
-                else
-                    local items = gitems[g]
-                    for k = 2, size * 2, 2 do
-                        local li = items[k]
-                        callback(items[k - 1], p1[li], p2[li], p3[li], p4[li], p5[li], p6[li], p7[li])
-                    end
-                end
-            end
-            return
-        elseif n == 8 then
-            local g1, g2, g3, g4, g5, g6, g7, g8 =
-                pages_lists[1],
-                pages_lists[2],
-                pages_lists[3],
-                pages_lists[4],
-                pages_lists[5],
-                pages_lists[6],
-                pages_lists[7],
-                pages_lists[8]
-            for g = 1, groups do
-                local size = sizes[g]
-                local p1, p2, p3, p4, p5, p6, p7, p8 = g1[g], g2[g], g3[g], g4[g], g5[g], g6[g], g7[g], g8[g]
-                if size == 1 then
-                    local li = first_lis[g]
-                    callback(firsts[g], p1[li], p2[li], p3[li], p4[li], p5[li], p6[li], p7[li], p8[li])
-                else
-                    local items = gitems[g]
-                    for k = 2, size * 2, 2 do
-                        local li = items[k]
-                        callback(items[k - 1], p1[li], p2[li], p3[li], p4[li], p5[li], p6[li], p7[li], p8[li])
-                    end
-                end
-            end
-            return
-        end
-        -- @generated list_each end
     end
 
     -- The callback loop of a query handle (Query.each).
@@ -9061,10 +9243,10 @@ local function world_new(debug: boolean?): World
             return
         end
         local pages = rec.pages
-        if set and value ~= nil and pages == nil then
+        if set and value ~= nil and not pages then
             error("cannot set a value on a tag; add the Component trait (world:component()) to store data", 3)
         end
-        local fill = set and pages ~= nil
+        local fill = set and pages ~= nil and pages ~= false
         local buffer = match_buffer
         local words = rec.words
         local st, sig_bit = rec.sig_table, rec.sig_bit
@@ -9210,120 +9392,6 @@ local function world_new(debug: boolean?): World
         return query
     end
 
-    -- A query state for the ids; `copy`, a query with the same ids, gives the flags of the ids.
-    local function new_query(ids: { i53 }, copy: QueryState?): QueryState
-        local wild_values, skip_disabled
-        if copy then
-            wild_values, skip_disabled = copy.wild_values, copy.skip_disabled
-        else
-            wild_values = false
-            for _, id in ids do
-                if id > PAIR_OFFSET and is_wildcard(id) then
-                    wild_values = true
-                end
-            end
-            skip_disabled = table.find(ids, EcsDisabled) == nil
-        end
-        -- only the fields that a query which is not cached reads: the first request of a shape
-        -- written inline is made on every call (make_cached adds the state of a cached query)
-        return {
-            ids = ids,
-            filter_with = ids,
-            is_cached = false,
-            listable = false,
-            mode = 0,
-            list_count = 0,
-            list_groups = 0,
-            scan_words = 0,
-            skip_disabled = skip_disabled,
-            wild_values = wild_values,
-        } :: any
-    end
-
-    -- Whether a query names Disabled in any of its terms.
-    local function names_disabled(query: QueryState): boolean
-        if
-            table.find(query.filter_with, EcsDisabled)
-            or (query.filter_without and table.find(query.filter_without, EcsDisabled))
-        then
-            return true
-        end
-        local groups = query.any_groups
-        if groups then
-            for _, group in groups do
-                if table.find(group, EcsDisabled) then
-                    return true
-                end
-            end
-        end
-        return false
-    end
-
-    -- The terms of a query changed in place: what a cached query observed no longer covers
-    -- them (the next iteration observes the records of the new terms and plans again).
-    local function forget_plan(query: QueryState)
-        query.mode = 0
-        -- (a nil assigned to a missing field would add the field)
-        if query.list_stamp ~= nil then
-            query.list_stamp = nil
-        end
-        if query.observed_generation ~= nil then
-            query.observed_generation = nil
-        end
-        if query.terms then
-            query.terms = nil
-        end
-    end
-
-    local function apply_with(query: QueryState, ...: i53): QueryState
-        local ids = query.ids
-        local n_ids, n_with = #ids, select("#", ...)
-        local with: { i53 } = table.create(n_ids + n_with) :: { i53 }
-        table.move(ids, 1, n_ids, 1, with)
-        for i = 1, n_with do
-            with[n_ids + i] = (select(i, ...))
-        end
-        query.filter_with = with
-        query.skip_disabled = not names_disabled(query)
-        forget_plan(query)
-        return query
-    end
-
-    local function apply_without(query: QueryState, ...: i53): QueryState
-        query.filter_without = { ... }
-        query.skip_disabled = not names_disabled(query)
-        forget_plan(query)
-        return query
-    end
-
-    -- A new, unshared copy of the terms of a query.
-    local function copy_query(query: QueryState): QueryState
-        local copy = new_query(query.ids, query)
-        if query.filter_with ~= query.ids then
-            copy.filter_with = table.clone(query.filter_with)
-        end
-        if query.filter_without then
-            copy.filter_without = table.clone(query.filter_without :: { i53 })
-        end
-        if query.any_groups then
-            copy.any_groups = table.clone(query.any_groups :: { { i53 } })
-        end
-        copy.skip_disabled = query.skip_disabled
-        return copy
-    end
-
-    local function apply_any(query: QueryState, ...: i53): QueryState
-        local groups = query.any_groups
-        if groups == nil then
-            groups = {}
-            query.any_groups = groups
-        end
-        table.insert(groups :: { { i53 } }, { ... })
-        query.skip_disabled = not names_disabled(query)
-        forget_plan(query)
-        return query
-    end
-
     -- A shape that has no shared state yet (the ids after owner[key]), with `state`, a new state
     -- of it. A shape is shared from its second request: a query requested once (an entity used
     -- as a term of a query written inline, a query built once at startup) costs neither a shared
@@ -9384,6 +9452,7 @@ local function world_new(debug: boolean?): World
                     key_add(shapes, slot, node, id)
                     -- world_delete of the entity prunes its shapes (see prune_shapes)
                     id_used[slot] = true
+                    used_stamp += 1
                 end
             end
             node = child
@@ -9599,7 +9668,7 @@ local function world_new(debug: boolean?): World
     -- id without hooks (nor tracking, signals or monitors) is toggled a word of 32 entities at a
     -- time; pairs and hooked ids go entity by entity through world:remove and world:add, and a
     -- match that the hook of an earlier one deleted is skipped. (Defined here, not as a local
-    -- function: world_new has used all its registers.)
+    -- function: it takes no register of world_new.)
     function Query.toggle_all(self: QueryHandle, id: i53)
         if debug then
             debug_check_id(alive, id, 3, false)
@@ -10277,7 +10346,7 @@ local function world_new(debug: boolean?): World
     world.range = world_range
     world.query = world_query
     -- Fast path: page table of a component (page index -> values of PAGE_SIZE slots). (These two
-    -- are written here, not as local functions: world_new has used all its registers.)
+    -- are written here, not as local functions: they take no registers of world_new.)
     world.column = function(_: any, id: i53): Pages
         return columns[id] or EMPTY_PAGES
     end
@@ -10287,7 +10356,7 @@ local function world_new(debug: boolean?): World
     world.ids = world_ids
 
     -- Adds the id when the entity does not have it and removes it when it does; true when it was
-    -- added. (Written here, not as local functions: world_new has used all its registers.)
+    -- added. (Written here, not as local functions: they take no registers of world_new.)
     world.toggle = function(_: any, entity: i53, id: i53): boolean
         if debug then
             debug_check_entity(alive, entity, 3)
@@ -10382,7 +10451,7 @@ local function world_new(debug: boolean?): World
 
     -- The builtin ids and the pre-registered ones: a function of its own, whose loops and
     -- calls take no registers of world_new (see the helpers before world_new), called at once
-    -- without a local (world_new has used all its registers).
+    -- without a local (it takes no register of world_new).
     (function()
         -- ids 1..EcsRest (and pre-registered tags) exist as entities
         for _ = 1, preregistered_tags do

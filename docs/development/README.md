@@ -247,7 +247,7 @@ heap of the target world not larger, and the behavior cases passed. Its release 
 changed behavior, the results of the suite and the memory of the target world.
 
 ```sh
-bash tools/workload.sh baseline=v0.2.4 release=yes          # full acceptance, both modes, 5 runs
+bash tools/workload.sh baseline=v1.0.0 release=yes          # full acceptance, both modes, 5 runs
 python tools/workload.py runs=10 tests=P1,P7 scales=sparse,target modes=native
 python tools/workload.py --luau /path/to/luau output=tmp/workload-custom
 ```
@@ -266,9 +266,9 @@ resolution; a difference of exactly the allowance (one step of the heap resoluti
 it. Candidate variation never enlarges it. A disputed row needs another 10–20
 repeats and investigation; overlapping ranges alone do not settle it.
 
-The [1.0.0 report](https://github.com/dubalda/mErCS/blob/main/bench/results/1.0.0.md) keeps the
-primary measurements and additional repeats together. It includes every initial flag,
-the combined decision and commands to reproduce the runs or verify the saved comparisons.
+The [1.0.1 report](https://github.com/dubalda/mErCS/blob/main/bench/results/1.0.1.md) keeps the
+measurements of the release run with the review of its flags (and any additional repeats
+together with them), and the commands to reproduce the runs or verify the saved comparisons.
 
 The default profiles are `sparse`, `small`, `target`, `small-empty-retained`,
 `target-empty-retained`, `client` and `buffers`. `release=yes` requires all profiles,
@@ -288,7 +288,7 @@ evidence. The measured tests are:
 | P3 | `world:each` over the holders of `(Trigger_k, agent)`: about 60 at the target scale, 2 at the small one |
 | P4 | the 25 stored queries at their periods (1 to 60 frames) while agents change and owned entities change state |
 | P5 | the messages of a frame handled (the walks of P3 and of `(Extra, agent)`, 3 values read per holder) and deleted, new ones made, the deferred ones visited: on average (2 / 5 messages a frame, 1 / 3 deferred ones at the small / target scale) and in a burst of activity (30 messages a frame, 60 / 300 deferred ones) |
-| P6 | the end of the activity of an agent, the removal of a retained agent (the cascade over its 500 owned entities, with removal listeners), a new agent with its owned entities; the median of the events of a run |
+| P6 | the end of the activity of an agent, the removal of a retained agent (the cascade over its 500 owned entities, with removal listeners), a new agent with its owned entities; the median of the events of a run; and the cascade of the removal of an agent alone, in a world of its own: 500 owned entities at the target scale, 15 at the small one, a removal listener on the state value of each and two on the agent (the median of 41 deletes) |
 | P7 | the frames of the model with the lifecycle events at their rate: µs per frame and ms of ECS work per second of server time |
 | P8 | the heap after build, after preceding measurement phases and 100 additional lifecycle rounds, then after 3 000, 6 000 and 9 000 more frames; bytes per distinct pair and per holder |
 | P9 | net heap growth during warmed frames and loops over a stored query or `world:each`; the first large snapshot in a fresh module |
@@ -354,7 +354,7 @@ of the later ones: by up to 30 % in some rows. The numbers of
 [the comparison](../comparison/jecs.md#performance) run each implementation in a process
 of its own (`impls=jecs`, `impls=previous`, `impls=lib`), 5 times in each mode, and take the
 medians. The
-[1.0.0 comparison evidence](https://github.com/dubalda/mErCS/blob/main/bench/results/1.0.0-comparison.md)
+[1.0.1 comparison evidence](https://github.com/dubalda/mErCS/blob/main/bench/results/1.0.1-comparison.md)
 includes the full ranges, raw samples, source hashes and isolated entry points for reproducing
 the matrix, synthetic frame, long session and memory probes.
 
@@ -393,7 +393,7 @@ first loops included; the matrix takes the minimum of several runs.
 `jecs/test/benches/visual`): `ParameterGenerator`, `BeforeAll` / `AfterAll` /
 `BeforeEach` / `AfterEach` and `Functions` with an entry for jecs and one for mErCS, and one for
 ecr in the four basic benchmarks of jecs, named with their versions (`jecs 0.11.0`,
-`mErCS 1.0.0`, `ecr 0.9.0`: `libs.luau` reads the versions of jecs and ecr from their Wally
+`mErCS 1.0.1`, `ecr 0.9.0`: `libs.luau` reads the versions of jecs and ecr from their Wally
 packages and holds the version of mErCS). The parameters are generated before every call and
 give each function its own fresh world. ecr declares its component types before the registries
 that use them, so its files make them once, when they are required. `bench/basic.luau` runs the
@@ -501,15 +501,15 @@ To release a version:
    shows `CHANGELOG.md` as its Changelog page.
 2. Set the version (without the `v`) in `wally.toml`, and in the output of the benchmarks:
    `library` in `bench/versions.luau` and `LIBRARY_VERSION` in `bench/visual/libs.luau`.
-3. Run `python tools/workload.py baseline=v0.2.4 release=yes` (the tag of the previous
+3. Run `python tools/workload.py baseline=v1.0.0 release=yes` (the tag of the previous
    release). Review performance and long-session memory, and save the report and
    raw samples under `bench/results/`. Summarize both modes/scales and every observable
    behavior change in the release notes.
 4. Commit, wait for a green CI, then push the tag:
 
 ```sh
-git tag -a v1.0.0 -m "mErCS v1.0.0"
-git push origin v1.0.0
+git tag -a v1.0.1 -m "mErCS v1.0.1"
+git push origin v1.0.1
 ```
 
 Settings of the GitHub repository:
