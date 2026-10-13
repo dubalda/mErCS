@@ -8,33 +8,34 @@ memory does not grow with the number of component combinations, and there is not
 up. The API follows [jecs](https://github.com/Ukendio/jecs); moving jecs code over takes a few
 mechanical changes (see [Migrating from jecs](docs/comparison/jecs.md#migrating-from-jecs)).
 
-Version 1.0.1 is validated with the standalone `luau` 0.740 CLI (interpreter and native code
+Version 1.1.0 is validated with the standalone `luau` 0.740 CLI (interpreter and native code
 generation); the [Benchmarker](docs/comparison/benchmarker.md) results were captured in Roblox
 Studio with 1.0.0, and the full Studio check (`studio/`) is pending.
 
-The [1.0.1 reference workload report](https://github.com/dubalda/mErCS/blob/main/bench/results/1.0.1.md)
-compares this version with 1.0.0 and includes raw measurements, controls and reproduction commands.
+The [1.1.0 reference workload report](https://github.com/dubalda/mErCS/blob/main/bench/results/1.1.0.md)
+compares this version with 1.0.1 and includes raw measurements, controls and reproduction commands.
 
 ## Why
 
-| | jecs 0.11.0 | mErCS 1.0.1 |
+| | jecs 0.11.0 | mErCS 1.1.0 |
 |---|---|---|
 | add / remove a component | moves the entity, copies all its columns | sets a bit and a value: O(1) |
 | new combination of components | creates an archetype, kept until `world:cleanup()` | nothing to create |
 | pair with many targets | an archetype per target | one small record per pair, freed when unused (in batches) or with its target |
-| a synthetic game frame (interpreter / native) | 5.2 / 4.48 ms | 2.26 / 1.66 ms |
+| a synthetic game frame (interpreter / native) | 6.8 / 5.93 ms | 2.72 / 1.95 ms |
 | heap growth with changing targets after 5000 frames (interpreter) | +15.38 MiB | +0.32 MiB |
 | memory per entity with 4 components | 320 B | 131 B |
 
 On the [query cases](docs/comparison/jecs.md#query-cases) where an archetype ECS is
-expected to be at its best, mErCS 1.0.1 takes 0.44–0.79× of the time of jecs 0.11.0 in native
+expected to be at its best, mErCS 1.1.0 takes 0.45–0.82× of the time of jecs 0.11.0 in native
 code. The [comparison](docs/comparison/jecs.md#performance) gives the ranges and the raw
 samples; [ecr](docs/comparison/ecr.md) has a page of its own, and the Roblox Studio screenshots
 are on [Benchmarker](docs/comparison/benchmarker.md).
 
 Beyond jecs: `query:each` (the fastest loop), OR terms, batch operations on query matches,
 toggles, change tracking by ticks and of new entities, disabled entities, hierarchies of any
-depth, slot pools. Query
+depth, slot pools, a read of a component that an entity must have (`world:expect`, an error
+that names both instead of `nil`). Query
 monitors (`query:monitor()`) take the place of the monitors of the jecs addon `modules/OB`.
 
 ## Installation
@@ -42,7 +43,7 @@ monitors (`query:monitor()`) take the place of the monitors of the jecs addon `m
 Copy `src/init.luau` into your project as a ModuleScript (for example
 `ReplicatedStorage.mErCS`; `src/jabby.luau` is an optional child module for the jabby
 debugger), or sync the repository with Rojo (`default.project.json`), or depend on it through
-Wally (`mercs = "dubalda/mercs@1.0.1"`). The module has no dependencies; `--!native` is enabled
+Wally (`mercs = "dubalda/mercs@1.1.0"`). The module has no dependencies; `--!native` is enabled
 at the top of the file.
 
 ## Quick start
@@ -88,7 +89,7 @@ from the doc comments of `src/`) and these pages:
 
 - [Guide](docs/guide/README.md) — worlds, components, queries, batch operations, relationships,
   hooks, query monitors, change tracking, the jabby adapter, types.
-- [Comparison](docs/comparison/README.md) — the Benchmarker screenshots, 1.0.1 against 1.0.0,
+- [Comparison](docs/comparison/README.md) — the Benchmarker screenshots, 1.1.0 against 1.0.1,
   and jecs and ecr: design, differences, benchmarks, migrating.
 - [Development](docs/development/README.md) — layout, tests, checks, benchmarks, Roblox Studio,
   CI and releases.

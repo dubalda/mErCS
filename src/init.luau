@@ -92,7 +92,8 @@
     entities may or may not be seen by the running loop; an entity deleted ahead of the loop
     may still be returned once (world:contains tells).
 
-    get/has take at most 8 ids (get_list/has_all take any number); hooks get (entity, id,
+    get/has take at most 8 ids (get_list/has_all take any number); world:expect reads one id
+    that the entity must have (instead of nil, an error that names both); hooks get (entity, id,
     value); query:each is the fastest way to iterate. The API reference is the block of doc
     comments after the types (published on the documentation site); docs/guide/README.md is the guide.
 ]]
@@ -357,6 +358,8 @@ export type World = {
             ...Id<any>
         ) -> ...any),
     get_list: (self: World, entity: Id<any>, ids: { Id<any> }, out: { any }?) -> { any },
+    -- the value of an id that the entity must have: instead of nil, an error that names both
+    expect: <T>(self: World, entity: Id<any>, id: Id<T>) -> T,
     has: (self: World, entity: Id<any>, ...Id<any>) -> boolean,
     has_all: (self: World, entity: Id<any>, ids: { Id<any> }) -> boolean,
     remove: (self: World, entity: Id<any>, id: Id<any>) -> (),
@@ -853,6 +856,30 @@ export type World = {
     @param out { any }? -- the table to fill; a new one when nil
     @return { any }
     The values of any number of ids.
+]=]
+
+--[=[
+    @method expect
+    @within World
+    @param entity Id
+    @param id Id<T> -- a component or a pair that holds data
+    @return T
+    The value of `id` on the entity, for an id that the entity must have: [World:get] of one id
+    that raises an error instead of returning nil. The error names the entity and the id by
+    their [mErCS.Name], else by their number, and says what is missing:
+
+    ```
+    entity "Goblin" (#4194561) has no Health
+    entity "Goblin" (#4194561) has Health without a value
+    entity "Goblin" (#4194561): Frozen is a tag, it has no value
+    entity "Goblin" (#4194561) has no #300 (the id is not alive)
+    entity #4194561 is not alive: an outdated handle or a deleted entity (expect Health)
+    ```
+
+    A component added without a value ([World:add], or `set` with nil) has none; a tag never
+    has one. A wildcard pair reads as in [World:get]: the value of the pair with the lowest
+    target slot for `(R, *)`, with the lowest relation slot for `(*, T)`. A read costs what
+    [World:get] of one id costs; the message is made only for the error.
 ]=]
 
 --[=[
@@ -2571,6 +2598,60 @@ local function debug_check_id(alive: { number }, id: i53, level: number, allow_w
             level
         )
     end
+end
+
+-- The message of world:expect when the entity has no value of the id (see World.expect): what is
+-- missing, with the entity named `"Name" (#id)` and the id `Name` by their Name, else `#id` (a pair
+-- `(R, T)`, the wildcard `*`). It reads the world through its methods, so that it takes no
+-- registers of world_new and costs only when there is an error. It returns the message:
+-- world:expect raises the error itself, at the level of its caller (the compiler may inline this
+-- function).
+local function expect_message(world: any, entity: i53, id: i53): string
+    local alive: { number } = world:alive_table()
+    -- an element of an id by its Name, else by its number (a slot for an element of a pair that
+    -- has no live entity)
+    local function label(x: number?, slot: number): string
+        if x == nil then
+            return `#{slot}`
+        elseif x == EcsWildcard then
+            return "*"
+        end
+        local name = world:get(x, EcsName)
+        return if type(name) == "string" then name else `#{x}`
+    end
+    local id_label: string
+    local id_alive: boolean
+    -- the id holds no value: a plain id without the Component trait, a pair whose relation and
+    -- target have none (a wildcard reads the pairs it stands for, as world:get does)
+    local tag = false
+    if id > PAIR_OFFSET then
+        local first, second = alive[ECS_PAIR_FIRST(id)], alive[ECS_PAIR_SECOND(id)]
+        local relation = if first and first > 0 then first else nil
+        local target = if second and second > 0 then second else nil
+        id_label = `({label(relation, ECS_PAIR_FIRST(id))}, {label(target, ECS_PAIR_SECOND(id))})`
+        id_alive = relation ~= nil and target ~= nil
+        tag = id_alive
+            and not is_wildcard(id)
+            and not world:has(relation, EcsComponent)
+            and not world:has(target, EcsComponent)
+    else
+        id_alive = alive[id % ENTITY_MASK] == id
+        id_label = if id_alive then label(id, id) else `#{id}`
+        tag = id_alive and not world:has(id, EcsComponent)
+    end
+    if alive[entity % ENTITY_MASK] ~= entity then
+        return `entity #{entity} is not alive: an outdated handle or a deleted entity (expect {id_label})`
+    end
+    local name = world:get(entity, EcsName)
+    local who = if type(name) == "string" then `"{name}" (#{entity})` else `#{entity}`
+    if not id_alive then
+        return `entity {who} has no {id_label} (the id is not alive)`
+    elseif tag then
+        return `entity {who}: {id_label} is a tag, it has no value`
+    elseif world:has(entity, id) then
+        return `entity {who} has {id_label} without a value`
+    end
+    return `entity {who} has no {id_label}`
 end
 
 -- A query must select entities: a required id, an OR term or a change filter. Excluded ids
@@ -10376,6 +10457,27 @@ local function world_new(debug: boolean?): World
         end
         world_add(world, entity, id)
         return true
+    end
+
+    -- The value of an id that the entity must have: world_get of one id, and instead of nil an
+    -- error that names both (see expect_message), raised at the level of the caller. (Written
+    -- here, not as a local function: it takes no register of world_new.)
+    world.expect = function(_: any, entity: i53, id: i53): any
+        local slot = entity % ENTITY_MASK
+        if alive[slot] == entity then
+            local column = columns[id]
+            local value: any
+            if column then
+                local page = column[slot // PAGE_SIZE + 1]
+                value = if page then page[slot % PAGE_SIZE + 1] else nil
+            else
+                value = value_of(id, slot)
+            end
+            if value ~= nil then
+                return value
+            end
+        end
+        error(expect_message(world, entity, id), 2)
     end
 
     -- Starts recording the entities made from now on (world:entity, a pool, world:entity(id)

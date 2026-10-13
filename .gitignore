@@ -45,3 +45,6 @@ __pycache__/
 .mcp.json
 
 AGENTS.md
+
+.claude
+

@@ -34,6 +34,8 @@ world:set(e, ecs.pair(Likes, Health), "five") -- error: Expected this to be 'num
 -- values read into variables of another type, also in another order
 local wrong: string? = world:get(e, Health) -- error: Expected this to be 'string?', but got 'number?'
 local swapped_h: number?, swapped_l: string? = world:get(e, Label, Health) -- error: Expected this to be 'number?', but got 'string?'
+local expected: string = world:expect(e, Health) -- error: Expected this to be 'string', but got 'number'
+local expected_pair: string = world:expect(e, ecs.pair(Owns, item)) -- error: Expected this to be 'string', but got 'number'
 
 -- callbacks and loops that take a value of another type
 world:query(Health):each(function(_entity, _value: string) end) -- error: Expected the 2nd parameter to be a supertype of
