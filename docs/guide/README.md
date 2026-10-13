@@ -103,6 +103,13 @@ world:toggle(e, Frozen)              -- adds it when absent, removes it when pre
   `world:clear`), raises an error and changes nothing; `world:delete` deletes a used component
   as any id.
 - `get` and `has` take up to 8 ids; `get_list` and `has_all` take any number.
+- `world:expect(e, id)` reads an id that the entity must have (a component set when the entity
+  is created): `get` of one id whose value is typed without `nil`, and which raises an error
+  instead of returning `nil`. The error names the entity and the id by their `Name`, else by
+  their number, and says what is missing: `entity "Goblin" (#4194561) has no Health`, `has
+  Health without a value` (a component added without one, or set to `nil`), `Frozen is a tag, it
+  has no value`, or that the entity or the id is not alive. A read costs what `get` of one id
+  costs.
 - `world:toggle(e, id)` adds an id that the entity does not have (a component gets no value)
   and removes one that it has, with the hooks, signals and change tracking of `add` and
   `remove`, and returns true when it added the id; `query:toggle_all(id)` does it for every
@@ -563,13 +570,14 @@ A component that is present with no value (`world:add`) also gets one here.
 ## Types
 
 `world:component()` returns `Component<unknown>`; a cast gives it the data type, and then
-`get`, `set` and queries are typed:
+`get`, `expect`, `set` and queries are typed:
 
 ```luau
 local Position = world:component() :: ecs.Component<Vector3>
 local Health = world:component() :: ecs.Component<number>
 
 local position: Vector3? = world:get(e, Position)
+local health: number = world:expect(e, Health) -- no nil: a missing value is an error
 for entity, position, health in world:query(Position, Health) do end -- Vector3, number
 ```
 

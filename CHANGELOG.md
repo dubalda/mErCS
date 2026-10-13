@@ -1,5 +1,94 @@
 # Changelog
 
+## v1.1.0 — 2026-10-13
+
+### Changed behavior
+
+None: what the calls of 1.0.1 return, in which order, what a loop sees and which errors are
+raised stay those of 1.0.1. The release adds a method.
+
+### Added
+
+- `world:expect(entity, id)`: the value of an id that the entity must have (a component set when
+  the entity is created and never removed). It reads like `world:get` of one id; its value is
+  typed without `nil` (`<T>(self: World, entity: Id<any>, id: Id<T>) -> T`), and instead of
+  `nil` it raises an error that names the entity and the id by their `Name`, else by their
+  number, and says what is missing:
+  - `entity "Goblin" (#4194561) has no Health`;
+  - `entity "Goblin" (#4194561) has Health without a value`: a component added without a value
+    (`world:add`), or set to `nil`;
+  - `entity "Goblin" (#4194561): Frozen is a tag, it has no value`, also for a pair whose
+    relation and target are tags;
+  - `entity "Goblin" (#4194561) has no #300 (the id is not alive)`;
+  - `entity #4194561 is not alive: an outdated handle or a deleted entity (expect Health)`.
+
+  The error points at the line that called `expect`, in a world with or without debug checks. A
+  wildcard pair reads as in `get`: the value of the pair with the lowest target slot for
+  `(R, *)`, with the lowest relation slot for `(*, T)`. A read takes 26.6 ns in native code,
+  where `get` of one id takes 32.7 ns (it takes up to 8 ids) and a method over `get` written in
+  Luau that checks for `nil` 46.2 ns; 54.2 ns in the interpreter (`get` 53.6 ns, the method
+  67.3 ns): one read per call over 700 entities, the median of 6 processes, Luau 0.740 `-O2`.
+  The message is built only for the error. The method is a field of the world: it takes no
+  register of the function that builds a world.
+
+### Tests and tools
+
+- `test/lib.luau`: `world:expect` in a world with and without debug checks: the value of a
+  component (`false` too), of a data pair and of both wildcards, and each error with its text and
+  the line it points at.
+- `test/types.luau`: the value of `world:expect` is typed without `nil`, also for a data pair;
+  `test/typecheck/errors.luau`: reading it as another type is rejected.
+
+### Documentation
+
+- The API reference and the guide describe `world:expect`; the jecs page lists it beyond jecs.
+- The comparison pages, the README and the page of the previous release carry the measurements of
+  1.1.0.
+
+### Performance on the reference workload
+
+Both versions are measured with the reference workload model of this release on Luau 0.740,
+`-O2`, in the interpreter and native code. The
+[full report](https://github.com/dubalda/mErCS/blob/main/bench/results/1.1.0.md) and
+[raw samples](https://github.com/dubalda/mErCS/blob/main/bench/results/1.1.0.json) contain 232
+comparison rows from 280 isolated processes: no timing regression beyond the measured control
+noise; the memory row that the report flags is the constant heap of a world (see Memory). 1.1.0
+changes no path that the suite measures and improves no test: the two rows faster beyond the
+noise (native code, target scale, retained agents without owned entities: P2 with one stored
+query per system tag 0.93×, P5 messages on average 0.89×) run code that this release does not
+change. The frame model (P7) and the lifecycle events of P6 stay within the noise (µs, medians
+[min–max] of each version's two control columns):
+
+| Mode | Scale | P7, µs/frame: 1.0.1 → 1.1.0 | P6, the removal of a retained agent, µs: 1.0.1 → 1.1.0 |
+|---|---|---|---|
+| native | small | 108.88 [101.65–125.30] → 105.90 [99.28–122.02] | 57.60 [50.15–75.45] → 53.95 [51.50–68.75] |
+| native | target | 366.83 [349.42–466.06] → 359.42 [345.75–408.82] | 1108.9 [1055.0–1188.1] → 1095.4 [1069.3–1190.4] |
+| native | small-empty-retained | 104.30 [102.02–119.51] → 107.23 [103.30–117.07] | 17.52 [14.80–21.00] → 19.10 [14.90–25.20] |
+| native | target-empty-retained | 355.92 [333.93–415.20] → 342.58 [324.46–367.51] | 27.2 [24.8–29.4] → 24.6 [22.2–28.6] |
+| interpreter | small | 172.42 [162.41–187.42] → 168.66 [159.70–195.57] | 89.55 [74.40–119.70] → 84.15 [72.30–105.65] |
+| interpreter | target | 564.54 [520.22–827.88] → 531.89 [503.52–655.72] | 1829.5 [1565.5–2006.5] → 1652.0 [1590.6–2008.9] |
+| interpreter | small-empty-retained | 165.47 [159.51–195.98] → 170.18 [156.58–185.36] | 28.48 [23.60–52.30] → 27.12 [22.90–45.05] |
+| interpreter | target-empty-retained | 531.90 [486.56–616.10] → 527.34 [495.73–632.36] | 36.0 [33.6–64.9] → 37.4 [33.7–47.0] |
+
+Single operations ([1.1.0 and 1.0.1](https://github.com/dubalda/mErCS/blob/main/docs/comparison/previous-release.md),
+measured with the comparison with jecs) have a median ratio of 0.99× in both modes over 113
+rows. 1.1.0 does not change their code, and the rows that move beyond a few percent move both
+ways: in native code `get` of one id (0.72×) and `target` (0.79×) are faster in these runs, 15
+cached queries over scattered entities (1.20×) and `query(A, pair(ChildOf, parent))` per parent
+(1.24×) slower.
+
+### Memory
+
+A new world takes 1 131 bytes more: 55 992 instead of 54 861 bytes (200 worlds kept alive), the
+closure of `world:expect` (about 100 bytes) and its field: the table of a world had 32 fields,
+and the 33rd doubles its hash part (1 024 bytes). There is no new per-entity, per-pair or
+per-query field: the heap of the target world (P8) is 137.63 MB after it is built and 138.57 MB
+after 100 lifecycle rounds in both versions, a distinct pair with its holder takes 1 527.8 bytes
+and a holder of a pair 37.1 bytes. The heap rows of P8 measure whole worlds in KiB, so this
+constant moves them by 1 or 2 KiB; one row is flagged (native, small-empty-retained, the heap
+after 6000 more frames: +2 KiB), and nothing accumulates over the lifecycle rounds and the long
+sessions.
+
 ## v1.0.1 — 2026-10-02
 
 ### Changed behavior

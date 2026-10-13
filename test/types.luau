@@ -39,6 +39,11 @@ local _has: boolean = world:has(e, Position, Velocity)
 local _many: { any } = world:get_list(e, { Position, Velocity, Health })
 assert(position and position.x == 0, "typed get")
 
+-- expect returns the data type without nil (a missing value is an error)
+local required: Vec = world:expect(e, Position)
+local _required_health: number = world:expect(e, Health)
+assert(required.x == 0, "typed expect")
+
 -- queries: for-in and each give typed values
 for entity, p, v in world:query(Position, Velocity) do
     local _p: Vec = p
@@ -60,6 +65,7 @@ local Owns = world:component() :: ecs.Component<number>
 local item = world:entity()
 world:set(e, ecs.pair(Owns, item), 5)
 local _count: number? = world:get(e, ecs.pair(Owns, item))
+local _required_count: number = world:expect(e, ecs.pair(Owns, item))
 local parent = world:entity()
 world:add(e, ecs.pair(ecs.ChildOf, parent))
 local _parent: ecs.Entity? = world:parent(e)

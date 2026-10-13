@@ -4,10 +4,10 @@
     Tests of mErCS features that the shared core suite (test/core.luau) and the jecs
     suite (test/jecs_compat) do not cover: query:each, cached query list mode and its patches
     after small changes (and passes over the bitsets after many), empty queries, changes during
-    iteration, more than 4 ids in get/has, relationships and (*, T) targets (also before their
-    first read), slot pools, large worlds, cleanup without leftovers, signals, hooks of ids
-    beyond the shared signature tables and of a word of them that loses its last hooked id,
-    cascades deeper than 100 levels, hooks and signals on
+    iteration, more than 4 ids in get/has, world:expect and its errors, relationships and
+    (*, T) targets (also before their first read), slot pools, large worlds, cleanup without
+    leftovers, signals, hooks of ids beyond the shared signature tables and of a word of them
+    that loses its last hooked id, cascades deeper than 100 levels, hooks and signals on
     builtin ids, pair records freed in batches, the shared query shapes of deleted entities,
     the iteration contexts that queries which are not cached reuse, the values of wildcard
     pairs (their mirrors), world:each and world:children over large records, query shapes
@@ -493,6 +493,138 @@ TEST("get and has with many ids", function()
     CHECK(world:has_all(e, ids))
     world:remove(e, ids[11])
     CHECK(not world:has_all(e, ids))
+end)
+
+TEST("expect: the value of an id that the entity must have", function()
+    -- the message of the error that a call raises
+    local function failure(call: () -> ()): string
+        local ok, message = pcall(call)
+        CHECK(not ok)
+        return tostring(message)
+    end
+    local function contains(text: string, part: string): boolean
+        return string.find(text, part, 1, true) ~= nil
+    end
+
+    for _, debug in { false, true } do
+        local kind = if debug then " (debug world)" else ""
+        local world = ecs.world(debug)
+        local Health = world:component() :: ecs.Component<number>
+        local Alive = world:component() :: ecs.Component<boolean>
+        local Owns = world:component() :: ecs.Component<number>
+        local Unnamed = world:component() :: ecs.Component<number>
+        local Frozen, Likes = world:entity(), world:entity()
+        world:set(Health, ecs.Name, "Health")
+        world:set(Alive, ecs.Name, "Alive")
+        world:set(Owns, ecs.Name, "Owns")
+        world:set(Frozen, ecs.Name, "Frozen")
+        local goblin = world:entity()
+        world:set(goblin, ecs.Name, "Goblin")
+        local item, other = world:entity(), world:entity()
+        world:set(other, ecs.Name, "Other")
+        world:set(goblin, Health, 10)
+        world:set(goblin, Alive, false)
+        world:set(goblin, pair(Owns, item), 3)
+        world:set(goblin, pair(Owns, other), 7)
+        local untyped: any = world
+
+        CASE(`the value of a component, of a data pair and of a wildcard as get reads it{kind}`)
+        CHECK(world:expect(goblin, Health) == 10)
+        CHECK(world:expect(goblin, Alive) == false) -- false is a value
+        CHECK(world:expect(goblin, pair(Owns, other)) == 7)
+        -- (R, *): the pair with the lowest target slot; (*, T): with the lowest relation slot
+        CHECK(world:expect(goblin, pair(Owns, ecs.Wildcard)) == 3)
+        CHECK(untyped:expect(goblin, pair(ecs.Wildcard, other)) == 7)
+
+        CASE(`an id that the entity does not have, named by Name or by number{kind}`)
+        local plain = world:entity()
+        CHECK(contains(
+            failure(function()
+                world:expect(plain, Health)
+            end),
+            `entity #{plain} has no Health`
+        ))
+        CHECK(contains(
+            failure(function()
+                world:expect(goblin, Unnamed)
+            end),
+            `entity "Goblin" (#{goblin}) has no #{Unnamed}`
+        ))
+        CHECK(contains(
+            failure(function()
+                world:expect(plain, pair(Owns, other))
+            end),
+            `entity #{plain} has no (Owns, Other)`
+        ))
+        CHECK(contains(
+            failure(function()
+                world:expect(plain, pair(Owns, ecs.Wildcard))
+            end),
+            `entity #{plain} has no (Owns, *)`
+        ))
+
+        CASE(`a component without a value: added without one, or set to nil{kind}`)
+        world:add(plain, Health)
+        CHECK(contains(
+            failure(function()
+                world:expect(plain, Health)
+            end),
+            `entity #{plain} has Health without a value`
+        ))
+        untyped:set(goblin, Health, nil)
+        CHECK(world:has(goblin, Health))
+        CHECK(contains(
+            failure(function()
+                world:expect(goblin, Health)
+            end),
+            `entity "Goblin" (#{goblin}) has Health without a value`
+        ))
+
+        CASE(`a tag and a tag pair have no value, whether the entity has them or not{kind}`)
+        world:add(goblin, Frozen)
+        CHECK(contains(
+            failure(function()
+                world:expect(goblin, Frozen)
+            end),
+            `entity "Goblin" (#{goblin}): Frozen is a tag, it has no value`
+        ))
+        CHECK(contains(
+            failure(function()
+                world:expect(plain, Frozen)
+            end),
+            `entity #{plain}: Frozen is a tag, it has no value`
+        ))
+        world:add(goblin, pair(Likes, other))
+        CHECK(contains(
+            failure(function()
+                world:expect(goblin, pair(Likes, other))
+            end),
+            `entity "Goblin" (#{goblin}): (#{Likes}, Other) is a tag, it has no value`
+        ))
+
+        CASE(`an entity that is not alive, an id that is not alive{kind}`)
+        world:delete(plain)
+        CHECK(contains(
+            failure(function()
+                world:expect(plain, Health)
+            end),
+            `entity #{plain} is not alive: an outdated handle or a deleted entity (expect Health)`
+        ))
+        local Gone = world:component()
+        world:delete(Gone)
+        CHECK(contains(
+            failure(function()
+                world:expect(goblin, Gone)
+            end),
+            `entity "Goblin" (#{goblin}) has no #{Gone} (the id is not alive)`
+        ))
+
+        CASE(`the error points at the caller{kind}`)
+        local message = failure(function()
+            world:expect(goblin, Unnamed)
+        end)
+        CHECK(contains(message, "lib.luau:") and not contains(message, "init.luau"))
+    end
 end)
 
 TEST("queries with more than 8 values", function()
