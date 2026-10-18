@@ -626,6 +626,45 @@ return function(spec: support.Spec)
             end)
         end
 
+        CASE("a debug world names a nil id given to a query, get or has, at the line of the call")
+        do
+            local world = ecs.world(true)
+            local A, T = world:component(), world:entity()
+            local e = world:entity()
+            world:set(e, A, 1)
+            world:add(e, T)
+            local missing = ({} :: any).Missing -- a table of ids read by a name that it does not have
+            -- whether the call raises `message` at the line after its `function()`
+            local function raises(message: string, call: () -> ()): boolean
+                local ok, raised = pcall(call)
+                local expected = `workload.luau:{(debug.info(call, "l") :: number) + 1}: {message}`
+                return not ok and string.sub(tostring(raised), -#expected) == expected
+            end
+            CHECK(raises("world:query: id 1 is nil", function()
+                world:query(missing)
+            end))
+            CHECK(raises("query:with: id 1 is nil", function()
+                world:query(A):with(missing)
+            end))
+            CHECK(raises("query:without: id 2 is nil", function()
+                world:query(A):without(T, missing)
+            end))
+            CHECK(raises("world:get: id 1 is nil", function()
+                world:get(e, missing)
+            end))
+            CHECK(raises("world:get: id 2 is nil", function()
+                world:get(e, A, missing)
+            end))
+            CHECK(raises("world:has: id 1 is nil", function()
+                world:has(e, missing)
+            end))
+            -- a pair is made before the call, by ecs.pair, which refuses a nil element in any world
+            CHECK(raises("ecs.pair: the target is nil", function()
+                world:has(e, ecs.pair(T, missing))
+            end))
+            CHECK(world:get(e, A) == 1 and world:has(e, A, T) and count(world:query(A):with(T)) == 1)
+        end
+
         CASE("a debug world warns once when the shared query states are all taken (the warning prints once)")
         do
             local world = ecs.world(true)

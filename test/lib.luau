@@ -12,7 +12,9 @@
     the iteration contexts that queries which are not cached reuse, the values of wildcard
     pairs (their mirrors), world:each and world:children over large records, query shapes
     shared from their second request, the buffered loops of small queries that are not cached,
-    match lists that skip the changes outside their unchanged terms, and query monitors.
+    match lists that skip the changes outside their unchanged terms, query monitors, the checks
+    of the arguments in a debug world, and the line that each error of a call points at (also
+    of ecs.pair and of change filters of untracked ids, at every use).
 
     Run from the repository root:
         luau test/lib.luau
@@ -50,6 +52,20 @@ local function shared_shape(make: () -> any): boolean
         end
     end
     return false
+end
+
+-- Whether `call` raises the error `message` at the line after its `function()`, where a case
+-- writes the call that fails: the error points at the line that called the library. `line`
+-- overrides that line (a call inside a hook). Prints what was raised instead.
+local function raises_at_call(message: string, call: () -> (), line: number?): boolean
+    local ok, raised = pcall(call)
+    local text = tostring(raised)
+    local expected = `lib.luau:{line or (debug.info(call, "l") :: number) + 1}: {message}`
+    if ok or string.sub(text, -#expected) ~= expected then
+        print(`  expected the error "{expected}", got {if ok then "none" else `"{text}"`}`)
+        return false
+    end
+    return true
 end
 
 TEST("query:each", function()
@@ -2060,6 +2076,481 @@ TEST("debug mode", function()
     quiet:set(g, quiet:component(), 1)
     quiet:delete(g)
     CHECK(not quiet:contains(g))
+end)
+
+TEST("debug mode: each error names the method and the argument", function()
+    local world = ecs.world(true)
+    local untyped: any = world
+    local A = world:component() :: ecs.Component<number>
+    local T, R = world:entity(), world:entity()
+    local e = world:entity()
+    world:set(e, A, 1)
+    world:add(e, T)
+    world:add(e, pair(R, T))
+    world:track(A)
+    -- a table of ids read by a name that it does not have
+    local missing = ({} :: any).Missing
+    local function listener() end
+
+    CASE("world:query and the terms of a query number the ids")
+    CHECK(raises_at_call("world:query: id 1 is nil", function()
+        untyped:query(missing)
+    end))
+    CHECK(raises_at_call("world:query: id 2 is nil", function()
+        untyped:query(A, missing)
+    end))
+    CHECK(raises_at_call("query:with: id 1 is nil", function()
+        untyped:query(A):with(missing)
+    end))
+    CHECK(raises_at_call("query:without: id 2 is nil", function()
+        untyped:query(A):without(T, missing)
+    end))
+    CHECK(raises_at_call("query:any: id 1 is nil", function()
+        untyped:query(A):any(missing, T)
+    end))
+    -- a shared query (a shape requested before) and a cached one check their terms as well
+    for _ = 1, 3 do
+        world:query(A)
+    end
+    CHECK(internal(world:query(A)).shared == true)
+    CHECK(raises_at_call("query:with: id 1 is nil", function()
+        untyped:query(A):with(missing)
+    end))
+    local cached = world:query(A):with(T):cached()
+    CHECK(raises_at_call("query:without: id 1 is nil", function()
+        (cached :: any):without(missing)
+    end))
+
+    CASE("get and has: the entity and each id, a nil after the last id too")
+    CHECK(raises_at_call("world:get: id 1 is nil", function()
+        untyped:get(e, missing)
+    end))
+    CHECK(raises_at_call("world:get: id 2 is nil", function()
+        untyped:get(e, A, missing)
+    end))
+    CHECK(raises_at_call("world:get: id 2 is nil", function()
+        untyped:get(e, A, missing, A)
+    end))
+    CHECK(raises_at_call("world:get: id 6 is nil", function()
+        untyped:get(e, A, A, A, A, A, missing, A)
+    end))
+    CHECK(raises_at_call("world:has: id 1 is nil", function()
+        untyped:has(e, missing)
+    end))
+    CHECK(raises_at_call("world:has: id 2 is nil", function()
+        untyped:has(e, T, missing)
+    end))
+    CHECK(raises_at_call("world:has: id 1 is nil", function()
+        untyped:has(e)
+    end))
+    CHECK(raises_at_call("world:get: the entity is nil", function()
+        untyped:get(missing, A)
+    end))
+    CHECK(raises_at_call("at most 8 ids can be passed; use get_list/has_all for more", function()
+        untyped:get(e, A, A, A, A, A, A, A, A, A)
+    end))
+
+    CASE("the other methods that read name the argument")
+    CHECK(raises_at_call("world:expect: the id is nil", function()
+        untyped:expect(e, missing)
+    end))
+    CHECK(raises_at_call("world:expect: the entity is nil", function()
+        untyped:expect(missing, A)
+    end))
+    CHECK(raises_at_call("world:get_list: id 2 of the list is nil", function()
+        untyped:get_list(e, { A, missing, A })
+    end))
+    CHECK(raises_at_call("world:has_all: the list of ids is nil", function()
+        untyped:has_all(e, missing)
+    end))
+    CHECK(raises_at_call("world:contains: the entity is nil", function()
+        untyped:contains(missing)
+    end))
+    CHECK(raises_at_call("world:exists: the entity is nil", function()
+        untyped:exists(missing)
+    end))
+    CHECK(raises_at_call("world:target: the relation is nil", function()
+        untyped:target(e, missing)
+    end))
+    CHECK(raises_at_call("world:targets: the entity is nil", function()
+        untyped:targets(missing, R)
+    end))
+    CHECK(raises_at_call("world:parent: the entity is nil", function()
+        untyped:parent(missing)
+    end))
+    CHECK(raises_at_call("world:children: the parent is nil", function()
+        untyped:children(missing)
+    end))
+    CHECK(raises_at_call("world:each: the id is nil", function()
+        untyped:each(missing)
+    end))
+    CHECK(raises_at_call("world:ids: the entity is nil", function()
+        untyped:ids(missing)
+    end))
+    CHECK(raises_at_call("world:column: the id is nil", function()
+        untyped:column(missing)
+    end))
+    CHECK(raises_at_call("world:remove_all: the id is nil", function()
+        untyped:remove_all(missing)
+    end))
+    CHECK(raises_at_call("world:track: the id is nil", function()
+        untyped:track(missing)
+    end))
+    CHECK(raises_at_call("world:added: the id is nil", function()
+        untyped:added(missing, listener)
+    end))
+    CHECK(raises_at_call("world:changed: the id is nil", function()
+        untyped:changed(missing, listener)
+    end))
+    CHECK(raises_at_call("world:removed: the id is nil", function()
+        untyped:removed(missing, listener)
+    end))
+    CHECK(raises_at_call("world:entity: the id is nil", function()
+        untyped:entity(missing)
+    end))
+    CHECK(raises_at_call("query:has: the entity is nil", function()
+        untyped:query(A):has(missing)
+    end))
+    CHECK(raises_at_call("query:added: the id is nil", function()
+        untyped:query(A):added(missing)
+    end))
+    CHECK(raises_at_call("query:changed: the id is nil", function()
+        untyped:query(A):changed(missing)
+    end))
+    CHECK(raises_at_call("query:removed: the id is nil", function()
+        untyped:query(A):removed(missing)
+    end))
+
+    CASE("a value of another type is named by its type")
+    CHECK(raises_at_call("world:get: id 1 is a string, not a number", function()
+        untyped:get(e, "Health")
+    end))
+    CHECK(raises_at_call("world:query: id 2 is a table, not a number", function()
+        untyped:query(A, {})
+    end))
+    CHECK(raises_at_call("world:each: the id is a boolean, not a number", function()
+        untyped:each(true)
+    end))
+    CHECK(raises_at_call("world:set: the id is a function, not a number", function()
+        untyped:set(e, listener, 1)
+    end))
+
+    CASE("changes name the method")
+    local dead = world:entity()
+    world:delete(dead)
+    CHECK(raises_at_call("world:set: the id is nil", function()
+        untyped:set(e, missing, 1)
+    end))
+    CHECK(raises_at_call("world:add: the entity is nil", function()
+        untyped:add(missing, T)
+    end))
+    CHECK(raises_at_call(`world:set: entity {dead} is not alive: an outdated handle or a deleted entity`, function()
+        world:set(dead, A, 1)
+    end))
+    CHECK(raises_at_call(`world:delete: entity {dead} is not alive: an outdated handle or a deleted entity`, function()
+        world:delete(dead)
+    end))
+    CHECK(
+        raises_at_call(
+            `world:add: id {dead} is not alive: an outdated handle, a deleted id, or ecs.component() called after ecs.world()`,
+            function()
+                world:add(e, dead)
+            end
+        )
+    )
+    CHECK(raises_at_call("world:remove: an element of the pair is not alive", function()
+        world:remove(e, pair(R, dead))
+    end))
+    CHECK(raises_at_call("world:toggle: wildcard pairs can only be used in queries and remove", function()
+        world:toggle(e, pair(R, ecs.Wildcard))
+    end))
+    CHECK(raises_at_call("query:set_all: the id is nil", function()
+        untyped:query(A):set_all(missing, 1)
+    end))
+    CHECK(
+        raises_at_call(
+            `query:toggle_all: id {dead} is not alive: an outdated handle, a deleted id, or ecs.component() called after ecs.world()`,
+            function()
+                world:query(A):toggle_all(dead)
+            end
+        )
+    )
+
+    CASE("calls with numbers work as in a world without debug")
+    local made = untyped:entity(untyped:entity() + 1)
+    CHECK(world:contains(made))
+    local va, vb = world:get(e, A, T)
+    CHECK(va == 1 and vb == nil and world:has(e, A, T) and not world:has(e, A, made))
+    CHECK(world:get_list(e, { A, T })[1] == 1 and world:has_all(e, { A, T }))
+    CHECK(world:expect(e, A) == 1 and world:target(e, R) == T)
+    local n = 0
+    for entity, a in world:query(A):with(T):without(made):any(T, R) do
+        n += 1
+        CHECK(entity == e and a == 1)
+    end
+    for entity in world:each(T) do
+        n += 1
+        CHECK(entity == e)
+    end
+    CHECK(n == 2)
+
+    CASE("a world without debug checks no type")
+    local quiet = ecs.world()
+    local QA = quiet:component() :: ecs.Component<number>
+    local q = quiet:entity()
+    quiet:set(q, QA, 5)
+    -- the nil after the last id is not seen: get returns the value of QA alone
+    CHECK(select("#", (quiet :: any):get(q, QA, missing)) == 1)
+    CHECK((quiet :: any):has(q, QA, missing))
+end)
+
+TEST("errors point at the line that called the library", function()
+    for _, checked in { false, true } do
+        local kind = if checked then " (debug world)" else ""
+        local world = ecs.world(checked)
+        local untyped: any = world
+        local A = world:component() :: ecs.Component<number>
+        local Tag, R, TagR = world:entity(), world:entity(), world:entity()
+        local e, f = world:entity(), world:entity()
+        world:set(e, A, 1)
+        world:add(f, Tag)
+        world:add(f, pair(TagR, R))
+
+        CASE(`a value on a tag or a tag pair, a wildcard pair, a pair with a free slot{kind}`)
+        local TAG = "cannot set a value on a tag; add the Component trait (world:component()) to store data"
+        local TAG_PAIR = "cannot set a value on a tag pair; the relation or the target must be a component"
+        CHECK(raises_at_call(TAG, function()
+            untyped:set(e, Tag, 1)
+        end))
+        CHECK(raises_at_call(TAG, function()
+            untyped:set(f, Tag, 1)
+        end))
+        CHECK(raises_at_call(TAG_PAIR, function()
+            untyped:set(e, pair(TagR, Tag), 1)
+        end))
+        CHECK(raises_at_call(TAG_PAIR, function()
+            untyped:set(f, pair(TagR, R), 1)
+        end))
+        local WILDCARD = if checked
+            then "world:set: wildcard pairs can only be used in queries and remove"
+            else "wildcard pairs can only be used in queries"
+        CHECK(raises_at_call(WILDCARD, function()
+            untyped:set(e, pair(R, ecs.Wildcard), 1)
+        end))
+        CHECK(raises_at_call(string.gsub(WILDCARD, "^world:set", "world:add"), function()
+            world:add(e, pair(TagR, ecs.Wildcard))
+        end))
+        local victim = world:entity()
+        world:delete(victim)
+        CHECK(
+            raises_at_call(
+                if checked
+                    then "world:add: an element of the pair is not alive"
+                    else "pair of an entity that is not alive",
+                function()
+                    world:add(e, pair(R, victim))
+                end
+            )
+        )
+        world:entity() -- takes the slot of the victim again
+
+        CASE(`ecs.pair with a nil element, also given to a call{kind}`)
+        local missing: any = nil
+        CHECK(raises_at_call("ecs.pair: the relation is nil", function()
+            pair(missing, R)
+        end))
+        CHECK(raises_at_call("ecs.pair: the target is nil", function()
+            world:get(e, pair(R, missing))
+        end))
+        CHECK(raises_at_call("ecs.pair: the target is nil", function()
+            world:query(pair(R, missing))
+        end))
+
+        CASE(`too many ids, a wildcard toggled, a value set on a tag by a batch{kind}`)
+        local TOO_MANY = "at most 8 ids can be passed; use get_list/has_all for more"
+        CHECK(raises_at_call(TOO_MANY, function()
+            untyped:get(e, A, A, A, A, A, A, A, A, A)
+        end))
+        CHECK(raises_at_call(TOO_MANY, function()
+            untyped:has(e, A, A, A, A, A, A, A, A, A)
+        end))
+        CHECK(
+            raises_at_call(
+                if checked
+                    then "world:toggle: wildcard pairs can only be used in queries and remove"
+                    else "toggle takes a component, a tag or a pair, not a wildcard",
+                function()
+                    world:toggle(e, pair(R, ecs.Wildcard))
+                end
+            )
+        )
+        CHECK(raises_at_call(TAG, function()
+            untyped:query(A):set_all(Tag, 1)
+        end))
+
+        CASE(`a query without terms, wherever it is used{kind}`)
+        local NO_TERMS = "a query needs a required id, an OR term or a change filter: excluded ids alone match nothing"
+        local none = world:query():without(A)
+        CHECK(raises_at_call(NO_TERMS, function()
+            none:each(function() end)
+        end))
+        CHECK(raises_at_call(NO_TERMS, function()
+            for _ in none do
+            end
+        end))
+        CHECK(raises_at_call(NO_TERMS, function()
+            none:has(e)
+        end))
+        CHECK(raises_at_call(NO_TERMS, function()
+            none:count()
+        end))
+        CHECK(raises_at_call(NO_TERMS, function()
+            none:cached()
+        end))
+        CHECK(raises_at_call(NO_TERMS, function()
+            none:add_all(Tag)
+        end))
+        CHECK(raises_at_call(NO_TERMS, function()
+            none:remove_all(Tag)
+        end))
+        CHECK(raises_at_call(NO_TERMS, function()
+            none:delete_all()
+        end))
+        CHECK(raises_at_call(NO_TERMS, function()
+            none:toggle_all(Tag)
+        end))
+        CHECK(raises_at_call(NO_TERMS, function()
+            none:monitor()
+        end))
+
+        CASE(`change filters of untracked ids at every use, monitors, signals of pairs{kind}`)
+        local UNTRACKED = "change filters need a tracked id: call world:track(id) first"
+        -- one query, used twice in every way: an error leaves the ticks unseen
+        local untracked = world:query(A):added(A)
+        for _ = 1, 2 do
+            CHECK(raises_at_call(UNTRACKED, function()
+                for _ in untracked do
+                end
+            end))
+            CHECK(raises_at_call(UNTRACKED, function()
+                untracked:each(function() end)
+            end))
+            CHECK(raises_at_call(UNTRACKED, function()
+                untracked:count()
+            end))
+            CHECK(raises_at_call(UNTRACKED, function()
+                untracked:add_all(Tag)
+            end))
+            -- whatever the entity: one with A, one without, a dead one
+            CHECK(raises_at_call(UNTRACKED, function()
+                untracked:has(e)
+            end))
+            CHECK(raises_at_call(UNTRACKED, function()
+                untracked:has(f)
+            end))
+            CHECK(raises_at_call(UNTRACKED, function()
+                untracked:has(victim)
+            end))
+        end
+        local CREATED = "the created filter needs world:track_created() first"
+        local created = world:query(A):created()
+        CHECK(raises_at_call(CREATED, function()
+            for _ in created do
+            end
+        end))
+        CHECK(raises_at_call(CREATED, function()
+            created:has(e)
+        end))
+        world:track(Tag)
+        -- whatever the changes: the filter of Tag has none, the one of A is checked all the same
+        local mixed = world:query(A):added(Tag):changed(A)
+        CHECK(raises_at_call(UNTRACKED, function()
+            for _ in mixed do
+            end
+        end))
+        local tracking = world:query(A):added(Tag)
+        CHECK(raises_at_call("a monitor cannot use change filters", function()
+            tracking:monitor()
+        end))
+        local by_target = world:query(A):with(pair(ecs.Wildcard, R))
+        CHECK(
+            raises_at_call(
+                "a monitor cannot use a term (*, T): the signals of a pair are those of its relation",
+                function()
+                    by_target:monitor()
+                end
+            )
+        )
+        local SIGNAL =
+            "signals and change tracking take a component, a tag or a relation (for all its pairs), not a pair"
+        CHECK(raises_at_call(SIGNAL, function()
+            world:added(pair(R, Tag), function() end)
+        end))
+        CHECK(raises_at_call(SIGNAL, function()
+            world:track(pair(R, Tag))
+        end))
+
+        CASE(`ranges, traits, expect{kind}`)
+        local RANGE = "entity id is outside the range set by world:range"
+        local ranged = ecs.world(checked)
+        ranged:range(1000, 1010)
+        while pcall(ranged.entity, ranged) do
+        end
+        CHECK(raises_at_call(RANGE, function()
+            ranged:entity()
+        end))
+        local pooled = ecs.world(checked)
+        pooled:range(1000, 1010)
+        local pool = pooled:pool()
+        CHECK(raises_at_call(RANGE, function()
+            pool:entity()
+        end))
+        local Used = world:component()
+        world:set(e, Used, 1)
+        CHECK(
+            raises_at_call(
+                "the Component trait cannot be added to an id used already: give it before the first use",
+                function()
+                    world:add(Tag, ecs.Component)
+                end
+            )
+        )
+        CHECK(raises_at_call("the Component trait cannot be removed from an id used already", function()
+            world:remove(Used, ecs.Component)
+        end))
+        local Rel = world:entity()
+        world:add(e, pair(Rel, A))
+        world:add(e, pair(Rel, Tag))
+        CHECK(
+            raises_at_call(
+                "the Exclusive trait cannot be added to a relation that an entity has with several targets",
+                function()
+                    world:add(Rel, ecs.Exclusive)
+                end
+            )
+        )
+        CHECK(raises_at_call(`entity #{e}: #{Tag} is a tag, it has no value`, function()
+            untyped:expect(e, Tag)
+        end))
+
+        CASE(`an error inside a hook points at the hook; hooks that keep a delete going{kind}`)
+        local Hooked = world:entity()
+        local function hook(entity: any)
+            untyped:set(entity, Tag, 1)
+        end
+        world:set(Hooked, ecs.OnAdd, hook)
+        CHECK(raises_at_call(TAG, function()
+            world:add(e, Hooked)
+        end, (debug.info(hook, "l") :: number) + 1))
+        local Spread = world:entity()
+        world:add(world:entity(), Spread)
+        world:set(Spread, ecs.OnRemove, function()
+            world:add(world:entity(), Spread)
+        end)
+        CHECK(raises_at_call("hooks keep giving an id to entities while it is deleted", function()
+            world:delete(Spread)
+        end))
+    end
 end)
 
 TEST("introspection", function()

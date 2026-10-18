@@ -1,5 +1,198 @@
 # Changelog
 
+## v1.2.0 — 2026-10-18
+
+### Changed behavior
+
+What the calls return, in which order, and what a loop sees stay those of 1.1.0. The changes
+are in the errors: which ones are raised (by a debug world, by the change filters of untracked
+ids, by `ecs.pair`), their text, and the line they point at.
+
+- **A debug world checks the arguments of every method that takes entities or ids.** In a world
+  made with `ecs.world(true)`, the methods that read raise an error for an entity or an id that
+  is not a number: `world:query` and the terms of a query (`with`, `without`, `any`), `get`,
+  `has`, `get_list`, `has_all`, `expect`, `each`, `children`, `target`, `targets`, `parent`,
+  `contains`, `exists`, `ids`, `column`, `remove_all`, `track`, the signals `added`, `changed`
+  and `removed`, `world:entity` given an id, `query:has` and the change filters `query:added`,
+  `changed` and `removed`. The error names the method and the argument, and points at the line
+  of the call. Such a value is usually a nil read from a table of ids by a name that the table
+  does not have.
+  - Before: the nil reached the internals of the method, in a debug world as in any other:
+    `src/init.luau:9506: attempt to compare nil < number` for an id of a query or of a term,
+    `attempt to compare number < nil` for `get`, `has` and `expect`, `attempt to perform
+    arithmetic (mod) on nil and number` for an entity; or nothing happened: `world:each(nil)`
+    visited nothing, `world:remove_all(nil)` removed nothing, `world:entity(nil)` made a new
+    entity.
+  - After: `world:query: id 1 is nil`, `query:with: id 2 is nil`, `world:get: the entity is
+    nil`, `world:target: the relation is nil`, `world:each: the id is a string, not a number`.
+  - These methods still do not check whether an id is alive: a dead id reads nothing, as in any
+    world. A world without debug checks nothing and keeps the errors of 1.1.0, except for the
+    line they point at, the change filters of untracked ids and `ecs.pair` (below).
+- **A nil after the last id of `get` and `has` is an error in a debug world.** `world:get(e, A,
+  missing)` returned the value of `A` alone and `world:has(e, A, missing)` checked `A` alone
+  (`world:has(e, A, missing, B)` was true without `B`); a debug world raises
+  `world:get: id 2 is nil`, and the same for `world:query(A, missing)` and the terms of a query.
+  A world without debug reads such a call as before.
+- **The errors of the checks of changes in a debug world name the method.**
+  `entity 4194561 is not alive: an outdated handle or a deleted entity` is now
+  `world:set: entity 4194561 is not alive: …` (and `world:delete: …`, `world:toggle: …`),
+  `id 271 is not alive: …` is `world:add: id 271 is not alive: …` (and `query:add_all: …`),
+  `wildcard pairs can only be used in queries and remove` is `world:set: wildcard pairs …`,
+  `an element of the pair is not alive` is `world:remove: an element of the pair is not alive`.
+  An argument that is not a number reads `world:set: the id is nil` (was `id nil is not a
+  number`) and `world:set: the entity is nil` (was `entity nil is not alive: an outdated
+  handle or a deleted entity`).
+- **A change filter of an id that is not tracked raises its error at every use, in any world.**
+  - Before: `query:has` returned false, also for `:created()` without `world:track_created()`.
+    A loop, `each`, `count` and the batch operations raised the error once per tick: the error
+    marked the ticks as seen, so the next use in the same tick found nothing (`count` returned
+    0). And a query whose earlier filter had no changes returned nothing without checking the
+    later ones: `world:query(A):added(A):changed(B)` with `B` untracked raised the error only in
+    the ticks when `A` was added.
+  - After: every use raises `change filters need a tracked id: call world:track(id) first` (or
+    `the created filter needs world:track_created() first`) at the line of the call, whatever
+    the entity, the changes and the previous uses.
+- **`ecs.pair` refuses a nil element, in any world.** `ecs.pair(R, missing)` raised
+  `src/init.luau:1559: attempt to perform arithmetic (mod) on nil and number` inside the
+  library, also as an argument of a call of a debug world (the pair is made before the call); it
+  raises `ecs.pair: the target is nil` (or `the relation is nil`) at the line of the call. Other
+  values that are not numbers stay as in 1.1.0: the arithmetic error of Luau, and a string of
+  digits makes a pair. The test costs about 2 ns per call in the interpreter and nothing
+  measurable in native code (see Performance).
+- **Errors point at the line that called the library, in any world.** An error raised for a
+  mistake of the caller names the line of that call, whatever the depth of the library function
+  that finds it; in a hook or a listener, the line in the hook. The messages stay the same; the
+  position in front of them changes. Before:
+  - in a debug world, the error for an entity that is not alive (`set`, `add`, `remove`,
+    `delete`, `clear`, `toggle`) named the line of the caller of the caller, or no line when that
+    was a C function such as `pcall`: the compiler inlined the check, and its error level was
+    counted from the method. The errors that `set` raises itself (a value set on a tag or on a
+    tag pair) named a line of `src/init.luau`: the check of the debug world was one frame more;
+  - in any world, these named a line of `src/init.luau`: `set` and `add` of a wildcard pair whose
+    relation had no pair yet, and of a pair whose relation or target has a free slot; a change
+    filter of an id that is not tracked, and the created filter without `world:track_created()`,
+    in a `for` loop; `world:entity()` beyond the end of `world:range`; `ecs.component()` beyond
+    256 ids;
+  - these had no line at all: the `Component` trait added to an id used already or removed from
+    it, the `Exclusive` trait added to a relation that an entity has with several targets, and
+    the hooks that keep a delete going (`hooks keep giving an id to entities while it is deleted`
+    and the like).
+
+  The function that raises them (`fail`) finds the first frame of the stack outside the library,
+  so the line does not depend on helpers, on the checks of a debug world or on what the compiler
+  inlines; it runs only when an error is raised.
+
+### The cost of the checks of a debug world
+
+A debug world checks the arguments of every call; a world without debug makes no check, and its
+methods run the code of 1.1.0 but for the paths that raise errors. One call per entity over 700
+entities, ns per call, the median of three processes of 7 rounds each, Luau 0.740 `-O2`:
+
+| Call of a debug world | interpreter: 1.1.0 → 1.2.0 | native: 1.1.0 → 1.2.0 |
+|---|---|---|
+| `get(e, A)` | 56.4 → 81.8 | 38.8 → 59.4 |
+| `get(e, A, B)` | 68.9 → 110.9 | 42.5 → 67.2 |
+| `has(e, T)` | 70.0 → 97.4 | 50.6 → 68.1 |
+| `contains(e)` | 35.9 → 54.0 | 23.9 → 34.5 |
+| `expect(e, A)` | 56.0 → 76.1 | 32.0 → 43.2 |
+| `set(e, A, 1)` (checked in 1.1.0 already) | 123.0 → 127.8 | 72.4 → 76.6 |
+| `query(A):with(T)` written inline, a loop left at its first match | 2 386 → 2 551 | 2 127 → 2 098 |
+| a cached query, a loop left at its first match | 2 193 → 2 204 | 1 848 → 1 823 |
+
+A read costs 11–25 ns more in native code (`get` and `has`, which take any number of ids, the
+most); the call of a query costs the same within a few percent, and its loops nothing more. The
+same calls of a world without debug take 0.97–1.03× of the time of 1.1.0 in these runs.
+
+### Tests and tools
+
+- `test/lib.luau`: every check of the arguments of a debug world with its message and the line it
+  points at (each method; a nil in the first, a middle and the last place; values of other
+  types; the changes with their method names), the calls with numbers working as in a world
+  without debug, and a test that every error a call raises for a mistake of its caller points at
+  the line of the call, in a world with and without debug checks (values on tags and tag pairs,
+  wildcard pairs, pairs with a free slot, `ecs.pair` with a nil element, too many ids, queries
+  without terms wherever they are used, change filters of untracked ids at every use and
+  whatever the entity and the changes, monitors, signals of pairs, ranges, pools, traits,
+  `expect`, an error inside a hook, hooks that keep a delete going).
+- `test/cases/workload.luau`, debugging aids: a debug world names a nil id given to a query, to a
+  term of a query, to `get` or to `has`, at the line of the call; `ecs.pair` names a nil target.
+
+### Documentation
+
+- The API reference (`ecs.world`, `ecs.pair`, `World`) and the guide describe the checks of a
+  debug world, the errors of `ecs.pair` and of the change filters of untracked ids, and the line
+  that errors point at; the jecs page lists the checks among the features beyond jecs and in the
+  migration.
+- The comparison pages, the README and the page of the previous release carry the measurements of
+  1.2.0.
+
+### Performance on the reference workload
+
+Both versions are measured with the reference workload model of this release on Luau 0.740,
+`-O2`, in the interpreter and native code. The
+[full report](https://github.com/dubalda/mErCS/blob/main/bench/results/1.2.0.md) and
+[raw samples](https://github.com/dubalda/mErCS/blob/main/bench/results/1.2.0.json) contain 232
+comparison rows from 460 isolated processes: the release run; 15 more repeats of the client
+profile in the interpreter, whose two rows it flagged (P4, 15 usually empty marker queries,
+1.03× at first and with all repeats; P7, the client frame, 1.05× at first and 1.01× with all
+repeats; within the noise); and 15 more repeats of P6 and P7 at the target scale in both modes,
+whose columns had split between two levels of time in both versions (with all repeats the frame
+of the model takes 0.99× of the time of 1.1.0 in native code). No timing row is slower than the
+noise; the memory rows that the report flags are the constant heap of a world and the
+resolution of the measurement (see Memory). 1.2.0 changes in the code that the suite runs only
+the paths that raise errors, which the suite does not take, and the test of nil of `ecs.pair`,
+and improves no test: the rows smaller beyond the noise (P8 bytes per distinct pair at the small
+scale without owned entities, 0.9987×: one step of the resolution) are not claimed as a gain.
+The frame model (P7) and the lifecycle events of P6 stay within the noise (µs, medians [min–max]
+of each version's two control columns); in the interpreter at the target scale the lifecycle
+events take 1.02–1.04× with all repeats, and 10 more processes of each version side by side
+give 1.00–1.01×:
+
+| Mode | Scale | P7, µs/frame: 1.1.0 → 1.2.0 | P6, the removal of a retained agent, µs: 1.1.0 → 1.2.0 |
+|---|---|---|---|
+| native | small | 101.26 [93.07–113.86] → 97.30 [92.27–113.36] | 49.43 [40.45–71.00] → 54.58 [43.75–70.45] |
+| native | target | 358.23 [313.90–428.92] → 355.60 [326.02–518.40] | 1051.8 [971.4–1205.2] → 1034.6 [955.4–1566.1] |
+| native | small-empty-retained | 104.37 [91.59–142.23] → 97.09 [92.08–121.39] | 19.50 [13.95–23.70] → 19.05 [15.55–26.45] |
+| native | target-empty-retained | 321.44 [311.49–388.56] → 325.70 [305.53–412.91] | 21.7 [18.2–30.0] → 21.4 [18.7–38.8] |
+| interpreter | small | 154.41 [147.00–180.29] → 158.73 [147.39–173.52] | 71.95 [61.95–101.85] → 76.72 [64.40–97.10] |
+| interpreter | target | 491.59 [464.84–830.87] → 510.14 [465.45–656.87] | 1503.1 [1446.0–2165.8] → 1566.2 [1444.1–1997.1] |
+| interpreter | small-empty-retained | 160.07 [151.65–215.78] → 156.85 [149.44–174.69] | 27.10 [19.20–34.45] → 23.78 [19.10–39.70] |
+| interpreter | target-empty-retained | 506.51 [473.74–546.77] → 490.06 [468.67–537.55] | 32.1 [29.4–49.7] → 30.0 [28.4–38.9] |
+
+Single operations ([1.2.0 and 1.1.0](https://github.com/dubalda/mErCS/blob/main/docs/comparison/previous-release.md),
+measured with the comparison with jecs) have a median ratio of 1.00× in both modes over 99 rows.
+`ecs.pair` pays its test of nil in the interpreter: `pair(R, T)` takes 22.7 instead of 20.8 ns
+(1.09×); in native code its 9.67 against 8.73 ns lie within the range of the row (8.41–11.3 ns),
+and the two modules side by side (8 processes each) take 12.7 ns per call each, loop included.
+The other rows that move beyond a few percent move both ways within their ranges (in the
+interpreter a usually empty query with 20 swaps per pass, 1.30×, and
+`query(A, pair(ChildOf, parent))` per parent, 1.11×). The matrix and the synthetic frame were
+measured fifteen times in each mode: in the first five the median frame of a library varied from
+process to process by 10–77 %, and 38 of the 214 rows of the matrix that compare the two
+releases moved by more than 5 % with the next ten. The
+[complete measurements](https://github.com/dubalda/mErCS/blob/main/bench/results/1.2.0-comparison.md)
+also compare this campaign with that of 1.1.0, on the same machine: the same code took 0.86–1.00
+of its time there.
+
+### Memory
+
+A new world takes 589 bytes more: 56 586 instead of 55 997 bytes (200 worlds kept alive): the
+closures of the world that raise errors for the mistakes of their callers keep the function that
+raises them as an upvalue, and the closure that takes the ticks of the change filters keeps the
+function that checks their ids (30 of the 589 bytes). The table of the world keeps its fields,
+and there is no new per-entity, per-pair or per-query field: the heap of the target world (P8)
+is 137.63 MB after it is built and 138.57 MB after 100 lifecycle rounds in both versions, a
+distinct pair with its holder takes 1 527.8 bytes and a holder of a pair 37.1 bytes in both. The
+rows of P8 measure the heap in whole KiB, rounded down before and after, so this constant moves
+the heap rows by 0, 1 or 2 KiB, and the bytes per distinct pair move by steps of 1 KiB over the
+pairs of a scale. Three rows are flagged: two heap rows at +2 KiB (interpreter: the client after
+9 000 frames, the target scale without owned entities after 3 000 frames) and the bytes per
+distinct pair of the small scale in the interpreter (+1.72 bytes, one step over its 594 pairs;
+the small scale without owned entities moved one step down in both modes). To the byte, a world
+of the client profile takes 560 bytes more after it is built and after 3 000 frames, and 592
+after 6 000 and after 9 000 frames: nothing accumulates. A debug world takes 60 216 bytes instead
+of 56 474 (the checks of its methods).
+
 ## v1.1.0 — 2026-10-13
 
 ### Changed behavior
