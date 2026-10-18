@@ -247,7 +247,7 @@ heap of the target world not larger, and the behavior cases passed. Its release 
 changed behavior, the results of the suite and the memory of the target world.
 
 ```sh
-bash tools/workload.sh baseline=v1.0.1 release=yes          # full acceptance, both modes, 5 runs
+bash tools/workload.sh baseline=v1.1.0 release=yes          # full acceptance, both modes, 5 runs
 python tools/workload.py runs=10 tests=P1,P7 scales=sparse,target modes=native
 python tools/workload.py --luau /path/to/luau output=tmp/workload-custom
 ```
@@ -266,7 +266,7 @@ resolution; a difference of exactly the allowance (one step of the heap resoluti
 it. Candidate variation never enlarges it. A disputed row needs another 10–20
 repeats and investigation; overlapping ranges alone do not settle it.
 
-The [1.1.0 report](https://github.com/dubalda/mErCS/blob/main/bench/results/1.1.0.md) keeps the
+The [1.2.0 report](https://github.com/dubalda/mErCS/blob/main/bench/results/1.2.0.md) keeps the
 measurements of the release run with the review of its flags (and any additional repeats
 together with them), and the commands to reproduce the runs or verify the saved comparisons.
 
@@ -354,7 +354,7 @@ of the later ones: by up to 30 % in some rows. The numbers of
 [the comparison](../comparison/jecs.md#performance) run each implementation in a process
 of its own (`impls=jecs`, `impls=previous`, `impls=lib`), 5 times in each mode, and take the
 medians. The
-[1.1.0 comparison evidence](https://github.com/dubalda/mErCS/blob/main/bench/results/1.1.0-comparison.md)
+[1.2.0 comparison evidence](https://github.com/dubalda/mErCS/blob/main/bench/results/1.2.0-comparison.md)
 includes the full ranges, raw samples, source hashes and isolated entry points for reproducing
 the matrix, synthetic frame, long session and memory probes.
 
@@ -393,7 +393,7 @@ first loops included; the matrix takes the minimum of several runs.
 `jecs/test/benches/visual`): `ParameterGenerator`, `BeforeAll` / `AfterAll` /
 `BeforeEach` / `AfterEach` and `Functions` with an entry for jecs and one for mErCS, and one for
 ecr in the four basic benchmarks of jecs, named with their versions (`jecs 0.11.0`,
-`mErCS 1.1.0`, `ecr 0.9.0`: `libs.luau` reads the versions of jecs and ecr from their Wally
+`mErCS 1.2.0`, `ecr 0.9.0`: `libs.luau` reads the versions of jecs and ecr from their Wally
 packages and holds the version of mErCS). The parameters are generated before every call and
 give each function its own fresh world. ecr declares its component types before the registries
 that use them, so its files make them once, when they are required. `bench/basic.luau` runs the
@@ -501,15 +501,15 @@ To release a version:
    shows `CHANGELOG.md` as its Changelog page.
 2. Set the version (without the `v`) in `wally.toml`, and in the output of the benchmarks:
    `library` in `bench/versions.luau` and `LIBRARY_VERSION` in `bench/visual/libs.luau`.
-3. Run `python tools/workload.py baseline=v1.0.1 release=yes` (the tag of the previous
+3. Run `python tools/workload.py baseline=v1.1.0 release=yes` (the tag of the previous
    release). Review performance and long-session memory, and save the report and
    raw samples under `bench/results/`. Summarize both modes/scales and every observable
    behavior change in the release notes.
 4. Commit, wait for a green CI, then push the tag:
 
 ```sh
-git tag -a v1.1.0 -m "mErCS v1.1.0"
-git push origin v1.1.0
+git tag -a v1.2.0 -m "mErCS v1.2.0"
+git push origin v1.2.0
 ```
 
 Settings of the GitHub repository:

@@ -92,6 +92,13 @@
     entities may or may not be seen by the running loop; an entity deleted ahead of the loop
     may still be returned once (world:contains tells).
 
+    Errors: an error for a mistake of the caller goes through fail, which raises it at the first
+    frame outside this module, whatever the depth of the function that finds the mistake. A
+    debug world (ecs.world(true)) checks the arguments of the methods of the world and of its
+    queries before they run (debug_install): the entities and ids of changes must be alive, those
+    of the other methods must be numbers; a world without debug makes no check. ecs.pair belongs
+    to no world: it refuses a nil element in any world.
+
     get/has take at most 8 ids (get_list/has_all take any number); world:expect reads one id
     that the entity must have (instead of nil, an error that names both); hooks get (entity, id,
     value); query:each is the fastest way to iterate. The API reference is the block of doc
@@ -482,14 +489,28 @@ export type World = {
 --[=[
     @function world
     @within mErCS
-    @param debug boolean? -- raise errors for entities and ids that are not alive
+    @param debug boolean? -- check the arguments of every call: raise errors that name them
     @return World
-    Creates a world. With `debug = true`, `set`, `add`, `remove`, `delete`, `clear` and the
-    batch operations raise an error for an entity or an id that is not alive (an outdated
-    handle) instead of ignoring the call, every match list that a cached query updates after a
-    change is checked against a scan of the bitsets, a query that takes its list as it is
-    checks that none of its ids changed, and the world warns once when its 1024 shared query
-    states are in use (a query of a new shape then builds a new state on every call).
+    Creates a world. With `debug = true`, the methods of the world and of its queries check
+    their arguments before they run, and the error names the method and the argument:
+
+    - `set`, `add`, `remove`, `toggle`, `delete`, `clear` and the batch operations of a query
+      raise an error for an entity or an id that is not alive (an outdated handle) instead of
+      ignoring the call: `world:set: entity 4194561 is not alive: an outdated handle or a
+      deleted entity`;
+    - every other method that takes entities or ids raises an error for one that is not a
+      number, such as a nil read from a table of ids by a name that the table does not have:
+      `world:query: id 2 is nil`, `query:with: id 1 is nil`, `world:get: the entity is nil`,
+      `world:each: the id is a string, not a number`. A nil passed after the last id counts
+      (`world:get(e, A, missing)`); an id is not checked for being alive there (a dead id
+      matches nothing, as in any world).
+
+    Every match list that a cached query updates after a change is checked against a scan of
+    the bitsets, a query that takes its list as it is checks that none of its ids changed, and
+    the world warns once when its 1024 shared query states are in use (a query of a new shape
+    then builds a new state on every call). The checks cost every call of a debug world; a
+    world without debug makes none of them. [mErCS.pair] belongs to no world: it raises an error
+    for a nil element in any world.
 ]=]
 
 --[=[
@@ -536,7 +557,8 @@ export type World = {
     ```
 
     The pair holds data when the relation is a component, or, for a tag relation, when the
-    target is one. The generations of both entities are dropped.
+    target is one. The generations of both entities are dropped. A nil element raises an error
+    at the line of the call, in any world: `ecs.pair: the target is nil`.
 ]=]
 
 --[=[
@@ -762,6 +784,10 @@ export type World = {
     Every component, tag and pair keeps a bitset of the entities that have it, and the
     values of a component sit in pages indexed by the entity slot: adding or removing an id
     sets a bit and a value and never moves the entity.
+
+    An error that a method raises for a mistake of its caller (a value set on a tag, a query
+    without terms, an argument that a debug world refuses...) points at the line that called
+    the library: in a hook or a listener, at the line of the hook.
 ]=]
 
 --[=[
@@ -1066,6 +1092,8 @@ export type World = {
     Starts recording additions, value changes and removals of `id` per tick, for the change
     filters [Query:added], [Query:changed] and [Query:removed]. Untracked ids cost nothing; a
     tracked id costs a call per add, change or remove. `id` is not a pair (see [World:added]).
+    A query with a change filter of an id that is not tracked raises an error at every use (a
+    loop, `each`, `count`, `has`, a batch operation).
 ]=]
 
 --[=[
@@ -1074,7 +1102,8 @@ export type World = {
     Starts recording the entities made from now on ([World:entity], a [Pool], [World:entity]
     with an id that makes a new id alive) per tick, for the change filter [Query:created]. A
     world that does not track creations pays a test per new entity; one that does pays a bit
-    per new entity, and a deleted entity is gone from the filter.
+    per new entity, and a deleted entity is gone from the filter. Without it, a query with the
+    filter raises an error at every use.
 ]=]
 
 --[=[
@@ -1466,6 +1495,27 @@ local SHAPES_EXHAUSTED = `mErCS: {MAX_SHAPES} query shapes are shared, the most 
 local RECOVERED = "mErCS: world:tick dropped what an error raised by a hook or a listener left (a removal, "
     .. "a clear or a cascade that did not finish): the changes of the frame of the error may be incomplete"
 
+-- The source of this module (its chunk name): fail raises its errors outside it.
+local MODULE_SOURCE = debug.info(1, "s")
+
+-- Raises an error for a mistake of the code that uses the library, at the line of that code: the
+-- first frame of the stack that is not in this module (a hook or a listener that calls the library
+-- is such a frame). error() takes a fixed level, which lands in the library when the function that
+-- finds the mistake runs at another depth: in a helper, behind a check of a debug world, inlined by
+-- the compiler. Every error that a call raises for a mistake of its caller goes through here; it
+-- costs only when it raises. When the whole stack is in this module (a bundle that puts the
+-- library and the code that uses it into one chunk, a coroutine that starts in a method), the
+-- error points at the caller of the function that raised it, as error(message, 2) would.
+local function fail(message: string): never
+    local level = 2
+    local source = debug.info(level, "s")
+    while source == MODULE_SOURCE do
+        level += 1
+        source = debug.info(level, "s")
+    end
+    error(message, if source == nil then 2 else level)
+end
+
 local function NOOP(): any
     return nil
 end
@@ -1569,7 +1619,7 @@ local KIND_TARGET = 3
 local function ECS_COMPONENT(): i53
     preregistered_components += 1
     if preregistered_components > HI_COMPONENT_ID then
-        error("too many pre-registered components")
+        fail("too many pre-registered components")
     end
     return preregistered_components
 end
@@ -2567,45 +2617,225 @@ local function apply_any(query: QueryState, ...: i53): QueryState
     return query
 end
 
--- The checks of a debug world (see the end of world_new): they take the alive table of the
--- world, so that they take no registers of world_new (see the helpers without world state).
--- `level` is the level of the error, as for error(): 3 when a wrapper of a world method calls
--- them.
-local function debug_check_entity(alive: { number }, entity: i53, level: number)
-    if type(entity) ~= "number" or alive[entity % ENTITY_MASK] ~= entity then
-        error(`entity {entity} is not alive: an outdated handle or a deleted entity`, level)
+-- The checks of a debug world (debug_install, called at the end of world_new). A debug world
+-- checks the arguments of its methods and of the methods of its queries before they run: the
+-- entities and ids given to a change (set, add, remove, toggle, delete, clear and the batch
+-- operations of a query) must be alive, and the entities and ids given to any other method must
+-- be numbers. A nil there is usually an id read from a table by a name that the table does not
+-- have; the method would reach its internals with it and fail there, or read nothing, without
+-- saying which argument it was. Each error names the method and the argument, and points at the
+-- line of the caller (see fail). The checks take the state of the world they need as arguments
+-- and the methods from the tables of the world and of its queries: they take no registers of
+-- world_new (see the helpers without world state).
+
+-- A method of a world or of a query, as the checks of a debug world wrap it.
+type Method = (...any) -> ...any
+
+-- What an argument is when it is not of the `expected` type: nil, or a value of another type
+-- (`typeof`, so that a Roblox value is named by its class).
+local function wrong_type(what: string, value: any, expected: string): string
+    if value == nil then
+        return `{what} is nil`
+    end
+    local kind = typeof(value)
+    local article = if string.find(kind, "^[AEIOUaeiou]") then "an" else "a"
+    return `{what} is {article} {kind}, not a {expected}`
+end
+
+-- The entity of a change: a number, the live entity of its slot.
+local function debug_check_entity(alive: { number }, method: string, entity: i53)
+    if type(entity) ~= "number" then
+        fail(`{method}: {wrong_type("the entity", entity, "number")}`)
+    elseif alive[entity % ENTITY_MASK] ~= entity then
+        fail(`{method}: entity {entity} is not alive: an outdated handle or a deleted entity`)
     end
 end
 
-local function debug_check_id(alive: { number }, id: i53, level: number, allow_wildcard: boolean)
+-- The id of a change: a number, alive (a pair: both elements alive), a wildcard pair only where
+-- `allow_wildcard` (remove).
+local function debug_check_id(alive: { number }, method: string, id: i53, allow_wildcard: boolean)
     if type(id) ~= "number" then
-        error(`id {id} is not a number`, level)
-    end
-    if id > PAIR_OFFSET then
+        fail(`{method}: {wrong_type("the id", id, "number")}`)
+    elseif id > PAIR_OFFSET then
         if is_wildcard(id) then
             if not allow_wildcard then
-                error("wildcard pairs can only be used in queries and remove", level)
+                fail(`{method}: wildcard pairs can only be used in queries and remove`)
             end
             return
         end
         local first, second = alive[ECS_PAIR_FIRST(id)], alive[ECS_PAIR_SECOND(id)]
         if first == nil or first <= 0 or second == nil or second <= 0 then
-            error("an element of the pair is not alive", level)
+            fail(`{method}: an element of the pair is not alive`)
         end
     elseif alive[id % ENTITY_MASK] ~= id then
-        error(
-            `id {id} is not alive: an outdated handle, a deleted id, or ecs.component() called after ecs.world()`,
-            level
+        fail(
+            `{method}: id {id} is not alive: an outdated handle, a deleted id, or ecs.component() called after ecs.world()`
         )
     end
+end
+
+-- A change of an entity (world:set, add, remove, delete, clear): the entity, and the id when
+-- `checks_id`, are checked before the method runs.
+local function debug_change(
+    alive: { number },
+    name: string,
+    method: Method,
+    checks_id: boolean,
+    wildcard: boolean
+): Method
+    return function(self: any, entity: i53, id: i53, value: any)
+        debug_check_entity(alive, name, entity)
+        if checks_id then
+            debug_check_id(alive, name, id, wildcard)
+        end
+        method(self, entity, id, value)
+    end
+end
+
+-- A batch operation of a query (add_all, set_all, remove_all): its id is checked before it runs.
+local function debug_batch(alive: { number }, name: string, method: Method, wildcard: boolean): Method
+    return function(self: any, id: i53, value: any)
+        debug_check_id(alive, name, id, wildcard)
+        method(self, id, value)
+    end
+end
+
+-- A method that reads: its first argument, and the second when `second` names it, must be
+-- numbers (`first` and `second` name them in the error: the entity, the id, the relation...);
+-- the others pass as they are.
+local function debug_args(name: string, method: Method, first: string, second: string?): Method
+    if second == nil then
+        return function(self: any, a: any, b: any, c: any): ...any
+            if type(a) ~= "number" then
+                fail(`{name}: {wrong_type(first, a, "number")}`)
+            end
+            return method(self, a, b, c)
+        end
+    end
+    return function(self: any, a: any, b: any, c: any): ...any
+        if type(a) ~= "number" then
+            fail(`{name}: {wrong_type(first, a, "number")}`)
+        elseif type(b) ~= "number" then
+            fail(`{name}: {wrong_type(second, b, "number")}`)
+        end
+        return method(self, a, b, c)
+    end
+end
+
+-- world:query and the terms of a query (with, without, any): each id must be a number, numbered
+-- from 1 in the error. A nil passed after the last id is one of them (`with(T, missing)`:
+-- select("#") counts it).
+local function debug_ids(name: string, method: Method): Method
+    return function(self: any, ...: any): ...any
+        for i = 1, select("#", ...) do
+            local id = select(i, ...)
+            if type(id) ~= "number" then
+                fail(`{name}: {wrong_type(`id {i}`, id, "number")}`)
+            end
+        end
+        return method(self, ...)
+    end
+end
+
+-- get and has: the entity and each id must be numbers, and there is an id at least; a nil passed
+-- after the last id is one of them (`world:get(e, A, missing)`). The call of one id, the common
+-- one, goes on without forwarding the varargs; the methods check the most ids they take.
+local function debug_entity_ids(name: string, method: Method): Method
+    return function(self: any, entity: any, id: any, ...: any): ...any
+        if type(entity) ~= "number" then
+            fail(`{name}: {wrong_type("the entity", entity, "number")}`)
+        elseif type(id) ~= "number" then
+            fail(`{name}: {wrong_type("id 1", id, "number")}`)
+        end
+        local n = select("#", ...)
+        if n == 0 then
+            return method(self, entity, id)
+        end
+        for i = 1, n do
+            local other = select(i, ...)
+            if type(other) ~= "number" then
+                fail(`{name}: {wrong_type(`id {i + 1}`, other, "number")}`)
+            end
+        end
+        return method(self, entity, id, ...)
+    end
+end
+
+-- get_list and has_all: the entity, and each id of the list up to its length, must be numbers.
+local function debug_list(name: string, method: Method): Method
+    return function(self: any, entity: any, ids: any, out: any): ...any
+        if type(entity) ~= "number" then
+            fail(`{name}: {wrong_type("the entity", entity, "number")}`)
+        elseif type(ids) ~= "table" then
+            fail(`{name}: {wrong_type("the list of ids", ids, "table")}`)
+        end
+        for i = 1, #ids do
+            local id = ids[i]
+            if type(id) ~= "number" then
+                fail(`{name}: {wrong_type(`id {i} of the list`, id, "number")}`)
+            end
+        end
+        return method(self, entity, ids, out)
+    end
+end
+
+-- Installs the checks of a debug world on the world and on the method table of its queries (see
+-- the checks of a debug world above); world:toggle and query:toggle_all check their arguments
+-- themselves. world:entity checks an id given to it: world:entity(nil) would make a new entity.
+local function debug_install(world: any, Query: any, alive: { number })
+    world.set = debug_change(alive, "world:set", world.set, true, false)
+    world.add = debug_change(alive, "world:add", world.add, true, false)
+    world.remove = debug_change(alive, "world:remove", world.remove, true, true)
+    world.delete = debug_change(alive, "world:delete", world.delete, false, false)
+    world.clear = debug_change(alive, "world:clear", world.clear, false, false)
+    Query.add_all = debug_batch(alive, "query:add_all", Query.add_all, false)
+    Query.set_all = debug_batch(alive, "query:set_all", Query.set_all, false)
+    Query.remove_all = debug_batch(alive, "query:remove_all", Query.remove_all, true)
+
+    local entity = world.entity
+    world.entity = function(self: any, ...: any): any
+        if select("#", ...) > 0 then
+            local id = ...
+            if type(id) ~= "number" then
+                fail(`world:entity: {wrong_type("the id", id, "number")}`)
+            end
+        end
+        return entity(self, ...)
+    end
+    world.get = debug_entity_ids("world:get", world.get)
+    world.has = debug_entity_ids("world:has", world.has)
+    world.get_list = debug_list("world:get_list", world.get_list)
+    world.has_all = debug_list("world:has_all", world.has_all)
+    world.expect = debug_args("world:expect", world.expect, "the entity", "the id")
+    world.contains = debug_args("world:contains", world.contains, "the entity")
+    world.exists = debug_args("world:exists", world.exists, "the entity")
+    world.target = debug_args("world:target", world.target, "the entity", "the relation")
+    world.targets = debug_args("world:targets", world.targets, "the entity", "the relation")
+    world.parent = debug_args("world:parent", world.parent, "the entity")
+    world.children = debug_args("world:children", world.children, "the parent")
+    world.each = debug_args("world:each", world.each, "the id")
+    world.ids = debug_args("world:ids", world.ids, "the entity")
+    world.column = debug_args("world:column", world.column, "the id")
+    world.remove_all = debug_args("world:remove_all", world.remove_all, "the id")
+    world.track = debug_args("world:track", world.track, "the id")
+    world.added = debug_args("world:added", world.added, "the id")
+    world.changed = debug_args("world:changed", world.changed, "the id")
+    world.removed = debug_args("world:removed", world.removed, "the id")
+    world.query = debug_ids("world:query", world.query)
+    Query.with = debug_ids("query:with", Query.with)
+    Query.without = debug_ids("query:without", Query.without)
+    Query.any = debug_ids("query:any", Query.any)
+    Query.has = debug_args("query:has", Query.has, "the entity")
+    Query.added = debug_args("query:added", Query.added, "the id")
+    Query.changed = debug_args("query:changed", Query.changed, "the id")
+    Query.removed = debug_args("query:removed", Query.removed, "the id")
 end
 
 -- The message of world:expect when the entity has no value of the id (see World.expect): what is
 -- missing, with the entity named `"Name" (#id)` and the id `Name` by their Name, else `#id` (a pair
 -- `(R, T)`, the wildcard `*`). It reads the world through its methods, so that it takes no
--- registers of world_new and costs only when there is an error. It returns the message:
--- world:expect raises the error itself, at the level of its caller (the compiler may inline this
--- function).
+-- registers of world_new and costs only when there is an error. It returns the message, which
+-- world:expect raises (see fail).
 local function expect_message(world: any, entity: i53, id: i53): string
     local alive: { number } = world:alive_table()
     -- an element of an id by its Name, else by its number (a slot for an element of a pair that
@@ -2656,10 +2886,9 @@ end
 
 -- A query must select entities: a required id, an OR term or a change filter. Excluded ids
 -- alone would match nothing, so a query used without such a term (iterated, counted, checked
--- with has, made a monitor, given to a batch operation) raises NO_TERMS from the query method,
--- at level 2 (the code that called it; the compiler may inline `selects`, so the method raises
--- the error itself). A query object without terms that is not used (jabby takes the metatable
--- of one) is not an error.
+-- with has, made a monitor, given to a batch operation) raises NO_TERMS from the query method
+-- (through fail, at the line that called it). A query object without terms that is not used
+-- (jabby takes the metatable of one) is not an error.
 local NO_TERMS = "a query needs a required id, an OR term or a change filter: excluded ids alone match nothing"
 local function selects(query: any): boolean
     return query.filter_with[1] ~= nil or query.any_groups ~= nil or query.tracking ~= nil
@@ -2840,13 +3069,24 @@ end
 
 -- Signals and change tracking take a component, a tag or a relation (which covers all its
 -- pairs), not a pair: the records of a pair come and go, and take their hooks from the
--- relation. `level` is the error level of the caller of the world method.
-local function check_signal_id(id: i53, level: number)
+-- relation.
+local function check_signal_id(id: i53)
     if id > PAIR_OFFSET then
-        error(
-            "signals and change tracking take a component, a tag or a relation (for all its pairs), not a pair",
-            level + 1
-        )
+        fail("signals and change tracking take a component, a tag or a relation (for all its pairs), not a pair")
+    end
+end
+
+-- The change filters of a query must name tracked ids (the tracked ids of its world: see
+-- world:track). A function of the module: in the world, the closure that calls it keeps fewer
+-- upvalues (a world takes about 50 bytes less than with the loop in the closure).
+local function check_tracked(tracked: { [i53]: any }, tracking: { { any } })
+    for _, filter in tracking do
+        if tracked[filter[2]] == nil then
+            if filter[2] == CREATED then
+                fail("the created filter needs world:track_created() first")
+            end
+            fail("change filters need a tracked id: call world:track(id) first")
+        end
     end
 end
 
@@ -2983,7 +3223,7 @@ local function world_new(debug: boolean?): World
         local slot = max_slot + 1
         local bounds = range
         if bounds and slot >= bounds[2] then
-            error("entity id is outside the range set by world:range")
+            fail("entity id is outside the range set by world:range")
         end
         max_slot = slot
         alive[slot] = slot
@@ -3889,10 +4129,10 @@ local function world_new(debug: boolean?): World
         local relation = alive[ECS_PAIR_FIRST(id)]
         local target = alive[ECS_PAIR_SECOND(id)]
         if relation == nil or relation <= 0 or target == nil or target <= 0 then
-            error("pair of an entity that is not alive", 3)
+            fail("pair of an entity that is not alive")
         end
         if relation == EcsWildcard or target == EcsWildcard then
-            error("wildcard pairs can only be used in queries", 3)
+            fail("wildcard pairs can only be used in queries")
         end
         local rel_slot = relation % ENTITY_MASK
         local rec =
@@ -3992,7 +4232,7 @@ local function world_new(debug: boolean?): World
     local function pair_add(entity: i53, slot: number, id: i53, value: any, with_value: boolean, existing: Record?)
         local rec = existing or records[id] or pair_record_create(id)
         if rec.kind ~= KIND_PAIR then
-            error("wildcard pairs can only be used in queries", 3)
+            fail("wildcard pairs can only be used in queries")
         end
         local words = rec.words
         local w = slot // 32 + 1
@@ -4010,7 +4250,7 @@ local function world_new(debug: boolean?): World
                         on_change(entity, id, value)
                     end
                 elseif value ~= nil then
-                    error("cannot set a value on a tag pair; the relation or the target must be a component", 3)
+                    fail("cannot set a value on a tag pair; the relation or the target must be a component")
                 end
             end
             return
@@ -4044,7 +4284,7 @@ local function world_new(debug: boolean?): World
             end
             replaced += 1
             if replaced > 100 then
-                error("the hooks of an exclusive relation keep giving the entity other targets", 3)
+                fail("the hooks of an exclusive relation keep giving the entity other targets")
             end
             local old_id = (victim :: Record).id
             if monitoring.list[1] == nil then
@@ -4156,7 +4396,7 @@ local function world_new(debug: boolean?): World
             if on_add then
                 on_add(entity, id, nil)
             end
-            error("cannot set a value on a tag pair; the relation or the target must be a component", 3)
+            fail("cannot set a value on a tag pair; the relation or the target must be a component")
         end
         if on_add then
             on_add(entity, id, value)
@@ -4216,7 +4456,7 @@ local function world_new(debug: boolean?): World
             if band(word, bit) ~= 0 then
                 -- already present: a tag, or a component whose value is nil
                 if not pages and value ~= nil then
-                    error("cannot set a value on a tag; add the Component trait (world:component()) to store data", 2)
+                    fail("cannot set a value on a tag; add the Component trait (world:component()) to store data")
                 end
                 if pages then
                     if not page then
@@ -4269,7 +4509,7 @@ local function world_new(debug: boolean?): World
             if on_add then
                 on_add(entity, id, nil)
             end
-            error("cannot set a value on a tag; add the Component trait (world:component()) to store data", 2)
+            fail("cannot set a value on a tag; add the Component trait (world:component()) to store data")
         end
         if on_add then
             on_add(entity, id, value)
@@ -4553,7 +4793,7 @@ local function world_new(debug: boolean?): World
             return va, vb, vc, vd
         end
         if overflow ~= nil then
-            error(TOO_MANY_IDS, 2)
+            fail(TOO_MANY_IDS)
         end
         return va,
             vb,
@@ -4658,7 +4898,7 @@ local function world_new(debug: boolean?): World
             return true
         end
         if overflow ~= nil then
-            error(TOO_MANY_IDS, 2)
+            fail(TOO_MANY_IDS)
         end
         return has_bit(e, w, bit) and has_bit(f, w, bit) and has_bit(g, w, bit) and has_bit(h, w, bit)
     end
@@ -5260,7 +5500,7 @@ local function world_new(debug: boolean?): World
         -- they are; then no member can be new.
         for round = 1, 101 do
             if round > 100 then
-                error("hooks keep giving an id to entities while it is deleted", 0)
+                fail("hooks keep giving an id to entities while it is deleted")
             end
             local has_hook = rec.on_remove ~= nil
             local stripped = not delete
@@ -5316,7 +5556,7 @@ local function world_new(debug: boolean?): World
             while next(pairs_of) ~= nil do
                 rounds += 1
                 if rounds > 100 then
-                    error("hooks keep making pairs of an entity while it is deleted", 0)
+                    fail("hooks keep making pairs of an entity while it is deleted")
                 end
                 local list: { Record } = {}
                 for _, pair_rec in pairs_of do
@@ -5342,7 +5582,7 @@ local function world_new(debug: boolean?): World
             while next(pairs_of) ~= nil do
                 rounds += 1
                 if rounds > 100 then
-                    error("hooks keep making pairs of an entity while it is deleted", 0)
+                    fail("hooks keep making pairs of an entity while it is deleted")
                 end
                 local list: { Record } = {}
                 for _, pair_rec in pairs_of do
@@ -5399,7 +5639,7 @@ local function world_new(debug: boolean?): World
             repeat
                 rounds += 1
                 if rounds > 100 then
-                    error("hooks keep giving an entity ids or uses while it is deleted", 0)
+                    fail("hooks keep giving an entity ids or uses while it is deleted")
                 end
                 id_used[slot] = false
                 cleanup_ids(entity, delete_policy == true)
@@ -5548,7 +5788,7 @@ local function world_new(debug: boolean?): World
                 end
                 rounds += 1
                 if rounds > 100 then
-                    error("hooks keep making entities in the slot of an explicit id", 2)
+                    fail("hooks keep making entities in the slot of an explicit id")
                 end
                 world_delete(world, current)
                 current = alive[slot]
@@ -5598,7 +5838,7 @@ local function world_new(debug: boolean?): World
         if range and last >= range[2] then
             last = range[2] - 1
             if last < first then
-                error("entity id is outside the range set by world:range", 3)
+                fail("entity id is outside the range set by world:range")
             end
         end
         -- pushed from the last slot: world:entity() takes them in ascending order
@@ -6075,17 +6315,17 @@ local function world_new(debug: boolean?): World
     end
 
     local function world_added(_: any, id: i53, listener: Hook): () -> ()
-        check_signal_id(id, 2)
+        check_signal_id(id)
         return connect("on_add", id, listener)
     end
 
     local function world_changed(_: any, id: i53, listener: Hook): () -> ()
-        check_signal_id(id, 2)
+        check_signal_id(id)
         return connect("on_change", id, listener)
     end
 
     local function world_removed(_: any, id: i53, listener: Hook): () -> ()
-        check_signal_id(id, 2)
+        check_signal_id(id)
         return connect("on_remove", id, listener)
     end
 
@@ -6116,7 +6356,7 @@ local function world_new(debug: boolean?): World
     end
 
     local function world_track(_: any, id: i53)
-        check_signal_id(id, 2)
+        check_signal_id(id)
         if tracked[id] then
             return
         end
@@ -6207,8 +6447,12 @@ local function world_new(debug: boolean?): World
     end
 
     -- Ticks a query sees now: from its first unseen tick to the last finished one, at most
-    -- TRACK_TICKS - 1 of them (older history has been overwritten).
+    -- TRACK_TICKS - 1 of them (older history has been overwritten). A change filter of an id
+    -- that is not tracked raises its error here, before anything else: before the query marks
+    -- the ticks as seen (plan_query) and whatever the entity (query_has), so that every use of
+    -- such a query raises it, whatever the changes.
     local function tracking_window(query: QueryState): (number, number)
+        check_tracked(tracked, query.tracking :: { { any } })
         local last = current_tick - 1
         local first = query.seen_tick or last
         if first < last - TRACK_TICKS + 2 then
@@ -6217,16 +6461,10 @@ local function world_new(debug: boolean?): World
         return first, last
     end
 
-    -- The bitset of one change filter over a window of ticks (a record-like table).
-    local function tracking_record(id: i53, kind: string, first: number, last: number): Record?
-        local rings = tracked[id]
-        if rings == nil then
-            if id == CREATED then
-                error("the created filter needs world:track_created() first", 4)
-            end
-            error("change filters need a tracked id: call world:track(id) first", 4)
-        end
-        local ring = rings[kind]
+    -- The bitset of one change filter of a tracked id (see tracking_window) over a window of
+    -- ticks (a record-like table).
+    local function tracking_record(id: i53, kind: string, first: number, last: number): Record
+        local ring = tracked[id][kind]
         if first == last then
             return ring[first % TRACK_TICKS + 1]
         end
@@ -6307,7 +6545,7 @@ local function world_new(debug: boolean?): World
             end
             local terms: { Record } = {}
             for _, filter in tracking do
-                local rec = tracking_record(filter[2], filter[1], first, last) :: Record
+                local rec = tracking_record(filter[2], filter[1], first, last)
                 if rec.word_count == 0 then
                     return nil, EMPTY_WORDS, EMPTY_WORDS
                 end
@@ -8185,7 +8423,7 @@ local function world_new(debug: boolean?): World
             end
         end
         if not ok or i ~= #slots or query.list_count ~= i then
-            error("mErCS: the match list of a cached query differs from its bitsets (a library bug)", 4)
+            fail("mErCS: the match list of a cached query differs from its bitsets (a library bug)")
         end
     end
 
@@ -8472,7 +8710,7 @@ local function world_new(debug: boolean?): World
         local listed = query.list_stamp == changes_stamp
         if listed then
             if debug and not list_unchanged(query) then
-                error("mErCS: a cached query missed a change of its records (a library bug)", 2)
+                fail("mErCS: a cached query missed a change of its records (a library bug)")
             end
         elseif list_unchanged(query) then
             listed = true
@@ -8481,7 +8719,7 @@ local function world_new(debug: boolean?): World
             -- a query that selects nothing never has a list: it is refused here, so that the
             -- loops over lists that are up to date pay nothing for the check
             if not selects(query) then
-                error(NO_TERMS, 2)
+                fail(NO_TERMS)
             end
             if iteration_mode(query) == 2 then
                 listed = true
@@ -8516,7 +8754,7 @@ local function world_new(debug: boolean?): World
             -- nothing that a cached query observes changed since this one found its list up to
             -- date
             if debug and not list_unchanged(query) then
-                error("mErCS: a cached query missed a change of its records (a library bug)", 2)
+                fail("mErCS: a cached query missed a change of its records (a library bug)")
             end
             if query.list_groups > 0 then
                 local epoch = query.list_epoch
@@ -8542,7 +8780,7 @@ local function world_new(debug: boolean?): World
         end
         if not stable and not selects(query) then
             -- a query that selects nothing never has a list (see query_iter)
-            error(NO_TERMS, 2)
+            fail(NO_TERMS)
         end
         if stable or iteration_mode(query) == 2 then
             query.list_stamp = changes_stamp
@@ -9154,12 +9392,17 @@ local function world_new(debug: boolean?): World
 
     -- True when the entity matches the query.
     local function query_has(query: QueryState, entity: i53): boolean
+        local tracking = query.tracking
+        local first, last = 0, -1
+        if tracking then
+            first, last = tracking_window(query) -- first: an untracked filter raises for any entity
+        end
         local slot = entity % ENTITY_MASK
         if alive[slot] ~= entity then
             return false
         end
         local filter_with = query.filter_with
-        if filter_with[1] == nil and query.any_groups == nil and query.tracking == nil then
+        if filter_with[1] == nil and query.any_groups == nil and tracking == nil then
             return false -- a query without terms matches nothing (see plan_query)
         end
         local w = slot // 32 + 1
@@ -9200,20 +9443,15 @@ local function world_new(debug: boolean?): World
                 end
             end
         end
-        local tracking = query.tracking
         if tracking then
-            local first, last = tracking_window(query)
             for _, filter in tracking do
-                local rings = tracked[filter[2]]
+                local ring = tracked[filter[2]][filter[1]]
                 local found = false
-                if rings then
-                    local ring = rings[filter[1]]
-                    for t = first, last do
-                        local word = ring[t % TRACK_TICKS + 1].words[w]
-                        if word and band(word, bit) ~= 0 then
-                            found = true
-                            break
-                        end
+                for t = first, last do
+                    local word = ring[t % TRACK_TICKS + 1].words[w]
+                    if word and band(word, bit) ~= 0 then
+                        found = true
+                        break
                     end
                 end
                 if not found then
@@ -9325,7 +9563,7 @@ local function world_new(debug: boolean?): World
         end
         local pages = rec.pages
         if set and value ~= nil and not pages then
-            error("cannot set a value on a tag; add the Component trait (world:component()) to store data", 3)
+            fail("cannot set a value on a tag; add the Component trait (world:component()) to store data")
         end
         local fill = set and pages ~= nil and pages ~= false
         local buffer = match_buffer
@@ -9689,7 +9927,7 @@ local function world_new(debug: boolean?): World
     function Query.cached(self: QueryHandle): QueryHandle
         local state = self.state
         if not selects(state) then
-            error(NO_TERMS, 2)
+            fail(NO_TERMS)
         end
         if not (state.first_use and promote(state)) then
             make_cached(state)
@@ -9704,7 +9942,7 @@ local function world_new(debug: boolean?): World
 
     function Query.has(self: QueryHandle, entity: i53): boolean
         if not selects(self.state) then
-            error(NO_TERMS, 2)
+            fail(NO_TERMS)
         end
         return query_has(self.state, entity)
     end
@@ -9712,35 +9950,35 @@ local function world_new(debug: boolean?): World
     -- Batch operations on the entities that match the query at the time of the call.
     function Query.count(self: QueryHandle): number
         if not selects(self.state) then
-            error(NO_TERMS, 2)
+            fail(NO_TERMS)
         end
         return query_count(self.state)
     end
 
     function Query.add_all(self: QueryHandle, id: i53)
         if not selects(self.state) then
-            error(NO_TERMS, 2)
+            fail(NO_TERMS)
         end
         query_insert(self.state, id, nil, false)
     end
 
     function Query.set_all(self: QueryHandle, id: i53, value: any)
         if not selects(self.state) then
-            error(NO_TERMS, 2)
+            fail(NO_TERMS)
         end
         query_insert(self.state, id, value, true)
     end
 
     function Query.remove_all(self: QueryHandle, id: i53)
         if not selects(self.state) then
-            error(NO_TERMS, 2)
+            fail(NO_TERMS)
         end
         query_remove(self.state, id)
     end
 
     function Query.delete_all(self: QueryHandle)
         if not selects(self.state) then
-            error(NO_TERMS, 2)
+            fail(NO_TERMS)
         end
         query_delete(self.state)
     end
@@ -9752,13 +9990,13 @@ local function world_new(debug: boolean?): World
     -- function: it takes no register of world_new.)
     function Query.toggle_all(self: QueryHandle, id: i53)
         if debug then
-            debug_check_id(alive, id, 3, false)
+            debug_check_id(alive, "query:toggle_all", id, false)
         elseif id > PAIR_OFFSET and is_wildcard(id) then
-            error("toggle takes a component, a tag or a pair, not a wildcard", 2)
+            fail("toggle takes a component, a tag or a pair, not a wildcard")
         end
         local query = self.state
         if not selects(query) then
-            error(NO_TERMS, 2)
+            fail(NO_TERMS)
         end
         local n = match_words(query)
         if n == 0 then
@@ -9846,7 +10084,7 @@ local function world_new(debug: boolean?): World
     -- Fast path: iterator of (first_slot, last_slot, mask), see make_advance.
     function Query.spans(self: QueryHandle): () -> (number?, number?, number)
         if not selects(self.state) then
-            error(NO_TERMS, 2)
+            fail(NO_TERMS)
         end
         local driver, others, without = plan_query(self.state)
         if driver == nil then
@@ -9982,10 +10220,10 @@ local function world_new(debug: boolean?): World
     function Query.monitor(self: QueryHandle): Monitor
         local state = self.state
         if not selects(state) then
-            error(NO_TERMS, 2)
+            fail(NO_TERMS)
         end
         if state.tracking then
-            error("a monitor cannot use change filters", 2)
+            fail("a monitor cannot use change filters")
         end
         -- the terms as they are now: a modifier of a query that is not shared changes its state
         -- in place, the monitor keeps its own copy
@@ -10019,7 +10257,7 @@ local function world_new(debug: boolean?): World
             if id > PAIR_OFFSET then
                 local relation_slot = ECS_PAIR_FIRST(id)
                 if relation_slot == EcsWildcard then
-                    error("a monitor cannot use a term (*, T): the signals of a pair are those of its relation", 3)
+                    fail("a monitor cannot use a term (*, T): the signals of a pair are those of its relation")
                 end
                 local relation = alive[relation_slot]
                 if relation > 0 then
@@ -10440,10 +10678,10 @@ local function world_new(debug: boolean?): World
     -- added. (Written here, not as local functions: they take no registers of world_new.)
     world.toggle = function(_: any, entity: i53, id: i53): boolean
         if debug then
-            debug_check_entity(alive, entity, 3)
-            debug_check_id(alive, id, 3, false)
+            debug_check_entity(alive, "world:toggle", entity)
+            debug_check_id(alive, "world:toggle", id, false)
         elseif id > PAIR_OFFSET and is_wildcard(id) then
-            error("toggle takes a component, a tag or a pair, not a wildcard", 2)
+            fail("toggle takes a component, a tag or a pair, not a wildcard")
         end
         if alive[entity % ENTITY_MASK] ~= entity then
             return false
@@ -10460,8 +10698,8 @@ local function world_new(debug: boolean?): World
     end
 
     -- The value of an id that the entity must have: world_get of one id, and instead of nil an
-    -- error that names both (see expect_message), raised at the level of the caller. (Written
-    -- here, not as a local function: it takes no register of world_new.)
+    -- error that names both (see expect_message), raised at the line of the caller (see fail).
+    -- (Written here, not as a local function: it takes no register of world_new.)
     world.expect = function(_: any, entity: i53, id: i53): any
         local slot = entity % ENTITY_MASK
         if alive[slot] == entity then
@@ -10477,7 +10715,7 @@ local function world_new(debug: boolean?): World
                 return value
             end
         end
-        error(expect_message(world, entity, id), 2)
+        return fail(expect_message(world, entity, id))
     end
 
     -- Starts recording the entities made from now on (world:entity, a pool, world:entity(id)
@@ -10500,55 +10738,14 @@ local function world_new(debug: boolean?): World
         end
     end
 
-    -- Debug mode (ecs.world(true)): set/add/remove/delete/clear raise an error for an entity
-    -- that is not alive (an outdated handle) or an id that is not alive, instead of ignoring
-    -- the call. Internal calls (cascades) are not checked. Patched match lists are checked by
-    -- iteration_mode (verify_list), the lists taken as they are by the loops (list_stamp).
+    -- Debug mode (ecs.world(true)): the methods of the world and of its queries check their
+    -- arguments first (see debug_install): a change raises an error for an entity or an id that
+    -- is not alive (an outdated handle) instead of ignoring the call, every other method for an
+    -- entity or an id that is not a number. Internal calls (cascades) are not checked. Patched
+    -- match lists are checked by iteration_mode (verify_list), the lists taken as they are by the
+    -- loops (list_stamp).
     if debug then
-        world.set = function(_: any, entity: i53, id: i53, value: any)
-            debug_check_entity(alive, entity, 3)
-            debug_check_id(alive, id, 3, false)
-            world_set(world, entity, id, value)
-        end
-        world.add = function(_: any, entity: i53, id: i53)
-            debug_check_entity(alive, entity, 3)
-            debug_check_id(alive, id, 3, false)
-            world_add(world, entity, id)
-        end
-        world.remove = function(_: any, entity: i53, id: i53)
-            debug_check_entity(alive, entity, 3)
-            debug_check_id(alive, id, 3, true)
-            world_remove(world, entity, id)
-        end
-        world.delete = function(_: any, entity: i53)
-            debug_check_entity(alive, entity, 3)
-            world_delete(world, entity)
-        end
-        world.clear = function(_: any, entity: i53)
-            debug_check_entity(alive, entity, 3)
-            world_clear(world, entity)
-        end
-        function Query.add_all(self: QueryHandle, id: i53)
-            debug_check_id(alive, id, 3, false)
-            if not selects(self.state) then
-                error(NO_TERMS, 2)
-            end
-            query_insert(self.state, id, nil, false)
-        end
-        function Query.set_all(self: QueryHandle, id: i53, value: any)
-            debug_check_id(alive, id, 3, false)
-            if not selects(self.state) then
-                error(NO_TERMS, 2)
-            end
-            query_insert(self.state, id, value, true)
-        end
-        function Query.remove_all(self: QueryHandle, id: i53)
-            debug_check_id(alive, id, 3, true)
-            if not selects(self.state) then
-                error(NO_TERMS, 2)
-            end
-            query_remove(self.state, id)
-        end
+        debug_install(world, Query, alive)
     end
 
     -- The builtin ids and the pre-registered ones: a function of its own, whose loops and
@@ -10622,7 +10819,7 @@ local function world_new(debug: boolean?): World
                 if not ok then
                     error(problem, 0)
                 end
-                error("the Exclusive trait cannot be added to a relation that an entity has with several targets", 0)
+                fail("the Exclusive trait cannot be added to a relation that an entity has with several targets")
             end
             wc.exclusive = true
         end)
@@ -10669,7 +10866,7 @@ local function world_new(debug: boolean?): World
                 if not ok then
                     error(problem, 0)
                 end
-                error("the Component trait cannot be added to an id used already: give it before the first use", 0)
+                fail("the Component trait cannot be added to an id used already: give it before the first use")
             end
         end)
         set_internal_hook(EcsComponent, "on_remove", function(entity: i53, _: i53, deleting: any?)
@@ -10688,7 +10885,7 @@ local function world_new(debug: boolean?): World
                 clearing[depth] = nil
                 clear_depth = depth - 1
             end
-            error("the Component trait cannot be removed from an id used already", 0)
+            fail("the Component trait cannot be removed from an id used already")
         end)
     end)()
 
@@ -10714,6 +10911,21 @@ local function pair_second(world: World, pair: i53): i53
     return if entity and entity > 0 then entity else 0
 end
 
+-- ecs.pair: ECS_PAIR that refuses a nil element (an id read from a table by a name that the
+-- table does not have) at the line of the call; the arithmetic of ECS_PAIR would raise inside
+-- this module. It belongs to no world, so it checks in any world: the test of nil costs nothing
+-- in native code, which takes the arguments as the numbers they are annotated with (a call with
+-- other values runs in the interpreter), and the interpreter less than a test of the types. The
+-- arithmetic is written out: a call of ECS_PAIR would cost the interpreter more.
+local function pair(first: i53, second: i53): i53
+    if first == nil or second == nil then
+        fail(`ecs.pair: the {if first == nil then "relation" else "target"} is nil`)
+    end
+    first %= ENTITY_MASK
+    second %= ENTITY_MASK
+    return second + first * ENTITY_MASK + PAIR_OFFSET
+end
+
 return {
     world = (world_new :: any) :: (debug: boolean?) -> World,
     component = (ECS_COMPONENT :: any) :: <T>() -> Component<T>,
@@ -10724,7 +10936,7 @@ return {
         return id + generation * ENTITY_MASK
     end :: any) :: (id: number, generation: number) -> Entity,
 
-    pair = (ECS_PAIR :: any) :: <P, O>(first: Id<P>, second: Id<O>) -> Pair<P, O>,
+    pair = (pair :: any) :: <P, O>(first: Id<P>, second: Id<O>) -> Pair<P, O>,
     IS_PAIR = (ECS_IS_PAIR :: any) :: (id: Id) -> boolean,
     pair_first = (pair_first :: any) :: (world: World, pair: Id) -> Entity,
     pair_second = (pair_second :: any) :: (world: World, pair: Id) -> Entity,

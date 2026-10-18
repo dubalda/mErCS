@@ -33,11 +33,31 @@ local world = ecs.world()
 ## Worlds, entities and ids
 
 A world holds entities and the components, tags and pairs on them. `ecs.world(true)` makes a
-debug world: changes of entities or ids that are not alive raise errors instead of being
-ignored (a pair whose relation or target has a free slot raises an error in any world: a pair
-keeps the slots of its elements), which helps while code is written or migrated; every match list that a cached query
-updates after a change (see [Queries](#queries)) is checked against a scan of the bitsets, and
-a query that takes its list as it is checks that none of its ids changed.
+debug world, which helps while code is written, migrated or diagnosed: the methods of the world
+and of its queries check their arguments first, and the error names the method and the
+argument.
+
+- Changes of entities or ids that are not alive raise errors instead of being ignored:
+  `world:set: entity 4194561 is not alive: an outdated handle or a deleted entity`. (A pair
+  whose relation or target has a free slot raises an error in any world: a pair keeps the slots
+  of its elements.)
+- Every other method raises an error for an entity or an id that is not a number, such as a nil
+  read from a table of ids by a name that the table does not have: `world:query: id 2 is nil`,
+  `query:with: id 1 is nil`, `world:get: the entity is nil`, `world:each: the id is nil`. A nil
+  passed after the last id counts too: `world:get(e, A, missing)`. These methods do not check
+  whether an id is alive: a dead id reads nothing, as in any world.
+- Every match list that a cached query updates after a change (see [Queries](#queries)) is
+  checked against a scan of the bitsets, and a query that takes its list as it is checks that
+  none of its ids changed.
+
+The checks cost every call of a debug world (a read of one id takes about 1.5 times as long); a
+world without debug makes none of them. `ecs.pair` belongs to no world and refuses a nil
+element in any world: `world:get(e, ecs.pair(Likes, missing))` raises
+`ecs.pair: the target is nil`.
+
+An error that a call raises for a mistake of its caller (a value set on a tag, a query without
+terms, an argument that a debug world refuses) points at the line of that call, in any world;
+in a hook or a listener, at the line of the hook.
 
 Entity ids are numbers: slot + generation × 2^24. A deleted slot is reused with the next
 generation, so an old handle of it is not alive anymore — `world:contains(e)` tells.
@@ -452,6 +472,8 @@ world:tick() -- once per frame: this frame's changes become visible
 - Untracked ids cost nothing. A tracked id costs a call per add, change or remove; deleting
   an entity costs extra only when it changed during the last 8 ticks (the current one
   included).
+- A change filter of an id that is not tracked raises an error at every use of its query: a
+  loop, `each`, `count`, `has`, a batch operation.
 
 New entities are tracked for the whole world:
 
@@ -464,6 +486,7 @@ for entity, model in spawned do end
 - `world:track_created()` records the entities made from then on: `world:entity()`, a slot
   pool, and `world:entity(id)` when it makes an id alive. `:created()` filters a query by them
   with the ticks of the other change filters; `world:query():created()` returns all of them.
+  Without `world:track_created()`, a query with `:created()` raises an error at every use.
 - A deleted entity is gone from the filter; a new entity in its slot is a new creation.
 - A world that does not track creations pays a test per new entity; one that does pays a bit.
 
