@@ -1,5 +1,143 @@
 # Changelog
 
+## v1.3.0 — 2026-11-07
+
+### Changed behavior
+
+What the calls return and in which order stay those of 1.2.0, except for two things: what a loop
+over the bitsets of a query returns for an entity that its body deleted ahead of it, and the
+arguments of `OnChange` hooks and `world:changed` listeners.
+
+- **A loop over the bitsets skips an entity that its body deleted ahead of it.** A for-in loop of
+  a query that passes over the bitsets (a query written inline whose smallest term spans more
+  than 2 048 slots; a stored or cached query whose matches are dense, or changed much since its
+  previous loop) reads the current run of matching slots, or the matches left in a 32-slot word,
+  before its body runs.
+  - Before (1.0.0–1.2.0): an entity of that word that the body deleted came back as a negative
+    number (the mark of the free slot, `-1 -` the next id of the slot), the id of no entity. In a
+    run of full words (32 matching slots in a row, within one value page of 256 slots) the loop
+    did not end: it went on from slot 2 and returned every slot up to the end of the run, the
+    ids of components and entities without the ids of the query included (they pass
+    `world:contains`), and came to the freed slot again.
+  - After: the loop skips the slot, as it did when the deleted entity lay in another word. An
+    entity that took the slot during the loop is returned in its place, whatever its ids. The
+    match list of a stored query and the matches that a small query gathers first return the
+    dead id once, as before, with the values that its slot holds when the loop reaches it (those
+    of an entity that took the slot, if it has them); `query:each` over the bitsets skipped such
+    a slot already.
+  - The check costs a comparison per returned entity in these loops only (see Performance).
+- **`OnChange` hooks and `world:changed` listeners get the value that the change replaced**, as a
+  fourth argument: `world:changed(Stats, function(entity, id, stats, previous) end)`.
+  - Before: `(entity, id, value)`.
+  - After: `(entity, id, value, previous)`, from `world:set` and `query:set_all`, for components
+    and data pairs. `previous` is nil when the entity had the id without a value (after
+    `world:set(e, id, nil)`); a table changed in place and set again is the same value before
+    and after. In an exclusive replacement whose removal hook set the new pair, it is the value
+    that the hook gave. A listener with three parameters gets what it got; code that reads `...`
+    or `select("#", ...)` sees four values, and a hook written for jecs, whose fourth argument is
+    `oldarchetype`, gets the replaced value instead.
+  - Types: `ecs.OnChange` is `Component<(entity: Entity, id: Id, value: any?, previous: any?) -> ()>`
+    and the listener of `world:changed` is `(entity: Entity, id: Id<T>, value: T, previous: T?) -> ()`;
+    listeners with fewer parameters type-check as before. `OnAdd`, `OnRemove`, `world:added` and
+    `world:removed` keep their arguments.
+  - The value is the one that the set reads anyway; an id without an `OnChange` hook or listener
+    reads nothing more.
+
+### Tests and tools
+
+- `test/cases/workload.luau`, loops: a query loop that deletes matches ahead of it ends, returns
+  no id twice and no id that never matched, and returns every match of the start that the body
+  did not delete with its own values: queries written inline over runs of full words (0, 1, 2 and
+  9 returned values), stored and cached queries after loops that matched nothing, partial words,
+  a stored query with a match list and a small query, each with and without entities made in the
+  loop. 1.2.0 fails 16 of its 20 loops.
+- `test/loops_fuzz.luau`: blocks of adjacent entities that have every component and tag (runs of
+  full words), changes of entities a few places ahead of the current one, and an inline query of
+  a shape of its own in every round (a pass over the bitsets); every loop must end and return only
+  entity ids that matched at the start or that the loop touched or made. 1.2.0 fails it with each
+  of the seeds 1–10.
+- `test/cases/hooks.luau`: the value that a change replaced, given to an `OnChange` hook and a
+  `changed` listener: a component (an addition gives none, a set of nil gives the old value, the
+  next set gives nil), `set_all`, a data pair through the hook and the listener of its relation,
+  a set from a listener, and an exclusive replacement whose removal hook set the new pair.
+- `test/types.luau`: `OnChange` hooks and `changed` listeners with three and four parameters;
+  `test/typecheck/errors.luau`: a listener whose `previous` has another type is rejected.
+- `tools/generate.py` generates the step of the loops over the bitsets that skips a freed slot.
+
+### Documentation
+
+- The guide, the API reference (`Query`, `World:changed`, `World:set`, `ecs.OnChange`) and the
+  jecs page say what a loop returns for an entity deleted ahead of it (it is skipped, or returned
+  once as a dead id with the values that its slot holds when the loop reaches it: `world:contains`
+  is the test, and a loop that also makes entities checks the values it reads), and describe the
+  fourth argument of `OnChange` hooks and `changed` listeners; the jecs page notes it among the
+  differences and in the migration (it is not `oldarchetype`).
+- The comparison pages, the README and the page of the previous release carry the measurements of
+  1.3.0.
+
+### Performance on the reference workload
+
+Both versions are measured with the reference workload model of this release on Luau 0.740,
+`-O2`, in the interpreter and native code, with Roblox Studio and the Roblox player open on the
+machine (their load widens the noise of every row). The
+[full report](https://github.com/dubalda/mErCS/blob/main/bench/results/1.3.0.md) and
+[raw samples](https://github.com/dubalda/mErCS/blob/main/bench/results/1.3.0.json) contain 232
+comparison rows from 520 isolated processes: the release run, and 15 more repeats of the stored
+queries at their periods (P4) and the frame model (P7) in the interpreter at the four scales of
+the server. The release run flagged P4 at the target scale without owned entities in the
+interpreter (1.049×); with all repeats it takes 1.041×, within the noise, and no timing row is
+slower than the noise. The loops whose step this release changes cost a little more in the
+interpreter, within the noise of each row: P4 takes 1.025–1.041× and P7 1.015–1.025× of the time of
+1.2.0 at the four scales of the server. In native code, which runs the server, the frame model
+takes 1.003–1.027× (1.014× at the target scale) and the lifecycle events of P6 0.95–1.07×, within
+the noise; the client profile (P4, usually empty queries; P7, its frame) takes 1.03× / 1.00× and
+1.01× / 1.00× (interpreter / native). A build that tested `e > 0` instead of `e >= s` in the step
+was measured first: with 20 repeats its P4 at the target scale without owned entities took 1.065×
+in the interpreter, beyond the noise; the comparison of two registers takes one instruction less
+there. In a loop that only iterates (66 000–100 000 matches, an empty body), a returned entity
+costs 3–6 % more in native code and 5–7 % more in the interpreter (1–4 ns). The release improves
+no test: the row smaller beyond the noise (P8 bytes per distinct pair at the small scale in the
+interpreter, 0.9985×) is one step of the resolution. µs, medians [min–max] of each version's two
+control columns:
+
+| Mode | Scale | P7, µs/frame: 1.2.0 → 1.3.0 | P6, the removal of a retained agent, µs: 1.2.0 → 1.3.0 |
+|---|---|---|---|
+| native | small | 99.34 [97.25–101.30] → 102.03 [98.46–111.24] | 48.57 [44.00–56.45] → 52.15 [49.60–56.80] |
+| native | target | 338.89 [331.14–342.11] → 343.71 [338.49–361.42] | 1042.7 [1020.8–1148.6] → 1048.6 [1029.7–1073.7] |
+| native | small-empty-retained | 100.18 [96.29–104.14] → 101.16 [99.27–106.58] | 16.35 [14.80–19.55] → 15.57 [14.30–21.35] |
+| native | target-empty-retained | 324.88 [316.72–383.50] → 325.89 [316.38–343.18] | 22.5 [20.7–29.5] → 23.2 [20.7–25.6] |
+| interpreter | small | 158.06 [155.05–179.14] → 160.41 [156.68–182.35] | 73.25 [70.55–79.10] → 75.47 [67.70–82.65] |
+| interpreter | target | 496.31 [485.18–529.37] → 508.52 [489.84–541.46] | 1570.1 [1541.4–1648.4] → 1563.2 [1515.2–1646.0] |
+| interpreter | small-empty-retained | 157.12 [154.62–161.79] → 159.71 [155.88–229.24] | 23.50 [21.25–27.25] → 22.57 [21.65–27.50] |
+| interpreter | target-empty-retained | 485.89 [474.93–509.91] → 496.10 [484.60–742.41] | 33.1 [29.5–36.5] → 32.2 [30.3–35.7] |
+
+Single operations ([1.3.0 and 1.2.0](https://github.com/dubalda/mErCS/blob/main/docs/comparison/previous-release.md),
+measured with the comparison with jecs) have a median ratio of 1.00× in both modes over 95 rows.
+The for-in loops of queries over dense matches pay the comparison per returned entity: one value
+of an entity with 4 components takes 40.1 / 29.2 instead of 36.9 / 27.9 ns per match (1.09× /
+1.05×, interpreter / native), four values 1.04–1.06× in the interpreter and 0.98–1.04× in native
+code, a query created and iterated once 1.06× / 1.06×; `query:each` and the loops over a match
+list or a sparse match take the time of 1.2.0. The matrix and the synthetic frame were measured
+fifteen times in each mode. The
+[complete measurements](https://github.com/dubalda/mErCS/blob/main/bench/results/1.3.0-comparison.md)
+also compare this campaign with that of 1.2.0, on the same machine: the same code took 0.97–1.07
+of its time there.
+
+### Memory
+
+A new world takes 56 586 bytes in both versions (200 worlds kept alive), a debug world 60 216:
+1.3.0 adds no field and no closure to a world (the dispatcher of the listeners of a change is made
+when the first of them connects, the function that reads a replaced value is a function of the
+module), and no per-entity, per-pair or per-query field. The heap of the target world (P8) is
+137.63 MB after it is built and 138.57 MB after 100 lifecycle rounds in both versions, a distinct
+pair with its holder takes 1 527.8 bytes and a holder of a pair 37.1 bytes in both; a loop over a
+stored query allocates nothing, and the frame model grows the heap by the bytes of 1.2.0 (P9).
+The rows of bytes per distinct pair move by steps of one KiB over the pairs of a scale: one is
+flagged, the small scale in native code (+1.72 bytes, one step over its 594 pairs), and the same
+row of the interpreter moved one step down. A world of the client profile takes the bytes of 1.2.0
+to within the 16–32 bytes by which two measurements of one build differ, 182 592 bytes after
+6 000 and after 9 000 frames in both: nothing accumulates.
+
 ## v1.2.0 — 2026-10-18
 
 ### Changed behavior

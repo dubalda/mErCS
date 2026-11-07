@@ -73,8 +73,14 @@ local _target: ecs.Entity? = world:target(e, ecs.ChildOf)
 for _child in world:children(parent) do
 end
 
--- hooks and signals
+-- hooks and signals (an OnChange hook and a changed listener may take the replaced value)
 world:set(Health, ecs.OnChange, function(_entity, _id, _value) end)
+world:set(Health, ecs.OnChange, function(_entity, _id, _value, _previous) end)
+local disconnect_change = world:changed(Health, function(_entity, _id, value: number, previous: number?)
+    local _delta: number = value - (previous or value)
+end)
+disconnect_change()
+world:changed(Health, function(_entity, _id, _value: number) end)()
 local disconnect = world:removed(Position, function(_entity, _id, _deleted) end)
 disconnect()
 
