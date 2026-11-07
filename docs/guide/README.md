@@ -209,9 +209,14 @@ local ok = q:has(entity)                          -- the entity matches the quer
   iterated yet (picks how it iterates and builds its list), so that its first loop costs no
   more than the next ones. An iteration of a stored query allocates nothing.
 - Changing the current entity inside the loop is allowed, deleting it too. Changes of other
-  entities may or may not be seen by the running loop; an entity deleted ahead of the loop
-  (for example by a `ChildOf` cascade) may still be returned once, as a dead id with nil
-  values: loops that delete other entities should check `world:contains(e)`.
+  entities may or may not be seen by the running loop: one ahead of the loop that loses a
+  returned component may still be returned, with nil for it. An entity deleted ahead of the
+  loop (for example by a `ChildOf` cascade) is either skipped or returned once as a dead id,
+  with the values that its slot holds when the loop reaches it: nil, or those of an entity
+  made during the loop that took the slot. Such an entity may also be returned in place of the
+  dead id, even when it does not match the query. So a loop that deletes other entities checks
+  `world:contains(e)` and reads no values of a dead id, and one that also makes entities checks
+  the values it reads for nil.
 - Loops over the same query may be nested, also when the inner loop changes the world, and a
   for-in loop may be left with `break` (the next update of the list copies it once). The
   iteration order is ascending by entity slot.
@@ -318,7 +323,7 @@ for entity in world:query(ecs.pair(Likes, ecs.Wildcard)) do end -- any target of
 
 ```luau
 world:set(Health, ecs.OnAdd, function(entity, id, value) end)
-world:set(Health, ecs.OnChange, function(entity, id, value) end)
+world:set(Health, ecs.OnChange, function(entity, id, value, previous) end)
 world:set(Health, ecs.OnRemove, function(entity, id, deleting) end)
 
 local disconnect = world:added(Health, function(entity, id, value) end) -- also changed / removed
@@ -326,6 +331,10 @@ disconnect()
 ```
 
 - Hooks may be set and removed at any time; hooks set on a relation apply to all its pairs.
+- `OnChange` hooks and `world:changed` listeners get the value that the change replaced as
+  their fourth argument: nil when the entity had the id without a value (after
+  `world:set(e, id, nil)`). A table changed in place and set again is the same value before
+  and after.
 - A hook and the signal listeners of an id (change tracking included) all run, the hook
   first, whatever the order they were set in. They run after what the library itself does
   for its builtin ids (`Exclusive`, `OnAdd`, `OnChange`, `OnRemove`), which they cannot

@@ -42,6 +42,7 @@ world:query(Health):each(function(_entity, _value: string) end) -- error: Expect
 for _entity, _value: string in world:query(Health) do end -- error: Expected the 2nd return value to be
 world:added(Health, function(_entity, _id, _value: string) end) -- error: No valid instantiation could be inferred
 world:changed(Label, function(_entity, _id, _value: number) end) -- error: No valid instantiation could be inferred
+world:changed(Health, function(_entity, _id, _value: number, _previous: string?) end) -- error: No valid instantiation could be inferred
 
 -- a string or a number where an id goes
 world:set(e, "Health", 1) -- error: but got 'string'

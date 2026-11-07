@@ -9,9 +9,12 @@
     did not finish, the target being cleaned up, the pair an exclusive relation replaced; the
     entities the cascade had queued are deleted, and the next changes work as before.
 
-    An OnChange hook reads the new value through world:get, from world:set and from set_all. A
-    listener of an id hears every addition of it, also when the id was used before as a tag and
-    as a relation.
+    An OnChange hook reads the new value through world:get, from world:set and from set_all.
+    OnChange hooks and changed listeners get the value that the change replaced: of a component
+    and of a data pair (nil after a set of nil), from set_all, from a set inside a listener (the
+    value of the outer set), and in an exclusive replacement whose removal hook set the new pair
+    (the value of that hook). A listener of an id hears every addition of it, also when the id
+    was used before as a tag and as a relation.
 
     Signals reach the listeners connected now: after listeners were disconnected and new ones
     connected, disconnecting an earlier one stops that one only. A disconnected listener or
@@ -838,6 +841,95 @@ return function(spec: support.Spec)
                 how = "set_all"
                 world:query(C):set_all(C, 7)
                 CHECK(seen.set == 4 and seen.set_all == 7)
+            end
+
+            CASE(`an OnChange hook and a changed listener get the value that the change replaced{kind}`)
+            do
+                local world = ecs.world(debug)
+                local C = world:component() :: api.Component<number>
+                local heard: { string } = {}
+                local function listener(name: string): (Entity, any, number?, number?) -> ()
+                    return function(_entity: Entity, _id: any, value: number?, previous: number?)
+                        table.insert(heard, `{name} {value} {previous}`)
+                    end
+                end
+                world:set(C, ecs.OnChange, listener("hook"))
+                world:changed(C, listener("signal"))
+                local e, f = world:entity(), world:entity()
+                world:set(e, C, 1) -- an addition: no OnChange
+                world:set(e, C, 4)
+                world:set(e, C, nil :: any) -- the entity keeps C without a value
+                world:set(e, C, 9)
+                world:set(f, C, 2)
+                world:query(C):set_all(C, 11)
+                CHECK(
+                    table.concat(heard, ", ")
+                        == "hook 4 1, signal 4 1, hook nil 4, signal nil 4, hook 9 nil, signal 9 nil, "
+                            .. "hook 11 9, signal 11 9, hook 11 2, signal 11 2"
+                )
+            end
+
+            CASE(`the hook and the listener of a relation get the value that a set of its data pair replaced{kind}`)
+            do
+                local world = ecs.world(debug)
+                local Owns = world:component() :: api.Component<number>
+                local item = world:entity()
+                local heard: { string } = {}
+                world:set(Owns, ecs.OnChange, function(_entity: Entity, _id: any, value: number?, previous: number?)
+                    table.insert(heard, `hook {value} {previous}`)
+                end)
+                world:changed(Owns, function(_entity: Entity, _id: any, value: number?, previous: number?)
+                    table.insert(heard, `signal {value} {previous}`)
+                end)
+                local e = world:entity()
+                local owns = ecs.pair(Owns, item)
+                world:set(e, owns, 5)
+                world:set(e, owns, 6)
+                world:set(e, owns, nil :: any)
+                world:set(e, owns, 7)
+                CHECK(
+                    table.concat(heard, ", ")
+                        == "hook 6 5, signal 6 5, hook nil 6, signal nil 6, hook 7 nil, signal 7 nil"
+                )
+            end
+
+            CASE(`a set from a changed listener gets the value that the outer set gave{kind}`)
+            do
+                local world = ecs.world(debug)
+                local C = world:component() :: api.Component<number>
+                local heard: { string } = {}
+                world:changed(C, function(entity: Entity, _id: any, value: number?, previous: number?)
+                    table.insert(heard, `{value} {previous}`)
+                    if value == 2 then
+                        world:set(entity, C, 3)
+                    end
+                end)
+                local e = world:entity()
+                world:set(e, C, 1)
+                world:set(e, C, 2)
+                CHECK(table.concat(heard, ", ") == "2 1, 3 2" and world:get(e, C) == 3)
+            end
+
+            CASE(`an exclusive replacement whose removal hook set the new pair: OnChange gets that value{kind}`)
+            do
+                local world = ecs.world(debug)
+                local Slot = world:component() :: api.Component<number>
+                world:add(Slot, ecs.Exclusive)
+                local first, second = world:entity(), world:entity()
+                local e = world:entity()
+                world:set(e, ecs.pair(Slot, first), 1)
+                world:set(Slot, ecs.OnRemove, function(entity: Entity, id: any)
+                    if id == ecs.pair(Slot, first) then
+                        world:set(entity, ecs.pair(Slot, second), 50)
+                    end
+                end)
+                local heard: { string } = {}
+                world:set(Slot, ecs.OnChange, function(_entity: Entity, _id: any, value: number?, previous: number?)
+                    table.insert(heard, `{value} {previous}`)
+                end)
+                world:set(e, ecs.pair(Slot, second), 60)
+                CHECK(table.concat(heard, ", ") == "60 50" and world:get(e, ecs.pair(Slot, second)) == 60)
+                CHECK(not world:has(e, ecs.pair(Slot, first)))
             end
 
             for _, before in { "a tag", "a relation", "a tag and a relation" } do

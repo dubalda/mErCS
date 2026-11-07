@@ -89,8 +89,11 @@
     before the functions that use it, and new methods are assigned to world and Query directly.
 
     Changes during iteration: the current entity may be changed or deleted. Changes of other
-    entities may or may not be seen by the running loop; an entity deleted ahead of the loop
-    may still be returned once (world:contains tells).
+    entities may or may not be seen by the running loop; an entity deleted ahead of the loop is
+    skipped or returned once as a dead id (world:contains tells), with the values that its slot
+    holds when the loop reaches it: the match lists and the gathered matches keep the id, while
+    a pass over the bitsets skips a freed slot and returns an entity that took it, whatever its
+    ids (new_direct).
 
     Errors: an error for a mistake of the caller goes through fail, which raises it at the first
     frame outside this module, whatever the depth of the function that finds the mistake. A
@@ -101,7 +104,8 @@
 
     get/has take at most 8 ids (get_list/has_all take any number); world:expect reads one id
     that the entity must have (instead of nil, an error that names both); hooks get (entity, id,
-    value); query:each is the fastest way to iterate. The API reference is the block of doc
+    value), OnChange hooks and changed listeners also the value that the change replaced;
+    query:each is the fastest way to iterate. The API reference is the block of doc
     comments after the types (published on the documentation site); docs/guide/README.md is the guide.
 ]]
 
@@ -130,7 +134,9 @@ end
 -- A pair carries the data of its relation, or of its target when the relation is a tag.
 export type Pair<First = any, Second = any> = pair_type<Id<First>, Id<Second>>
 
-type Hook = (entity: i53, id: i53, value: any?) -> ()
+-- The callback of a hook field: OnAdd gets (entity, id, value), OnChange also the value that the
+-- change replaced, OnRemove (entity, id, deleting).
+type Hook = (entity: i53, id: i53, value: any?, previous: any?) -> ()
 type Page = { [number]: any }
 type Pages = { [number]: Page }
 type Words = { [number]: number }
@@ -390,7 +396,11 @@ export type World = {
     track_created: (self: World) -> (),
     -- advances the tick: the changes recorded so far become visible to change filters
     tick: (self: World) -> number,
-    changed: <T>(self: World, id: Id<T>, listener: (entity: Entity, id: Id<T>, value: T) -> ()) -> () -> (),
+    changed: <T>(
+        self: World,
+        id: Id<T>,
+        listener: (entity: Entity, id: Id<T>, value: T, previous: T?) -> ()
+    ) -> () -> (),
     removed: <T>(self: World, id: Id<T>, listener: (entity: Entity, id: Id<T>, delete: boolean?) -> ()) -> () -> (),
     range: (self: World, range_begin: number, range_end: number?) -> (),
     query: ((self: World) -> Query<>)
@@ -666,10 +676,17 @@ export type World = {
 ]=]
 
 --[=[
-    @prop OnChange Component<(entity: Entity, id: Id, value: any?) -> ()>
+    @prop OnChange Component<(entity: Entity, id: Id, value: any?, previous: any?) -> ()>
     @within mErCS
     @readonly
-    Hook: runs when the value of the id it is set on is set again on an entity.
+    Hook: runs when the value of the id it is set on is set again on an entity, with the new
+    value and the value that it replaced (nil when the entity had the id without a value).
+
+    ```lua
+    world:set(Stats, ecs.OnChange, function(entity, id, stats, previous) end)
+    ```
+
+    A table changed in place and set again is the same value before and after.
 ]=]
 
 --[=[
@@ -850,7 +867,8 @@ export type World = {
     @param entity Id
     @param id Id<T> -- a component or a pair that holds data
     @param value T
-    Adds `id` with a value, or replaces the value; [mErCS.OnAdd] or [mErCS.OnChange] runs.
+    Adds `id` with a value, or replaces the value; [mErCS.OnAdd] or [mErCS.OnChange] runs (the
+    latter also with the value that it replaced).
     Only ids with the [mErCS.Component] trait hold data: setting a value on a tag raises an
     error.
 ]=]
@@ -1069,10 +1087,12 @@ export type World = {
     @method changed
     @within World
     @param id Id<T>
-    @param listener (entity: Entity, id: Id<T>, value: T) -> ()
+    @param listener (entity: Entity, id: Id<T>, value: T, previous: T?) -> ()
     @return () -> () -- disconnects the listener
-    Connects a listener that runs when the value of `id` is set again on an entity. `id` is not
-    a pair (see [World:added]).
+    Connects a listener that runs when the value of `id` is set again on an entity, with the
+    new value and the value that it replaced (`previous`, nil when the entity had `id` without a
+    value; a table changed in place and set again is the same value before and after). `id` is
+    not a pair (see [World:added]).
 ]=]
 
 --[=[
@@ -1179,7 +1199,10 @@ export type World = {
       loop).
     - The current entity may be changed or deleted inside the loop. Changes of other
       entities may or may not be seen by the running loop; an entity deleted ahead of the
-      loop may still be returned once (check [World:contains]).
+      loop is skipped or returned once as a dead id (check [World:contains]), with the values
+      that its slot holds when the loop reaches it: nil, or those of an entity made during the
+      loop that took the slot, which may also be returned in place of the dead id, even when it
+      does not match.
     - Loops over the same query may be nested. The order is ascending by entity slot.
 ]=]
 
@@ -3055,16 +3078,28 @@ local function prune_shapes(shapes: Shapes, slot: number)
 end
 
 -- The callback of a record whose id has an internal hook (see internal_hooks in world_new):
--- the internal hook, then `hook` (the hook of the id or the dispatcher of its signals).
+-- the internal hook, then `hook` (the hook of the id or the dispatcher of its signals), both
+-- with the arguments of the event (an OnChange passes the replaced value as the fourth).
 local function chain_hooks(internal: Hook?, hook: Hook?): Hook?
     if internal == nil or hook == nil then
         return internal or hook
     end
     local first, second = internal :: Hook, hook :: Hook
-    return function(entity: i53, id: i53, value: any?)
-        first(entity, id, value)
-        second(entity, id, value)
+    return function(entity: i53, id: i53, value: any?, previous: any?)
+        first(entity, id, value, previous)
+        second(entity, id, value, previous)
     end
+end
+
+-- The value that a record holds in `slot`, nil when it holds none: the value that a set
+-- replaces, for OnChange (world_set reads it on its own fast path).
+local function value_in(rec: Record, slot: number): any
+    local pages = rec.pages
+    if not pages then
+        return nil
+    end
+    local page = pages[slot // PAGE_SIZE + 1]
+    return if page then page[slot % PAGE_SIZE + 1] else nil
 end
 
 -- Signals and change tracking take a component, a tag or a relation (which covers all its
@@ -4241,13 +4276,14 @@ local function world_new(debug: boolean?): World
         if word ~= nil and band(word, bit) ~= 0 then
             if with_value then
                 if rec.pages then
+                    local on_change = rec.on_change
+                    local previous = if on_change then value_in(rec, slot) else nil
                     set_value(rec, slot, value)
                     if mirror_count > 0 then
                         mirror.pair(rec, slot, value)
                     end
-                    local on_change = rec.on_change
                     if on_change then
-                        on_change(entity, id, value)
+                        on_change(entity, id, value, previous)
                     end
                 elseif value ~= nil then
                     fail("cannot set a value on a tag pair; the relation or the target must be a component")
@@ -4328,17 +4364,19 @@ local function world_new(debug: boolean?): World
                 return
             end
             -- the hooks of the removal may have changed the entity: a pair that they added is
-            -- there, and a set gives it the value of this call (as to a pair there before it)
+            -- there, and a set gives it the value of this call (as to a pair there before it;
+            -- OnChange gets the value that the hooks gave it)
             word = words[w]
             if word ~= nil and band(word, bit) ~= 0 then
                 if with_value and rec.pages then
+                    local on_change = rec.on_change
+                    local previous = if on_change then value_in(rec, slot) else nil
                     set_value(rec, slot, value)
                     if mirror_count > 0 then
                         mirror.pair(rec, slot, value)
                     end
-                    local on_change = rec.on_change
                     if on_change then
-                        on_change(entity, id, value)
+                        on_change(entity, id, value, previous)
                     end
                 end
                 return
@@ -4413,20 +4451,24 @@ local function world_new(debug: boolean?): World
         local page_index, page_slot = 0, 0
         local page: Page? = nil
         if pages then
-            -- an existing value (of a component or a pair) is replaced in place
+            -- an existing value (of a component or a pair) is replaced in place; OnChange gets
+            -- the value that it replaces
             page_index = slot // PAGE_SIZE + 1
             page_slot = slot % PAGE_SIZE + 1
             page = pages[page_index]
-            if page and page[page_slot] ~= nil then
-                page[page_slot] = value
-                if mirror_count > 0 and id > PAIR_OFFSET then
-                    mirror.pair(existing :: Record, slot, value)
+            if page then
+                local previous = page[page_slot]
+                if previous ~= nil then
+                    page[page_slot] = value
+                    if mirror_count > 0 and id > PAIR_OFFSET then
+                        mirror.pair(existing :: Record, slot, value)
+                    end
+                    local on_change = (existing :: Record).on_change
+                    if on_change then
+                        on_change(entity, id, value, previous)
+                    end
+                    return
                 end
-                local on_change = (existing :: Record).on_change
-                if on_change then
-                    on_change(entity, id, value)
-                end
-                return
             end
         end
         if id > PAIR_OFFSET then
@@ -4465,7 +4507,7 @@ local function world_new(debug: boolean?): World
                     (page :: Page)[page_slot] = value
                     local on_change = rec.on_change
                     if on_change then
-                        on_change(entity, id, value)
+                        on_change(entity, id, value) -- (the value it replaces is nil)
                     end
                 end
                 return
@@ -6268,13 +6310,27 @@ local function world_new(debug: boolean?): World
             end
             local created: Dispatch = { hook = own_hook or false, listeners = {}, loud = 0 }
             cell = created
-            local function dispatch(entity: i53, component: i53, value: any?)
-                local hook = created.hook
-                if hook then
-                    hook(entity, component, value)
+            local dispatch: Hook
+            if field == "on_change" then
+                -- a change also gives the value that it replaced
+                dispatch = function(entity: i53, component: i53, value: any?, previous: any?)
+                    local hook = created.hook
+                    if hook then
+                        hook(entity, component, value, previous)
+                    end
+                    for _, fn in created.listeners do
+                        fn(entity, component, value, previous)
+                    end
                 end
-                for _, fn in created.listeners do
-                    fn(entity, component, value)
+            else
+                dispatch = function(entity: i53, component: i53, value: any?)
+                    local hook = created.hook
+                    if hook then
+                        hook(entity, component, value)
+                    end
+                    for _, fn in created.listeners do
+                        fn(entity, component, value)
+                    end
                 end
             end
             dispatchers[field][id] = dispatch
@@ -7127,7 +7183,11 @@ local function world_new(debug: boolean?): World
     -- Direct for-in iterator over the bitsets of a query, with the state it runs on. The for-in
     -- control variable carries the last entity. Cached queries keep one context and bind it
     -- for every iteration, so iterating allocates nothing; ctx.busy is true while an iteration
-    -- started from the context has not reached its end.
+    -- started from the context has not reached its end. The current run of matching slots and
+    -- the remaining bits of a word (pmask) were read before the bodies of the loop ran: a slot
+    -- that a body freed since then holds a negative mark in alive and is skipped, so the loop
+    -- returns live entities only (an entity that took such a slot is returned in its place,
+    -- whatever its ids); the spans that advance returns are read after the bodies.
     local function new_direct(n: number): any
         local ctx: any = { busy = false, others = {}, without = {} }
         local advance, bind_advance = new_advance()
@@ -7173,20 +7233,26 @@ local function world_new(debug: boolean?): World
         if n == 0 then
             step = function(_: any, prev: i53): ...any
                 local s = band(prev, SLOT_BITS) + 1
-                if s <= run_last then
-                    return alive[s]
-                end
-                local m = pmask
-                if m ~= 0 then
-                    s = pbase + countrz(m)
-                    pmask = band(m, m - 1)
-                    return alive[s]
-                end
-                if prev < 0 then
-                    -- the previous entity was deleted meanwhile: continue after its slot
-                    s = (-1 - prev) // ENTITY_MASK + 1
+                -- a slot that the body of the loop freed holds a negative mark and is skipped
+                -- (a live id is at least its slot)
+                while true do
                     if s <= run_last then
-                        return alive[s]
+                        local e = alive[s]
+                        if e >= s then
+                            return e
+                        end
+                        s += 1
+                    else
+                        local m = pmask
+                        if m == 0 then
+                            break
+                        end
+                        s = pbase + countrz(m)
+                        pmask = band(m, m - 1)
+                        local e = alive[s]
+                        if e >= s then
+                            return e
+                        end
                     end
                 end
                 local first, last, span_mask = advance()
@@ -7214,23 +7280,28 @@ local function world_new(debug: boolean?): World
             step = function(_: any, prev: i53): ...any
                 local s = band(prev, SLOT_BITS) + 1
                 local q1 = p1
-                if s <= run_last then
-                    local li = s - page_offset
-                    return alive[s], q1[li]
-                end
-                local m = pmask
-                if m ~= 0 then
-                    s = pbase + countrz(m)
-                    pmask = band(m, m - 1)
-                    local li = s - page_offset
-                    return alive[s], q1[li]
-                end
-                if prev < 0 then
-                    -- the previous entity was deleted meanwhile: continue after its slot
-                    s = (-1 - prev) // ENTITY_MASK + 1
+                -- a slot that the body of the loop freed holds a negative mark and is skipped
+                -- (a live id is at least its slot)
+                while true do
                     if s <= run_last then
-                        local li = s - page_offset
-                        return alive[s], q1[li]
+                        local e = alive[s]
+                        if e >= s then
+                            local li = s - page_offset
+                            return e, q1[li]
+                        end
+                        s += 1
+                    else
+                        local m = pmask
+                        if m == 0 then
+                            break
+                        end
+                        s = pbase + countrz(m)
+                        pmask = band(m, m - 1)
+                        local e = alive[s]
+                        if e >= s then
+                            local li = s - page_offset
+                            return e, q1[li]
+                        end
                     end
                 end
                 local first, last, span_mask = advance()
@@ -7260,23 +7331,28 @@ local function world_new(debug: boolean?): World
             step = function(_: any, prev: i53): ...any
                 local s = band(prev, SLOT_BITS) + 1
                 local q1, q2 = p1, p2
-                if s <= run_last then
-                    local li = s - page_offset
-                    return alive[s], q1[li], q2[li]
-                end
-                local m = pmask
-                if m ~= 0 then
-                    s = pbase + countrz(m)
-                    pmask = band(m, m - 1)
-                    local li = s - page_offset
-                    return alive[s], q1[li], q2[li]
-                end
-                if prev < 0 then
-                    -- the previous entity was deleted meanwhile: continue after its slot
-                    s = (-1 - prev) // ENTITY_MASK + 1
+                -- a slot that the body of the loop freed holds a negative mark and is skipped
+                -- (a live id is at least its slot)
+                while true do
                     if s <= run_last then
-                        local li = s - page_offset
-                        return alive[s], q1[li], q2[li]
+                        local e = alive[s]
+                        if e >= s then
+                            local li = s - page_offset
+                            return e, q1[li], q2[li]
+                        end
+                        s += 1
+                    else
+                        local m = pmask
+                        if m == 0 then
+                            break
+                        end
+                        s = pbase + countrz(m)
+                        pmask = band(m, m - 1)
+                        local e = alive[s]
+                        if e >= s then
+                            local li = s - page_offset
+                            return e, q1[li], q2[li]
+                        end
                     end
                 end
                 local first, last, span_mask = advance()
@@ -7307,23 +7383,28 @@ local function world_new(debug: boolean?): World
             step = function(_: any, prev: i53): ...any
                 local s = band(prev, SLOT_BITS) + 1
                 local q1, q2, q3 = p1, p2, p3
-                if s <= run_last then
-                    local li = s - page_offset
-                    return alive[s], q1[li], q2[li], q3[li]
-                end
-                local m = pmask
-                if m ~= 0 then
-                    s = pbase + countrz(m)
-                    pmask = band(m, m - 1)
-                    local li = s - page_offset
-                    return alive[s], q1[li], q2[li], q3[li]
-                end
-                if prev < 0 then
-                    -- the previous entity was deleted meanwhile: continue after its slot
-                    s = (-1 - prev) // ENTITY_MASK + 1
+                -- a slot that the body of the loop freed holds a negative mark and is skipped
+                -- (a live id is at least its slot)
+                while true do
                     if s <= run_last then
-                        local li = s - page_offset
-                        return alive[s], q1[li], q2[li], q3[li]
+                        local e = alive[s]
+                        if e >= s then
+                            local li = s - page_offset
+                            return e, q1[li], q2[li], q3[li]
+                        end
+                        s += 1
+                    else
+                        local m = pmask
+                        if m == 0 then
+                            break
+                        end
+                        s = pbase + countrz(m)
+                        pmask = band(m, m - 1)
+                        local e = alive[s]
+                        if e >= s then
+                            local li = s - page_offset
+                            return e, q1[li], q2[li], q3[li]
+                        end
                     end
                 end
                 local first, last, span_mask = advance()
@@ -7355,23 +7436,28 @@ local function world_new(debug: boolean?): World
             step = function(_: any, prev: i53): ...any
                 local s = band(prev, SLOT_BITS) + 1
                 local q1, q2, q3, q4 = p1, p2, p3, p4
-                if s <= run_last then
-                    local li = s - page_offset
-                    return alive[s], q1[li], q2[li], q3[li], q4[li]
-                end
-                local m = pmask
-                if m ~= 0 then
-                    s = pbase + countrz(m)
-                    pmask = band(m, m - 1)
-                    local li = s - page_offset
-                    return alive[s], q1[li], q2[li], q3[li], q4[li]
-                end
-                if prev < 0 then
-                    -- the previous entity was deleted meanwhile: continue after its slot
-                    s = (-1 - prev) // ENTITY_MASK + 1
+                -- a slot that the body of the loop freed holds a negative mark and is skipped
+                -- (a live id is at least its slot)
+                while true do
                     if s <= run_last then
-                        local li = s - page_offset
-                        return alive[s], q1[li], q2[li], q3[li], q4[li]
+                        local e = alive[s]
+                        if e >= s then
+                            local li = s - page_offset
+                            return e, q1[li], q2[li], q3[li], q4[li]
+                        end
+                        s += 1
+                    else
+                        local m = pmask
+                        if m == 0 then
+                            break
+                        end
+                        s = pbase + countrz(m)
+                        pmask = band(m, m - 1)
+                        local e = alive[s]
+                        if e >= s then
+                            local li = s - page_offset
+                            return e, q1[li], q2[li], q3[li], q4[li]
+                        end
                     end
                 end
                 local first, last, span_mask = advance()
@@ -7404,23 +7490,28 @@ local function world_new(debug: boolean?): World
             step = function(_: any, prev: i53): ...any
                 local s = band(prev, SLOT_BITS) + 1
                 local q1, q2, q3, q4, q5 = p1, p2, p3, p4, p5
-                if s <= run_last then
-                    local li = s - page_offset
-                    return alive[s], q1[li], q2[li], q3[li], q4[li], q5[li]
-                end
-                local m = pmask
-                if m ~= 0 then
-                    s = pbase + countrz(m)
-                    pmask = band(m, m - 1)
-                    local li = s - page_offset
-                    return alive[s], q1[li], q2[li], q3[li], q4[li], q5[li]
-                end
-                if prev < 0 then
-                    -- the previous entity was deleted meanwhile: continue after its slot
-                    s = (-1 - prev) // ENTITY_MASK + 1
+                -- a slot that the body of the loop freed holds a negative mark and is skipped
+                -- (a live id is at least its slot)
+                while true do
                     if s <= run_last then
-                        local li = s - page_offset
-                        return alive[s], q1[li], q2[li], q3[li], q4[li], q5[li]
+                        local e = alive[s]
+                        if e >= s then
+                            local li = s - page_offset
+                            return e, q1[li], q2[li], q3[li], q4[li], q5[li]
+                        end
+                        s += 1
+                    else
+                        local m = pmask
+                        if m == 0 then
+                            break
+                        end
+                        s = pbase + countrz(m)
+                        pmask = band(m, m - 1)
+                        local e = alive[s]
+                        if e >= s then
+                            local li = s - page_offset
+                            return e, q1[li], q2[li], q3[li], q4[li], q5[li]
+                        end
                     end
                 end
                 local first, last, span_mask = advance()
@@ -7454,23 +7545,28 @@ local function world_new(debug: boolean?): World
             step = function(_: any, prev: i53): ...any
                 local s = band(prev, SLOT_BITS) + 1
                 local q1, q2, q3, q4, q5, q6 = p1, p2, p3, p4, p5, p6
-                if s <= run_last then
-                    local li = s - page_offset
-                    return alive[s], q1[li], q2[li], q3[li], q4[li], q5[li], q6[li]
-                end
-                local m = pmask
-                if m ~= 0 then
-                    s = pbase + countrz(m)
-                    pmask = band(m, m - 1)
-                    local li = s - page_offset
-                    return alive[s], q1[li], q2[li], q3[li], q4[li], q5[li], q6[li]
-                end
-                if prev < 0 then
-                    -- the previous entity was deleted meanwhile: continue after its slot
-                    s = (-1 - prev) // ENTITY_MASK + 1
+                -- a slot that the body of the loop freed holds a negative mark and is skipped
+                -- (a live id is at least its slot)
+                while true do
                     if s <= run_last then
-                        local li = s - page_offset
-                        return alive[s], q1[li], q2[li], q3[li], q4[li], q5[li], q6[li]
+                        local e = alive[s]
+                        if e >= s then
+                            local li = s - page_offset
+                            return e, q1[li], q2[li], q3[li], q4[li], q5[li], q6[li]
+                        end
+                        s += 1
+                    else
+                        local m = pmask
+                        if m == 0 then
+                            break
+                        end
+                        s = pbase + countrz(m)
+                        pmask = band(m, m - 1)
+                        local e = alive[s]
+                        if e >= s then
+                            local li = s - page_offset
+                            return e, q1[li], q2[li], q3[li], q4[li], q5[li], q6[li]
+                        end
                     end
                 end
                 local first, last, span_mask = advance()
@@ -7505,23 +7601,28 @@ local function world_new(debug: boolean?): World
             step = function(_: any, prev: i53): ...any
                 local s = band(prev, SLOT_BITS) + 1
                 local q1, q2, q3, q4, q5, q6, q7 = p1, p2, p3, p4, p5, p6, p7
-                if s <= run_last then
-                    local li = s - page_offset
-                    return alive[s], q1[li], q2[li], q3[li], q4[li], q5[li], q6[li], q7[li]
-                end
-                local m = pmask
-                if m ~= 0 then
-                    s = pbase + countrz(m)
-                    pmask = band(m, m - 1)
-                    local li = s - page_offset
-                    return alive[s], q1[li], q2[li], q3[li], q4[li], q5[li], q6[li], q7[li]
-                end
-                if prev < 0 then
-                    -- the previous entity was deleted meanwhile: continue after its slot
-                    s = (-1 - prev) // ENTITY_MASK + 1
+                -- a slot that the body of the loop freed holds a negative mark and is skipped
+                -- (a live id is at least its slot)
+                while true do
                     if s <= run_last then
-                        local li = s - page_offset
-                        return alive[s], q1[li], q2[li], q3[li], q4[li], q5[li], q6[li], q7[li]
+                        local e = alive[s]
+                        if e >= s then
+                            local li = s - page_offset
+                            return e, q1[li], q2[li], q3[li], q4[li], q5[li], q6[li], q7[li]
+                        end
+                        s += 1
+                    else
+                        local m = pmask
+                        if m == 0 then
+                            break
+                        end
+                        s = pbase + countrz(m)
+                        pmask = band(m, m - 1)
+                        local e = alive[s]
+                        if e >= s then
+                            local li = s - page_offset
+                            return e, q1[li], q2[li], q3[li], q4[li], q5[li], q6[li], q7[li]
+                        end
                     end
                 end
                 local first, last, span_mask = advance()
@@ -7557,23 +7658,28 @@ local function world_new(debug: boolean?): World
             step = function(_: any, prev: i53): ...any
                 local s = band(prev, SLOT_BITS) + 1
                 local q1, q2, q3, q4, q5, q6, q7, q8 = p1, p2, p3, p4, p5, p6, p7, p8
-                if s <= run_last then
-                    local li = s - page_offset
-                    return alive[s], q1[li], q2[li], q3[li], q4[li], q5[li], q6[li], q7[li], q8[li]
-                end
-                local m = pmask
-                if m ~= 0 then
-                    s = pbase + countrz(m)
-                    pmask = band(m, m - 1)
-                    local li = s - page_offset
-                    return alive[s], q1[li], q2[li], q3[li], q4[li], q5[li], q6[li], q7[li], q8[li]
-                end
-                if prev < 0 then
-                    -- the previous entity was deleted meanwhile: continue after its slot
-                    s = (-1 - prev) // ENTITY_MASK + 1
+                -- a slot that the body of the loop freed holds a negative mark and is skipped
+                -- (a live id is at least its slot)
+                while true do
                     if s <= run_last then
-                        local li = s - page_offset
-                        return alive[s], q1[li], q2[li], q3[li], q4[li], q5[li], q6[li], q7[li], q8[li]
+                        local e = alive[s]
+                        if e >= s then
+                            local li = s - page_offset
+                            return e, q1[li], q2[li], q3[li], q4[li], q5[li], q6[li], q7[li], q8[li]
+                        end
+                        s += 1
+                    else
+                        local m = pmask
+                        if m == 0 then
+                            break
+                        end
+                        s = pbase + countrz(m)
+                        pmask = band(m, m - 1)
+                        local e = alive[s]
+                        if e >= s then
+                            local li = s - page_offset
+                            return e, q1[li], q2[li], q3[li], q4[li], q5[li], q6[li], q7[li], q8[li]
+                        end
                     end
                 end
                 local first, last, span_mask = advance()
@@ -7611,59 +7717,52 @@ local function world_new(debug: boolean?): World
                 local s = band(prev, SLOT_BITS) + 1
                 local q1, q2, q3, q4, q5, q6, q7, q8 = p1, p2, p3, p4, p5, p6, p7, p8
                 local xq = xp
-                if s <= run_last then
-                    local li = s - page_offset
-                    for k = 1, nx do
-                        xout[k] = xq[k][li]
-                    end
-                    return alive[s],
-                        q1[li],
-                        q2[li],
-                        q3[li],
-                        q4[li],
-                        q5[li],
-                        q6[li],
-                        q7[li],
-                        q8[li],
-                        table.unpack(xout, 1, nx)
-                end
-                local m = pmask
-                if m ~= 0 then
-                    s = pbase + countrz(m)
-                    pmask = band(m, m - 1)
-                    local li = s - page_offset
-                    for k = 1, nx do
-                        xout[k] = xq[k][li]
-                    end
-                    return alive[s],
-                        q1[li],
-                        q2[li],
-                        q3[li],
-                        q4[li],
-                        q5[li],
-                        q6[li],
-                        q7[li],
-                        q8[li],
-                        table.unpack(xout, 1, nx)
-                end
-                if prev < 0 then
-                    -- the previous entity was deleted meanwhile: continue after its slot
-                    s = (-1 - prev) // ENTITY_MASK + 1
+                -- a slot that the body of the loop freed holds a negative mark and is skipped
+                -- (a live id is at least its slot)
+                while true do
                     if s <= run_last then
-                        local li = s - page_offset
-                        for k = 1, nx do
-                            xout[k] = xq[k][li]
+                        local e = alive[s]
+                        if e >= s then
+                            local li = s - page_offset
+                            for k = 1, nx do
+                                xout[k] = xq[k][li]
+                            end
+                            return e,
+                                q1[li],
+                                q2[li],
+                                q3[li],
+                                q4[li],
+                                q5[li],
+                                q6[li],
+                                q7[li],
+                                q8[li],
+                                table.unpack(xout, 1, nx)
                         end
-                        return alive[s],
-                            q1[li],
-                            q2[li],
-                            q3[li],
-                            q4[li],
-                            q5[li],
-                            q6[li],
-                            q7[li],
-                            q8[li],
-                            table.unpack(xout, 1, nx)
+                        s += 1
+                    else
+                        local m = pmask
+                        if m == 0 then
+                            break
+                        end
+                        s = pbase + countrz(m)
+                        pmask = band(m, m - 1)
+                        local e = alive[s]
+                        if e >= s then
+                            local li = s - page_offset
+                            for k = 1, nx do
+                                xout[k] = xq[k][li]
+                            end
+                            return e,
+                                q1[li],
+                                q2[li],
+                                q3[li],
+                                q4[li],
+                                q5[li],
+                                q6[li],
+                                q7[li],
+                                q8[li],
+                                table.unpack(xout, 1, nx)
+                        end
                     end
                 end
                 local first, last, span_mask = advance()
@@ -10951,7 +11050,7 @@ return {
 
     OnAdd = (EcsOnAdd :: any) :: Component<(entity: Entity, id: Id, value: any?) -> ()>,
     OnRemove = (EcsOnRemove :: any) :: Component<(entity: Entity, id: Id, delete: boolean?) -> ()>,
-    OnChange = (EcsOnChange :: any) :: Component<(entity: Entity, id: Id, value: any?) -> ()>,
+    OnChange = (EcsOnChange :: any) :: Component<(entity: Entity, id: Id, value: any?, previous: any?) -> ()>,
     Wildcard = (EcsWildcard :: any) :: Entity,
     ChildOf = (EcsChildOf :: any) :: Entity,
     Component = (EcsComponent :: any) :: Entity,

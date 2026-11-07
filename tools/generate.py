@@ -60,7 +60,13 @@ def direct_iterator(n: int, indent: str) -> list[str]:
     """for-in over bitsets; the control variable carries the previous entity.
 
     Order of the paths: the current run of matching slots, the remaining bits of a partial
-    word (pmask), a deleted entity returned by the previous step, the next span.
+    word (pmask), the next span. The run and the bits of the word were read before the bodies
+    of the loop ran: a slot whose entity the body deleted since then holds a negative mark in
+    alive and is skipped (the next slot of the run, the next bit), so the step returns live
+    entities only. The test is `e >= s`: a live id is at least its slot (the slot plus a multiple
+    of ENTITY_MASK), and a comparison of two registers costs the interpreter one instruction
+    less than one with a constant. A span that advance returns is read after the bodies: its
+    slots are live.
     """
     i = indent
     wide = n == WIDE
@@ -89,28 +95,33 @@ def direct_iterator(n: int, indent: str) -> list[str]:
             f"{i}{T}local s = band(prev, SLOT_BITS) + 1",
         ]
         + copy
-        + [f"{i}{T}if s <= run_last then"]
-        + li(f"{i}{T}{T}", "xq")
         + [
-            f"{i}{T}{T}return alive[s]{hot}",
-            f"{i}{T}end",
-            f"{i}{T}local m = pmask",
-            f"{i}{T}if m ~= 0 then",
-            f"{i}{T}{T}s = pbase + countrz(m)",
-            f"{i}{T}{T}pmask = band(m, m - 1)",
-        ]
-        + li(f"{i}{T}{T}", "xq")
-        + [
-            f"{i}{T}{T}return alive[s]{hot}",
-            f"{i}{T}end",
-            f"{i}{T}if prev < 0 then",
-            f"{i}{T}{T}-- the previous entity was deleted meanwhile: continue after its slot",
-            f"{i}{T}{T}s = (-1 - prev) // ENTITY_MASK + 1",
+            f"{i}{T}-- a slot that the body of the loop freed holds a negative mark and is skipped",
+            f"{i}{T}-- (a live id is at least its slot)",
+            f"{i}{T}while true do",
             f"{i}{T}{T}if s <= run_last then",
+            f"{i}{T}{T}{T}local e = alive[s]",
+            f"{i}{T}{T}{T}if e >= s then",
         ]
-        + li(f"{i}{T}{T}{T}", "xq")
+        + li(f"{i}{T}{T}{T}{T}", "xq")
         + [
-            f"{i}{T}{T}{T}return alive[s]{hot}",
+            f"{i}{T}{T}{T}{T}return e{hot}",
+            f"{i}{T}{T}{T}end",
+            f"{i}{T}{T}{T}s += 1",
+            f"{i}{T}{T}else",
+            f"{i}{T}{T}{T}local m = pmask",
+            f"{i}{T}{T}{T}if m == 0 then",
+            f"{i}{T}{T}{T}{T}break",
+            f"{i}{T}{T}{T}end",
+            f"{i}{T}{T}{T}s = pbase + countrz(m)",
+            f"{i}{T}{T}{T}pmask = band(m, m - 1)",
+            f"{i}{T}{T}{T}local e = alive[s]",
+            f"{i}{T}{T}{T}if e >= s then",
+        ]
+        + li(f"{i}{T}{T}{T}{T}", "xq")
+        + [
+            f"{i}{T}{T}{T}{T}return e{hot}",
+            f"{i}{T}{T}{T}end",
             f"{i}{T}{T}end",
             f"{i}{T}end",
             f"{i}{T}local first, last, span_mask = advance()",

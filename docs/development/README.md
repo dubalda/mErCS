@@ -63,7 +63,7 @@ test/jabby.luau        the jabby adapter: what jabby reads from its jecs module 
 test/jecs_compat/      the jecs test suite run against this library (125/125 applicable), and the tests of its addon modules/OB against the query monitors (ob.luau, 42/42 monitor cases)
 test/monitors_fuzz.luau random queries and changes of the world against query monitors
 test/queries_fuzz.luau random queries and changes of the world against brute force
-test/loops_fuzz.luau   loops that change the world (no entity twice, untouched ones once)
+test/loops_fuzz.luau   loops that change the world (every loop ends; entity ids only, none twice, untouched ones once)
 test/behavior.luau     the behavior specification: the groups of cases in test/cases/ (a group per subject)
 test/cases/           the groups of the behavior specification and support.luau (the kit type, the helpers)
 test/snapshots_fuzz.luau independent model of exact each/children snapshots held across world changes
@@ -115,7 +115,7 @@ library can observe, in groups by subject, one module per group in `test/cases/`
 | `changes` | `world:toggle`, the `Component` trait after the first use of an id |
 | `queries` | the terms of a query through every way of reading it, a query without terms that select entities, `world:each` and `world:children` over disabled members, the arity and nil values of queries, several excluded ids |
 | `loops` | `world:each` and `world:children` snapshots at word, page and block boundaries, after emptied words and recycled slots, while a few members move between words; buffers of held, exhausted and abandoned iterators across two worlds; a frame of messages changed by hooks |
-| `hooks` | reentrant removal listeners during target and relation deletion, listener replacement, errors raised by hooks and the `world:tick` after them, the listeners that a signal reaches after others were disconnected, disconnected listeners and monitors that nothing keeps, listeners that delete the entity of their own event or take back an excluded id of a monitored query, a clear or a delete that notifies every id once, monitors and the changes made while an id is removed |
+| `hooks` | reentrant removal listeners during target and relation deletion, the value that a change replaced given to `OnChange` hooks and `changed` listeners, listener replacement, errors raised by hooks and the `world:tick` after them, the listeners that a signal reaches after others were disconnected, disconnected listeners and monitors that nothing keeps, listeners that delete the entity of their own event or take back an excluded id of a monitored query, a clear or a delete that notifies every id once, monitors and the changes made while an id is removed |
 | `relations` | relations kept in sync by their own hooks, a cascade that reaches an entity through ownership and `ChildOf`, listeners that give a changing exclusive relation, a deleted id or the entities of a cascade new uses, hooks that never stop giving new uses |
 | `tracking` | what one tick records, batch operations on tracked ids, the depth of the history, creation tracking, an entity that a listener of the change deletes |
 | `batches` | batch operations whose matches cascade or leave the query, nested batch operations, `toggle_all` |
@@ -194,9 +194,13 @@ for-in, `each`, `break` and nested loops, after bursts of few or many changes (m
 patched, filtered and built again), batch operations and deleted targets, over dense runs,
 scattered entities and a slot pool; the matches, their order, their values, `count` and `has`
 must agree (`luau test/queries_fuzz.luau -a 42 300 debug` with a debug world).
-`test/loops_fuzz.luau` changes the world inside loops (the current entity, others, new ones,
-nested loops): no entity may come twice, and the entities that matched at the start and that
-nothing touched must come once (`luau test/loops_fuzz.luau -a 42 1000`).
+`test/loops_fuzz.luau` changes the world inside loops (the current entity, others, often a few
+places ahead of it, new ones, nested loops) over scattered matches and blocks of adjacent
+entities (runs of full words), with stored queries, inline ones and an inline query of a shape
+of its own in every round (a pass over the bitsets): every loop must end and return only entity
+ids that matched at the start or that the loop touched or made, none twice, and the entities
+that matched at the start and that nothing touched exactly once
+(`luau test/loops_fuzz.luau -a 42 1000`).
 
 `test/fuzz.luau` takes a seed, a number of rounds and flags: `wide` creates 300 ids first
 (records beyond the shared signature tables), `hooks` adds hooks that change the entity,
@@ -247,7 +251,7 @@ heap of the target world not larger, and the behavior cases passed. Its release 
 changed behavior, the results of the suite and the memory of the target world.
 
 ```sh
-bash tools/workload.sh baseline=v1.1.0 release=yes          # full acceptance, both modes, 5 runs
+bash tools/workload.sh baseline=v1.2.0 release=yes          # full acceptance, both modes, 5 runs
 python tools/workload.py runs=10 tests=P1,P7 scales=sparse,target modes=native
 python tools/workload.py --luau /path/to/luau output=tmp/workload-custom
 ```
@@ -266,7 +270,7 @@ resolution; a difference of exactly the allowance (one step of the heap resoluti
 it. Candidate variation never enlarges it. A disputed row needs another 10–20
 repeats and investigation; overlapping ranges alone do not settle it.
 
-The [1.2.0 report](https://github.com/dubalda/mErCS/blob/main/bench/results/1.2.0.md) keeps the
+The [1.3.0 report](https://github.com/dubalda/mErCS/blob/main/bench/results/1.3.0.md) keeps the
 measurements of the release run with the review of its flags (and any additional repeats
 together with them), and the commands to reproduce the runs or verify the saved comparisons.
 
@@ -354,7 +358,7 @@ of the later ones: by up to 30 % in some rows. The numbers of
 [the comparison](../comparison/jecs.md#performance) run each implementation in a process
 of its own (`impls=jecs`, `impls=previous`, `impls=lib`), 5 times in each mode, and take the
 medians. The
-[1.2.0 comparison evidence](https://github.com/dubalda/mErCS/blob/main/bench/results/1.2.0-comparison.md)
+[1.3.0 comparison evidence](https://github.com/dubalda/mErCS/blob/main/bench/results/1.3.0-comparison.md)
 includes the full ranges, raw samples, source hashes and isolated entry points for reproducing
 the matrix, synthetic frame, long session and memory probes.
 
@@ -393,7 +397,7 @@ first loops included; the matrix takes the minimum of several runs.
 `jecs/test/benches/visual`): `ParameterGenerator`, `BeforeAll` / `AfterAll` /
 `BeforeEach` / `AfterEach` and `Functions` with an entry for jecs and one for mErCS, and one for
 ecr in the four basic benchmarks of jecs, named with their versions (`jecs 0.11.0`,
-`mErCS 1.2.0`, `ecr 0.9.0`: `libs.luau` reads the versions of jecs and ecr from their Wally
+`mErCS 1.3.0`, `ecr 0.9.0`: `libs.luau` reads the versions of jecs and ecr from their Wally
 packages and holds the version of mErCS). The parameters are generated before every call and
 give each function its own fresh world. ecr declares its component types before the registries
 that use them, so its files make them once, when they are required. `bench/basic.luau` runs the
@@ -476,8 +480,9 @@ mErCS.rbxm`.
 
 The specialized query iterators (0–8 returned values) are generated by `tools/generate.py`
 between the `-- @generated <name> begin` / `end` markers of `src/init.luau`: the direct for-in
-iterators and loops over bitset spans, the iterators and loops over the match list of a cached
-query, and the ones over the buffer of a small query that is not cached:
+iterators and loops over bitset spans (they skip a slot that the body of the loop freed after
+its run or word was read), the iterators and loops over the match list of a cached query, and
+the ones over the buffer of a small query that is not cached:
 
 ```sh
 python tools/generate.py && stylua src
@@ -501,15 +506,15 @@ To release a version:
    shows `CHANGELOG.md` as its Changelog page.
 2. Set the version (without the `v`) in `wally.toml`, and in the output of the benchmarks:
    `library` in `bench/versions.luau` and `LIBRARY_VERSION` in `bench/visual/libs.luau`.
-3. Run `python tools/workload.py baseline=v1.1.0 release=yes` (the tag of the previous
+3. Run `python tools/workload.py baseline=v1.2.0 release=yes` (the tag of the previous
    release). Review performance and long-session memory, and save the report and
    raw samples under `bench/results/`. Summarize both modes/scales and every observable
    behavior change in the release notes.
 4. Commit, wait for a green CI, then push the tag:
 
 ```sh
-git tag -a v1.2.0 -m "mErCS v1.2.0"
-git push origin v1.2.0
+git tag -a v1.3.0 -m "mErCS v1.3.0"
+git push origin v1.3.0
 ```
 
 Settings of the GitHub repository:

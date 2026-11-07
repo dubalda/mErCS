@@ -463,6 +463,142 @@ return function(spec: support.Spec)
             CHECK(ok)
         end
 
+        CASE("a query loop that deletes matches ahead of it ends, returns no id twice and no id that never matched")
+        do
+            -- The ways a query loop goes: a pass over the bitsets (a query written inline over more
+            -- than 2048 slots, a stored or cached query whose earlier loops matched nothing), the
+            -- match list of a stored query that looped before, the matches gathered first (a small
+            -- query written inline). At its first entity the body deletes matches ahead of the loop:
+            -- in the same word, in the same run of full words and value page, in the next page, and
+            -- 40 adjacent ones (a cascade); then it may create entities, which take the freed slots.
+            local ok = true
+            local function run(label: string, way: string, n: number, dense: boolean, arity: number, creates: boolean)
+                local world = ecs.world()
+                local comps: { any } = {}
+                for k = 1, math.max(arity, 1) do
+                    comps[k] = world:component()
+                end
+                local T = world:entity()
+                local function make(): any
+                    if arity == 0 then
+                        return world:query():with(T)
+                    end
+                    return (world :: any):query(table.unpack(comps, 1, arity))
+                end
+                local stored: any = if way == "inline" then nil else make()
+                if way == "cached" then
+                    stored = stored:cached()
+                end
+                if way == "empty loops" or way == "cached" then
+                    count(stored)
+                    count(stored)
+                end
+                local matches: { any } = {}
+                local value_of: { [any]: number } = {}
+                local position: { [any]: number } = {}
+                for i = 1, n do
+                    local e = world:entity()
+                    if dense or i % 2 == 1 then
+                        world:add(e, T)
+                        for k = 1, #comps do
+                            world:set(e, comps[k], i)
+                        end
+                        table.insert(matches, e)
+                        value_of[e] = i
+                        position[e] = #matches
+                    end
+                end
+                if way == "list" then
+                    count(stored)
+                    count(stored)
+                end
+                local deleted: { [any]: boolean } = {}
+                local created: { [any]: boolean } = {}
+                local seen: { [any]: boolean } = {}
+                local steps, first, reported = 0, true, false
+                local function wrong(message: string)
+                    if not reported then
+                        reported = true
+                        print(`  {label}: {message}`)
+                    end
+                    ok = false
+                end
+                for e, v1, v2, _, _, _, _, _, _, v9 in if way == "inline" then make() else stored do
+                    steps += 1
+                    if steps > #matches + 20 then
+                        wrong("the loop does not end")
+                        break
+                    end
+                    if type(e) ~= "number" or e <= 0 then
+                        wrong(`{e} returned, not an entity`)
+                    elseif seen[e] then
+                        wrong(`{e} returned twice`)
+                    elseif not (value_of[e] or created[e]) then
+                        wrong(`{e} returned, it never matched`)
+                    elseif value_of[e] and not deleted[e] and arity > 0 then
+                        local i = value_of[e]
+                        if v1 ~= i or (arity >= 2 and v2 ~= i) or (arity == 9 and v9 ~= i) then
+                            wrong(`the values of {e} are not its own`)
+                        end
+                    end
+                    seen[e] = true
+                    if first then
+                        first = false
+                        local at = position[e] :: number
+                        local victims: { number } = { 1, 20, 100, 300 }
+                        for k = 120, 159 do
+                            table.insert(victims, k)
+                        end
+                        for _, ahead in victims do
+                            local victim = matches[at + ahead]
+                            if victim then
+                                world:delete(victim)
+                                deleted[victim] = true
+                            end
+                        end
+                        if creates then
+                            for j = 1, 10 do
+                                local fresh = world:entity()
+                                created[fresh] = true
+                                if j % 2 == 0 then
+                                    world:add(fresh, T)
+                                    for k = 1, #comps do
+                                        world:set(fresh, comps[k], 0)
+                                    end
+                                end
+                            end
+                        end
+                    end
+                end
+                -- every match of the start that the body did not delete is returned
+                for _, e in matches do
+                    if not deleted[e] and not seen[e] then
+                        wrong(`{e} matched at the start and was not returned`)
+                        break
+                    end
+                end
+            end
+            local configs: { { any } } = {
+                { "inline, runs, no values", "inline", 3000, true, 0 },
+                { "inline, runs, 1 value", "inline", 3000, true, 1 },
+                { "inline, runs, 2 values", "inline", 3000, true, 2 },
+                { "inline, runs, 9 values", "inline", 3000, true, 9 },
+                { "stored after empty loops, runs", "empty loops", 3000, true, 1 },
+                { "stored after empty loops, runs, 9 values", "empty loops", 3000, true, 9 },
+                { "cached after empty loops, runs", "cached", 3000, true, 2 },
+                { "stored after empty loops, partial words", "empty loops", 3000, false, 1 },
+                { "stored with a match list, partial words", "list", 3000, false, 1 },
+                { "inline, small", "inline", 300, true, 1 },
+            }
+            for _, config in configs do
+                for _, creates in { false, true } do
+                    local label = config[1] .. (if creates then ", creating entities" else "")
+                    run(label, config[2], config[3], config[4], config[5], creates)
+                end
+            end
+            CHECK(ok)
+        end
+
         CASE("nested loops over one stored query and over inline queries, also when the inner loop changes the world")
         do
             local world = ecs.world()

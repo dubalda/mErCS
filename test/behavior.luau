@@ -9,7 +9,8 @@
       members, and the arity and nil values of queries;
     - loops: world:each and world:children snapshots at the boundaries of words, pages and
       blocks, their buffers across two worlds, and a frame of messages changed by hooks;
-    - hooks: hooks and signals in reentrant operations, and errors raised by hooks;
+    - hooks: hooks and signals in reentrant operations, the values they get (the value that a
+      change replaced included), and errors raised by hooks;
     - relations: relations kept in sync by their own hooks, and a cascade that reaches an entity
       twice;
     - tracking: what one tick of change tracking records, batch operations on tracked ids, the
